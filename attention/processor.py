@@ -11,7 +11,7 @@ import torch.nn as nn
 
 from .hira_attention import HiraAttention
 from ..utils import FixedThresholdStrategy
-from ..search import HalfspaceRangeSearcher
+from ..search import HalfspaceSearcher
 
 
 class HiraAttentionProcessor:
@@ -40,7 +40,7 @@ class HiraAttentionProcessor:
     ):
         self.hira_attention = HiraAttention(
             threshold_strategy=FixedThresholdStrategy(threshold=threshold),
-            range_searcher=HalfspaceRangeSearcher(),
+            range_searcher=HalfspaceSearcher(),
             use_hira_during_prefill=use_hira_during_prefill,
         )
     

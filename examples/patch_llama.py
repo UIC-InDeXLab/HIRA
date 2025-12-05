@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 
 from hira import HiraCache, HiraAttention
 from hira.utils import FixedThresholdStrategy
-from hira.search import HalfspaceRangeSearcher
+from hira.search import HalfspaceSearcher
 
 
 def create_hira_forward_method(hira_attention: HiraAttention):
@@ -131,7 +131,7 @@ def main():
     threshold = 0.0  # Fixed threshold
     hira_attention = HiraAttention(
         threshold_strategy=FixedThresholdStrategy(threshold=threshold),
-        range_searcher=HalfspaceRangeSearcher(),
+        range_searcher=HalfspaceSearcher(),
         use_hira_during_prefill=False,  # Use standard attention during prefill
     )
     print(f"   Threshold: {threshold}")

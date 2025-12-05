@@ -5,24 +5,20 @@ This module provides abstractions and implementations for building, maintaining,
 and querying hierarchical indexes over key vectors in the KV cache.
 """
 
-from .builders import IndexBuilder, KMeansIndexBuilder
-from .structure import HierarchicalIndex, IndexLevel
-from .updater import IndexUpdater, RebuildUpdater, IncrementalUpdater
+from .index import Index, KMeansIndex, RandomizedClustering
 from .memory_policy import MemoryTieringPolicy, AllGPUPolicy, HybridGPUCPUPolicy
+from .config import IndexConfig, KMeansIndexConfig, RandomizedClusteringConfig
 
 __all__ = [
-    # Builders
-    "IndexBuilder",
-    "KMeansIndexBuilder",
+    # Unified index classes
+    "Index",
+    "KMeansIndex",
+    "RandomizedClustering",
     
-    # Structure
-    "HierarchicalIndex",
-    "IndexLevel",
-    
-    # Updaters
-    "IndexUpdater",
-    "RebuildUpdater",
-    "IncrementalUpdater",
+    # Configuration
+    "IndexConfig",
+    "KMeansIndexConfig",
+    "RandomizedClusteringConfig",
     
     # Memory policies
     "MemoryTieringPolicy",

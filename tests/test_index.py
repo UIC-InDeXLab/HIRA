@@ -6,29 +6,31 @@ import pytest
 import torch
 
 from hira.index import (
-    KMeansIndexBuilder,
-    HierarchicalIndex,
-    RebuildUpdater,
+    KMeansIndex,
+    KMeansIndexConfig,
     AllGPUPolicy,
 )
 
 
-class TestIndexBuilder:
-    """Tests for index builders."""
+class TestIndex:
+    """Tests for unified index classes."""
     
-    def test_kmeans_builder_basic(self):
+    def test_kmeans_index_basic(self):
         """Test basic k-means index building."""
         # Create some random keys
         num_keys = 1000
         head_dim = 64
         keys = torch.randn(num_keys, head_dim)
         
-        # Build index
-        builder = KMeansIndexBuilder(max_iterations=50)
-        index = builder.build(
-            keys=keys,
+        # Create config and index
+        config = KMeansIndexConfig(
             num_levels=2,
             branching_factor=10,
+            max_iterations=50,
+        )
+        index_obj = KMeansIndex(config)
+        index = index_obj.build(
+            keys=keys,
             device=torch.device("cpu"),
         )
         
@@ -51,12 +53,11 @@ class TestIndexBuilder:
     def test_single_level_index(self):
         """Test building a single-level index."""
         keys = torch.randn(100, 32)
-        builder = KMeansIndexBuilder()
+        config = KMeansIndexConfig(num_levels=1, branching_factor=5)
+        index_obj = KMeansIndex(config)
         
-        index = builder.build(
+        index = index_obj.build(
             keys=keys,
-            num_levels=1,
-            branching_factor=5,
             device=torch.device("cpu"),
         )
         
@@ -66,56 +67,56 @@ class TestIndexBuilder:
     def test_empty_keys_error(self):
         """Test that empty keys raise an error."""
         keys = torch.tensor([]).reshape(0, 64)
-        builder = KMeansIndexBuilder()
+        config = KMeansIndexConfig()
+        index_obj = KMeansIndex(config)
         
         with pytest.raises(ValueError):
-            builder.build(
+            index_obj.build(
                 keys=keys,
-                num_levels=2,
-                branching_factor=10,
                 device=torch.device("cpu"),
             )
     
     def test_hirarchy_path(self):
         """Test getting hierarchical path for a key."""
         keys = torch.randn(100, 32)
-        builder = KMeansIndexBuilder()
+        config = KMeansIndexConfig(num_levels=2, branching_factor=5)
+        index_obj = KMeansIndex(config)
         
-        index = builder.build(
+        index = index_obj.build(
             keys=keys,
-            num_levels=2,
-            branching_factor=5,
             device=torch.device("cpu"),
         )
         
         # Get path for first key
-        path = index.get_hirarchy_path(0)
+        path = index.get_hierarchy_path(0)
         assert len(path) == 2
         assert all(isinstance(p, int) for p in path)
 
 
-class TestIndexUpdater:
-    """Tests for index updaters."""
+class TestIndexUpdate:
+    """Tests for index update functionality."""
     
-    def test_rebuild_updater(self):
-        """Test rebuild updater."""
+    def test_index_update_always(self):
+        """Test index update with always frequency."""
         keys_initial = torch.randn(100, 32)
         keys_new = torch.randn(20, 32)
         keys_all = torch.cat([keys_initial, keys_new], dim=0)
         
-        builder = KMeansIndexBuilder()
-        updater = RebuildUpdater(update_frequency="always")
-        
-        # Build initial index
-        index = builder.build(
-            keys=keys_initial,
+        config = KMeansIndexConfig(
             num_levels=2,
             branching_factor=5,
+            update_frequency="always",
+        )
+        index_obj = KMeansIndex(config)
+        
+        # Build initial index
+        index = index_obj.build(
+            keys=keys_initial,
             device=torch.device("cpu"),
         )
         
         # Check if update is needed
-        should_update = updater.should_update(
+        should_update = index_obj.should_update(
             current_index=index,
             num_new_keys=20,
             total_keys=120,
@@ -123,30 +124,39 @@ class TestIndexUpdater:
         assert should_update
         
         # Update index
-        new_index = updater.update(
+        new_index = index_obj.update(
             current_index=index,
             new_keys=keys_new,
             all_keys=keys_all,
-            builder=builder,
-            num_levels=2,
-            branching_factor=5,
             device=torch.device("cpu"),
         )
         
         assert new_index.num_keys == 120
     
-    def test_rebuild_every_n(self):
-        """Test rebuild updater with every_n frequency."""
-        updater = RebuildUpdater(
+    def test_update_every_n(self):
+        """Test index update with every_n frequency."""
+        keys = torch.randn(100, 32)
+        
+        config = KMeansIndexConfig(
+            num_levels=2,
+            branching_factor=5,
             update_frequency="every_n",
             update_interval=50,
         )
+        index_obj = KMeansIndex(config)
+        
+        # Build initial index
+        index = index_obj.build(
+            keys=keys,
+            device=torch.device("cpu"),
+        )
         
         # Should not update with 30 new keys
-        assert not updater.should_update(None, 30, 100)
+        assert not index_obj.should_update(index, 30, 130)
         
         # Should update with 50+ new keys
-        assert updater.should_update(None, 50, 100)
+        index_obj._keys_since_last_update = 50
+        assert index_obj.should_update(index, 0, 130)
 
 
 class TestMemoryPolicy:
@@ -155,11 +165,10 @@ class TestMemoryPolicy:
     def test_all_gpu_policy(self):
         """Test all-GPU memory policy."""
         keys = torch.randn(100, 32)
-        builder = KMeansIndexBuilder()
-        index = builder.build(
+        config = KMeansIndexConfig(num_levels=3, branching_factor=5)
+        index_obj = KMeansIndex(config)
+        index = index_obj.build(
             keys=keys,
-            num_levels=3,
-            branching_factor=5,
             device=torch.device("cpu"),
         )
         

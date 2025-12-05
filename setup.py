@@ -4,14 +4,15 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="hira-attention",
+    name="hira",
     version="0.1.0",
-    author="Hira Team",
     description="Hierarchical Range-Searching Attention for Transformers",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/hira",
-    packages=find_packages(),
+    # packages=find_packages(),
+    packages=["hira", "hira.attention", "hira.cache", "hira.index", "hira.search", "hira.utils", "hira.kernels", "hira.tests"],
+    package_dir={"hira": "."},
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",

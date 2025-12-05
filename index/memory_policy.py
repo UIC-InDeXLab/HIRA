@@ -6,10 +6,11 @@ on GPU vs CPU. This is critical for managing memory as cache size grows.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict
+from typing import Dict, TYPE_CHECKING
 import torch
 
-from .structure import HierarchicalIndex
+if TYPE_CHECKING:
+    from .index import Index
 
 
 class MemoryTieringPolicy(ABC):
@@ -22,13 +23,13 @@ class MemoryTieringPolicy(ABC):
     
     @abstractmethod
     def get_device_assignments(
-        self, index: HierarchicalIndex
+        self, index: "Index"
     ) -> Dict[int, torch.device]:
         """
         Determine device placement for each level.
         
         Args:
-            index: HierarchicalIndex to assign devices for
+            index: Index to assign devices for
             
         Returns:
             Dictionary mapping level_idx -> device
@@ -61,13 +62,13 @@ class AllGPUPolicy(MemoryTieringPolicy):
         self.device = torch.device(device)
     
     def get_device_assignments(
-        self, index: HierarchicalIndex
+        self, index: "Index"
     ) -> Dict[int, torch.device]:
         """
         Assign all levels to GPU.
         
         Args:
-            index: HierarchicalIndex
+            index: Index
             
         Returns:
             Dictionary with all levels assigned to GPU
@@ -118,13 +119,13 @@ class HybridGPUCPUPolicy(MemoryTieringPolicy):
         self.cpu_device = torch.device(cpu_device)
     
     def get_device_assignments(
-        self, index: HierarchicalIndex
+        self, index: "Index"
     ) -> Dict[int, torch.device]:
         """
         Assign first N levels to GPU, rest to CPU.
         
         Args:
-            index: HierarchicalIndex
+            index: Index
             
         Returns:
             Dictionary with device assignments
@@ -174,7 +175,7 @@ class AdaptivePolicy(MemoryTieringPolicy):
         self.cpu_device = torch.device(cpu_device)
     
     def get_device_assignments(
-        self, index: HierarchicalIndex
+        self, index: "Index"
     ) -> Dict[int, torch.device]:
         """
         Adaptively assign devices based on memory usage.
@@ -183,7 +184,7 @@ class AdaptivePolicy(MemoryTieringPolicy):
         For now, falls back to putting all on GPU.
         
         Args:
-            index: HierarchicalIndex
+            index: Index
             
         Returns:
             Dictionary with device assignments

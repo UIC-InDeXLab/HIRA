@@ -18,13 +18,12 @@ Hira implements a hierarchical range-searching attention mechanism that efficien
 **Purpose**: Build and maintain hierarchical indexes over key vectors
 
 **Components**:
-- `IndexBuilder`: Abstract interface for building indexes
-  - `KMeansIndexBuilder`: Concrete implementation using hierarchical k-means
+- `Index`: Abstract base class for hierarchical indexes (build, update, should_update)
+  - `KMeansIndex`: Implementation using hierarchical k-means clustering
+  - `IncrementalIndex`: Incremental updates without full rebuilding (WIP)
+  - `ProductQuantizationIndex`: PQ-based compression (placeholder)
 - `HierarchicalIndex`: Data structure representing multi-level index
   - `IndexLevel`: Single level with centroids, assignments, and metadata
-- `IndexUpdater`: Strategies for updating indexes as cache grows
-  - `RebuildUpdater`: Rebuild from scratch periodically
-  - `IncrementalUpdater`: Update incrementally (placeholder)
 - `MemoryTieringPolicy`: Controls GPU/CPU placement of levels
   - `AllGPUPolicy`: Keep all levels on GPU
   - `HybridGPUCPUPolicy`: Split between GPU and CPU
@@ -164,10 +163,13 @@ Level 1:
 ### Index Configuration
 ```python
 HiraCache(
-    num_levels=3,              # Hirarchy depth
+    num_levels=3,              # Hierarchy depth
     branching_factor=32,       # Clusters per level
-    builder=KMeansIndexBuilder(max_iterations=100),
-    updater=RebuildUpdater(update_frequency="every_n", update_interval=128),
+    index=KMeansIndex(
+        max_iterations=100,
+        update_frequency="every_n",
+        update_interval=128,
+    ),
     memory_policy=AllGPUPolicy(),
     build_index_every_n=128,   # Update frequency override
 )
@@ -188,9 +190,9 @@ HiraAttention(
 
 ## Extension Points
 
-### Adding New Index Builders
-1. Subclass `IndexBuilder`
-2. Implement `build()` method
+### Adding New Index Strategies
+1. Subclass `Index`
+2. Implement `build()`, `update()`, and `should_update()` methods
 3. Return `HierarchicalIndex` with appropriate structure
 
 Example: PQ-based indexing, LSH, learned indexes

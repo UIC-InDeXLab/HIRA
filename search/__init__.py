@@ -5,9 +5,8 @@ This module provides efficient range search capabilities, particularly
 halfspace range searching for finding keys with high query-key dot products.
 """
 
-from .range_searcher import RangeSearcher, HalfspaceRangeSearcher
+from .range_searcher import HalfspaceSearcher
 
 __all__ = [
-    "RangeSearcher",
-    "HalfspaceRangeSearcher",
+    "HalfspaceSearcher",
 ]

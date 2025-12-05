@@ -5,18 +5,15 @@ This cache extends the standard DynamicCache to maintain a hierarchical index
 over key vectors, enabling efficient range-based key selection during attention.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type
 import torch
 from transformers.cache_utils import Cache
 
-from ..index import (
-    HierarchicalIndex,
-    IndexBuilder,
-    KMeansIndexBuilder,
-    IndexUpdater,
-    RebuildUpdater,
-    MemoryTieringPolicy,
-    AllGPUPolicy,
+from ..index import Index, KMeansIndex, RandomizedClustering
+from ..index.config import (
+    IndexConfig,
+    KMeansIndexConfig,
+    RandomizedClusteringConfig,
 )
 
 
@@ -25,58 +22,78 @@ class HiraCache(Cache):
     Custom cache that maintains hierarchical indexes over key vectors.
 
     This cache behaves like a standard HuggingFace Cache but additionally
-    maintains a hierarchical index for each layer, enabling efficient
-    range-based key selection.
+    maintains a separate hierarchical index per layer, enabling efficient
+    range-based key selection during attention.
+
+    Each layer gets its own independent index since different layers capture
+    different semantic information and should not share indexes.
 
     The cache stores:
-    - Key and value tensors (like DynamicCache)
-    - Hierarchical indexes built from key vectors
-    - Configuration for index building and updating
+    - Key and value tensors per layer (like DynamicCache)
+    - One hierarchical index per layer
+
+    Usage:
+        # Create a configuration
+        from hira import KMeansIndexConfig, HiraCache
+
+        config = KMeansIndexConfig(
+            num_levels=3,
+            branching_factor=16,
+            max_iterations=50
+        )
+
+        # Pass the config to the cache
+        # Indexes are created per-layer automatically
+        cache = HiraCache(config)
 
     Args:
-        num_levels: Number of levels in the hirarchy
-        branching_factor: Number of clusters per level
-        builder: IndexBuilder instance (default: KMeansIndexBuilder)
-        updater: IndexUpdater instance (default: RebuildUpdater)
-        memory_policy: MemoryTieringPolicy instance (default: AllGPUPolicy)
-        build_index_every_n: Build/update index every N tokens (0 = every update)
+        index_config: IndexConfig instance (KMeansIndexConfig, IncrementalIndexConfig, etc.)
+                     Each layer will get its own Index instance created from this config.
     """
 
-    def __init__(
-        self,
-        num_levels: int = 3,
-        branching_factor: int = 32,
-        builder: Optional[IndexBuilder] = None,
-        updater: Optional[IndexUpdater] = None,
-        memory_policy: Optional[MemoryTieringPolicy] = None,
-        build_index_every_n: int = 0,
-    ):
+    def __init__(self, index_config: IndexConfig):
         super().__init__()
 
         # Standard cache storage
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
 
-        # Hierarchical index storage (one per layer)
-        self.indexes: List[Optional[HierarchicalIndex]] = []
+        # Store config to create indexes per layer
+        self.index_config = index_config
 
-        # Configuration
-        self.num_levels = num_levels
-        self.branching_factor = branching_factor
-        self.builder = builder or KMeansIndexBuilder()
-        self.updater = updater or RebuildUpdater(
-            update_frequency="every_n", update_interval=128
-        )
-        self.memory_policy = memory_policy or AllGPUPolicy()
-        self.build_index_every_n = build_index_every_n
+        # Determine index class from config type
+        self.index_class = self._get_index_class(index_config)
+
+        # Per-layer indexes (created lazily)
+        self.indexes: List[Optional[Index]] = []
 
         # Tracking
         self._seen_tokens = 0
-        self._tokens_since_last_index_build: List[int] = []
 
     def __len__(self):
         """Returns the number of layers in the cache."""
         return len(self.key_cache)
+
+    def _get_index_class(self, config: IndexConfig) -> Type[Index]:
+        """Map config type to index class."""
+        if isinstance(config, KMeansIndexConfig):
+            return KMeansIndex
+        elif isinstance(config, RandomizedClusteringConfig):
+            return RandomizedClustering
+        else:
+            raise ValueError(f"Unknown config type: {type(config)}")
+
+    def _get_or_create_index(self, layer_idx: int) -> Index:
+        """Get existing index for layer or create a new one."""
+        # Ensure list is long enough
+        while len(self.indexes) <= layer_idx:
+            self.indexes.append(None)
+
+        # Create index if not exists
+        if self.indexes[layer_idx] is None:
+            self.indexes[layer_idx] = self.index_class(self.index_config)
+
+        return self.indexes[layer_idx]
 
     def update(
         self,
@@ -109,8 +126,6 @@ class HiraCache(Cache):
         while len(self.key_cache) <= layer_idx:
             self.key_cache.append(torch.tensor([]))
             self.value_cache.append(torch.tensor([]))
-            self.indexes.append(None)
-            self._tokens_since_last_index_build.append(0)
 
         # Update KV cache
         if self.key_cache[layer_idx].numel() == 0:
@@ -126,86 +141,54 @@ class HiraCache(Cache):
                 [self.value_cache[layer_idx], value_states], dim=-2
             )
 
-        # Update hierarchical index
-        num_new_keys = key_states.shape[-2]
-        self._tokens_since_last_index_build[layer_idx] += num_new_keys
-
-        # Check if we should build/update the index
-        if self.build_index_every_n > 0:
-            should_build = (
-                self._tokens_since_last_index_build[layer_idx]
-                >= self.build_index_every_n
-            )
-        else:
-            # Use the updater's policy
-            total_keys = self.key_cache[layer_idx].shape[-2]
-            should_build = self.updater.should_update(
-                current_index=self.indexes[layer_idx],
-                num_new_keys=num_new_keys,
-                total_keys=total_keys,
-            )
-
-        if should_build:
-            self._update_index(layer_idx)
-            self._tokens_since_last_index_build[layer_idx] = 0
+        # Update index for this specific layer
+        self._update_index(layer_idx)
 
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
     def _update_index(self, layer_idx: int):
         """
-        Update or build the hierarchical index for a specific layer.
+        Update the index for a specific layer.
 
-        The index is built from the key vectors in the cache. We flatten
-        the key tensor from [batch_size, num_heads, seq_len, head_dim] to
-        [seq_len, num_heads * head_dim] or similar, depending on indexing strategy.
-
-        TODO: Decide on indexing strategy:
-        - Option 1: One index per head (num_heads separate indexes)
-        - Option 2: One index for all heads (concatenate or average)
-        - Option 3: One index per layer (current approach)
-
-        For now, we use Option 3: build one index per layer, treating each
-        (batch, head, seq_pos) as a separate key vector.
+        Each layer has its own independent index that is built and updated
+        separately. The Index class handles all decisions about building,
+        updating, hierarchy levels, etc. based on its internal configuration.
 
         Args:
-            layer_idx: Layer index
+            layer_idx: Index of the layer to update
         """
-        keys_tensor = self.key_cache[
-            layer_idx
-        ]  # [batch_size, num_heads, seq_len, head_dim]
+        if len(self.key_cache) <= layer_idx:
+            return
 
+        keys_tensor = self.key_cache[layer_idx]
         if keys_tensor.numel() == 0:
             return
 
-        # Flatten to [batch_size * num_heads * seq_len, head_dim]
-        # This treats each position in each head as a separate key
+        # Get or create index for this layer
+        index = self._get_or_create_index(layer_idx)
+
+        # Flatten keys for this layer
         batch_size, num_heads, seq_len, head_dim = keys_tensor.shape
-        keys_flat = keys_tensor.reshape(-1, head_dim)  # [batch*heads*seq, head_dim]
+        keys_flat = keys_tensor.reshape(-1, head_dim)
+        device = keys_tensor.device
 
-        # Extract new keys (if this is an update)
-        num_new_tokens = self._tokens_since_last_index_build[layer_idx]
-        if num_new_tokens > 0 and self.indexes[layer_idx] is not None:
-            # Incremental update case
-            new_keys_start = (seq_len - num_new_tokens) * batch_size * num_heads
-            new_keys = keys_flat[new_keys_start:]
+        # Build or update the index for this layer
+        if index.num_keys == 0:
+            # First build - index uses its config to determine parameters
+            index.build(
+                keys=keys_flat,
+                device=device,
+            )
         else:
-            # Full rebuild case
-            new_keys = keys_flat
-
-        # Update or build index
-        self.indexes[layer_idx] = self.updater.update(
-            current_index=self.indexes[layer_idx],
-            new_keys=new_keys,
-            all_keys=keys_flat,
-            builder=self.builder,
-            num_levels=self.num_levels,
-            branching_factor=self.branching_factor,
-            device=keys_tensor.device,
-        )
-
-        # Apply memory tiering policy
-        if self.indexes[layer_idx] is not None:
-            self.indexes[layer_idx].apply_memory_policy(self.memory_policy)
+            # Update with new keys
+            # TODO: track new vs old keys properly
+            new_keys = keys_flat  # Simplified for now
+            index.update(
+                current_index=index,
+                new_keys=new_keys,
+                all_keys=keys_flat,
+                device=device,
+            )
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states."""
@@ -221,15 +204,15 @@ class HiraCache(Cache):
         """Returns the maximum sequence length (None for dynamic cache)."""
         return None
 
-    def get_index(self, layer_idx: int) -> Optional[HierarchicalIndex]:
+    def get_index(self, layer_idx: int) -> Optional[Index]:
         """
-        Get the hierarchical index for a specific layer.
+        Get the index for a specific layer.
 
         Args:
             layer_idx: Layer index
 
         Returns:
-            HierarchicalIndex or None if not yet built
+            The Index instance for this layer, or None if not created yet
         """
         if layer_idx >= len(self.indexes):
             return None
@@ -263,9 +246,9 @@ class HiraCache(Cache):
         """Reset the cache to empty state."""
         self.key_cache = []
         self.value_cache = []
+        # Reset all per-layer indexes
         self.indexes = []
         self._seen_tokens = 0
-        self._tokens_since_last_index_build = []
 
     def get_cache_info(self, layer_idx: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -285,11 +268,11 @@ class HiraCache(Cache):
             info = {
                 "layer_idx": layer_idx,
                 "seq_length": self.get_seq_length(layer_idx),
-                "has_index": self.indexes[layer_idx] is not None,
             }
 
-            if self.indexes[layer_idx] is not None:
-                index = self.indexes[layer_idx]
+            # Add index info if exists for this layer
+            index = self.get_index(layer_idx)
+            if index is not None and index.num_keys > 0:
                 info["index_info"] = {
                     "num_levels": index.num_levels(),
                     "num_keys": index.num_keys,
@@ -298,9 +281,35 @@ class HiraCache(Cache):
 
             return info
         else:
-            # Info for all layers
-            return {
+            # Info for entire cache
+            layers_info = []
+            total_indexed_keys = 0
+            num_built_indexes = 0
+
+            for i in range(len(self)):
+                layer_info = {
+                    "layer_idx": i,
+                    "seq_length": self.get_seq_length(i),
+                }
+
+                index = self.get_index(i)
+                if index is not None and index.num_keys > 0:
+                    layer_info["index_info"] = {
+                        "num_levels": index.num_levels(),
+                        "num_keys": index.num_keys,
+                        "memory_usage": index.total_memory_usage(),
+                    }
+                    total_indexed_keys += index.num_keys
+                    num_built_indexes += 1
+
+                layers_info.append(layer_info)
+
+            info = {
                 "num_layers": len(self),
                 "total_tokens": self._seen_tokens,
-                "layers": [self.get_cache_info(i) for i in range(len(self))],
+                "num_built_indexes": num_built_indexes,
+                "total_indexed_keys": total_indexed_keys,
+                "layers": layers_info,
             }
+
+            return info

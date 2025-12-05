@@ -3,12 +3,7 @@
 WIP
 
 ## Overview
-
-Hira implements an attention mechanism that:
-- Maintains a hierarchical index over key vectors in the KV cache
-- For each query, computes a score threshold and performs halfspace range search
-- Returns only "high-score" keys whose dot product with the query exceeds the threshold
-- Computes attention only over the selected key subset
+WIP
 
 ## Architecture
 

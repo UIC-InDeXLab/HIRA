@@ -5,8 +5,8 @@ Unit tests for range searching.
 import pytest
 import torch
 
-from hira.index import KMeansIndexBuilder
-from hira.search import HalfspaceRangeSearcher
+from hira.index import KMeansIndex, KMeansIndexConfig
+from hira.search import HalfspaceSearcher
 
 
 class TestRangeSearcher:
@@ -21,16 +21,17 @@ class TestRangeSearcher:
         query = torch.randn(head_dim)
         
         # Build index
-        builder = KMeansIndexBuilder(max_iterations=30)
-        index = builder.build(
-            keys=keys,
+        config = KMeansIndexConfig(
             num_levels=2,
             branching_factor=10,
-            device=torch.device("cpu"),
+            max_iterations=30,
+            device="cpu",
         )
+        index_obj = KMeansIndex(config)
+        index = index_obj.build(keys=keys, device=torch.device("cpu"))
         
         # Perform range search
-        searcher = HalfspaceRangeSearcher()
+        searcher = HalfspaceSearcher()
         threshold = 0.0
         results = searcher.search(
             query=query,
@@ -51,16 +52,16 @@ class TestRangeSearcher:
         keys = torch.randn(100, 32)
         query = torch.randn(32)
         
-        builder = KMeansIndexBuilder()
-        index = builder.build(
-            keys=keys,
+        config = KMeansIndexConfig(
             num_levels=2,
             branching_factor=5,
-            device=torch.device("cpu"),
+            device="cpu",
         )
+        index_obj = KMeansIndex(config)
+        index = index_obj.build(keys=keys, device=torch.device("cpu"))
         
         # Very high threshold - should return few or no results
-        searcher = HalfspaceRangeSearcher()
+        searcher = HalfspaceSearcher()
         threshold = 10.0
         results = searcher.search(
             query=query,
@@ -77,16 +78,16 @@ class TestRangeSearcher:
         keys = torch.randn(100, 32)
         query = torch.randn(32)
         
-        builder = KMeansIndexBuilder()
-        index = builder.build(
-            keys=keys,
+        config = KMeansIndexConfig(
             num_levels=2,
             branching_factor=5,
-            device=torch.device("cpu"),
+            device="cpu",
         )
+        index_obj = KMeansIndex(config)
+        index = index_obj.build(keys=keys, device=torch.device("cpu"))
         
         # Very low threshold - should return many results
-        searcher = HalfspaceRangeSearcher()
+        searcher = HalfspaceSearcher()
         threshold = -10.0
         results = searcher.search(
             query=query,
@@ -103,16 +104,16 @@ class TestRangeSearcher:
         keys = torch.randn(100, 32)
         query = torch.randn(32)
         
-        builder = KMeansIndexBuilder()
-        index = builder.build(
-            keys=keys,
+        config = KMeansIndexConfig(
             num_levels=2,
             branching_factor=5,
-            device=torch.device("cpu"),
+            device="cpu",
         )
+        index_obj = KMeansIndex(config)
+        index = index_obj.build(keys=keys, device=torch.device("cpu"))
         
         # Search with max_candidates
-        searcher = HalfspaceRangeSearcher(max_candidates=10)
+        searcher = HalfspaceSearcher(max_candidates=10)
         threshold = -5.0  # Low threshold to get many candidates
         results = searcher.search(
             query=query,

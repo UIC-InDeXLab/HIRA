@@ -7,14 +7,16 @@ A novel attention mechanism using hierarchical indexing for efficient key select
 __version__ = "0.1.0"
 
 from .index import (
-    IndexBuilder,
-    HierarchicalIndex,
-    IndexUpdater,
+    Index,
+    KMeansIndex,
+    RandomizedClustering,
     MemoryTieringPolicy,
-    KMeansIndexBuilder,
+    IndexConfig,
+    KMeansIndexConfig,
+    RandomizedClusteringConfig,
 )
 
-from .search import RangeSearcher, HalfspaceRangeSearcher
+from .search import HalfspaceSearcher
 
 from .attention import HiraAttention, HiraAttentionProcessor, patch_model_with_hira_attention
 
@@ -22,15 +24,16 @@ from .cache import HiraCache
 
 __all__ = [
     # Index components
-    "IndexBuilder",
-    "HierarchicalIndex",
-    "IndexUpdater",
+    "Index",
+    "KMeansIndex",
+    "RandomizedClustering",
     "MemoryTieringPolicy",
-    "KMeansIndexBuilder",
+    "IndexConfig",
+    "KMeansIndexConfig",
+    "RandomizedClusteringConfig",
     
     # Search components
-    "RangeSearcher",
-    "HalfspaceRangeSearcher",
+    "HalfspaceSearcher",
     
     # Attention components
     "HiraAttention",

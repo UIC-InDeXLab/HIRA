@@ -5,10 +5,10 @@
 ### Core Components ✓
 
 1. **Index Module** (`hira/index/`)
-   - ✓ Abstract `IndexBuilder` interface
-   - ✓ `KMeansIndexBuilder` with k-means++ initialization
+   - ✓ Abstract `Index` base class with unified build/update logic
+   - ✓ `KMeansIndex` with k-means++ initialization and FAISS optimization
+   - ✓ `IncrementalIndex` for incremental updates (WIP)
    - ✓ `HierarchicalIndex` and `IndexLevel` data structures
-   - ✓ `IndexUpdater` interface with `RebuildUpdater` and `IncrementalUpdater`
    - ✓ `MemoryTieringPolicy` with `AllGPUPolicy` and `HybridGPUCPUPolicy`
 
 2. **Search Module** (`hira/search/`)
@@ -170,7 +170,10 @@ hira_attn = patch_llama_with_hira(model, cache)
 cache = HiraCache(
     num_levels=4,
     branching_factor=64,
-    updater=RebuildUpdater(update_frequency="threshold", update_threshold=0.1)
+    index=KMeansIndex(
+        update_frequency="threshold",
+        update_threshold=0.1
+    )
 )
 ```
 

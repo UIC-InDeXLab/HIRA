@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import Cache
 
 from ..cache import HiraCache
-from ..search import HalfspaceRangeSearcher
+from ..search import HalfspaceSearcher
 from ..utils import FixedThresholdStrategy, ThresholdStrategy
 
 
@@ -39,12 +39,12 @@ class HiraAttention:
     def __init__(
         self,
         threshold_strategy: Optional[ThresholdStrategy] = None,
-        range_searcher: Optional[HalfspaceRangeSearcher] = None,
+        range_searcher: Optional[HalfspaceSearcher] = None,
         scaling: Optional[float] = None,
         use_hira_during_prefill: bool = False,
     ):
         self.threshold_strategy = threshold_strategy or FixedThresholdStrategy(threshold=0.0)
-        self.range_searcher = range_searcher or HalfspaceRangeSearcher()
+        self.range_searcher = range_searcher or HalfspaceSearcher()
         self.scaling = scaling
         self.use_hira_during_prefill = use_hira_during_prefill
     
@@ -322,7 +322,7 @@ def patch_model_with_hira_attention(
     
     # Create threshold strategy and range searcher
     threshold_strategy = FixedThresholdStrategy(threshold=threshold)
-    range_searcher = HalfspaceRangeSearcher()
+    range_searcher = HalfspaceSearcher()
     
     # Create HiraAttention instance
     hira_attention = HiraAttention(

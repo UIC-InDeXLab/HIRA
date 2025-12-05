@@ -5,15 +5,16 @@ This example demonstrates how to use HiraCache and HiraAttention
 with a HuggingFace model.
 """
 
+import sys
+from pathlib import Path
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from huggingface_hub import login
 from dotenv import load_dotenv
 import os
 
-from hira import HiraCache, HiraAttention
-from hira.utils import FixedThresholdStrategy
-from hira.search import HalfspaceSearcher
+from hira import HiraCache, KMeansIndexConfig
 
 
 def main():
@@ -42,14 +43,24 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    # Create HiraCache
+    # Create HiraCache with config-based architecture
     print("\n2. Creating HiraCache...")
-    cache = HiraCache(
+
+    # Create configuration (one config, but each layer gets its own index)
+    config = KMeansIndexConfig(
         num_levels=3,
         branching_factor=32,
-        build_index_every_n=128,  # Build index every 128 tokens
+        update_frequency="every_n",
+        update_interval=128,  # Build index every 128 tokens
+        max_iterations=25,
     )
-    print(f"   Cache configured with {cache.num_levels} levels")
+
+    # Create cache with config (indexes created per-layer automatically)
+    cache = HiraCache(config)
+
+    print(f"   Cache configured with {config.num_levels} levels per layer")
+    print(f"   Each layer will have its own independent index")
+    print(f"   Indexes will rebuild every {config.update_interval} tokens")
 
     # Prepare input
     text = "What is the capital of France?"
@@ -80,25 +91,32 @@ def main():
     cache_info = cache.get_cache_info()
     print(f"   Total tokens generated: {cache_info['total_tokens']}")
     print(f"   Number of layers: {cache_info['num_layers']}")
+    print(
+        f"   Built indexes: {cache_info['num_built_indexes']}/{cache_info['num_layers']}"
+    )
+    print(f"   Total indexed keys: {cache_info['total_indexed_keys']}")
 
-    for layer_info in cache_info["layers"][:3]:  # Show first 3 layers
+    print(f"\n   Layer-wise information (first 3 layers):")
+    for layer_info in cache_info["layers"][:3]:
         layer_idx = layer_info["layer_idx"]
         seq_len = layer_info["seq_length"]
-        has_index = layer_info["has_index"]
-        print(f"\n   Layer {layer_idx}:")
-        print(f"     - Sequence length: {seq_len}")
-        print(f"     - Has index: {has_index}")
+        print(f"     Layer {layer_idx}: {seq_len} tokens", end="")
 
-        if has_index:
+        if "index_info" in layer_info:
             index_info = layer_info["index_info"]
-            print(f"     - Index levels: {index_info['num_levels']}")
-            print(f"     - Indexed keys: {index_info['num_keys']}")
-            mem_usage = index_info["memory_usage"]
-            print(f"     - Index memory: {mem_usage['total_mb']:.2f} MB")
+            print(
+                f" | Index: {index_info['num_keys']} keys, {index_info['num_levels']} levels"
+            )
+        else:
+            print(" | No index yet")
 
     print("\n" + "=" * 60)
     print("Done!")
-    print("\nNote: This example uses HiraCache but standard attention.")
+    print("\nNote: This example uses the new per-layer index architecture:")
+    print("  1. Create IndexConfig (KMeansIndexConfig)")
+    print("  2. Create HiraCache with config")
+    print("  3. Each layer automatically gets its own independent index")
+    print("\nThis example uses HiraCache but standard attention.")
     print("See patch_llama.py for using HiraAttention with hierarchical search.")
 
 
