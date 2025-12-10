@@ -9,11 +9,8 @@ __version__ = "0.1.0"
 from .index import (
     Index,
     KMeansIndex,
-    RandomizedClustering,
-    MemoryTieringPolicy,
     IndexConfig,
     KMeansIndexConfig,
-    RandomizedClusteringConfig,
 )
 
 from .search import HalfspaceSearcher
@@ -26,11 +23,8 @@ __all__ = [
     # Index components
     "Index",
     "KMeansIndex",
-    "RandomizedClustering",
-    "MemoryTieringPolicy",
     "IndexConfig",
     "KMeansIndexConfig",
-    "RandomizedClusteringConfig",
     
     # Search components
     "HalfspaceSearcher",

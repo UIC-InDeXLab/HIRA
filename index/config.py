@@ -76,7 +76,6 @@ class KMeansIndexConfig(IndexConfig):
         use_gpu: Whether to use GPU acceleration (default: False)
         nredo: Number of k-means runs to perform (default: 1)
         verbose: Whether to print FAISS clustering progress (default: False)
-        spherical: Use spherical k-means (default: False)
         use_float16: Use float16 for faster computation (default: False)
         update_frequency: When to rebuild ("always", "every_n", "threshold")
         update_interval: For "every_n", rebuild every N keys (default: 128)
@@ -92,7 +91,6 @@ class KMeansIndexConfig(IndexConfig):
     use_gpu: bool = False
     nredo: int = 1
     verbose: bool = False
-    spherical: bool = False
     use_float16: bool = False
 
     # Update policy
@@ -111,63 +109,7 @@ class KMeansIndexConfig(IndexConfig):
                 "use_gpu": self.use_gpu,
                 "nredo": self.nredo,
                 "verbose": self.verbose,
-                "spherical": self.spherical,
                 "use_float16": self.use_float16,
-                "update_frequency": self.update_frequency,
-                "update_interval": self.update_interval,
-                "update_threshold": self.update_threshold,
-            }
-        )
-        return base_dict
-
-
-@dataclass
-class RandomizedClusteringConfig(IndexConfig):
-    """
-    Configuration specific to RandomizedClustering (RC) Index.
-
-    This index builds a hierarchy using FAISS k-means with niter=1 (random initialization).
-    Identical to KMeans but with single iteration, making it faster but less optimal.
-
-    Attributes:
-        random_seed: Random seed for reproducibility (default: 42)
-        max_iterations: K-means iterations (fixed at 1 for random init)
-        tolerance: Convergence tolerance (default: 1e-4)
-        nredo: Number of k-means restarts (default: 1)
-        verbose: Print k-means progress (default: False)
-        spherical: Use spherical k-means (default: False)
-        use_gpu: Use GPU for FAISS if available (default: False)
-        update_frequency: When to rebuild ("always", "every_n", "threshold")
-        update_interval: For "every_n", rebuild every N keys (default: 128)
-        update_threshold: For "threshold", rebuild ratio (default: 0.1)
-    """
-
-    # Random sampling parameters
-    random_seed: int = 42
-
-    # K-means parameters (same as KMeans but niter=1 in code)
-    tolerance: float = 1e-4
-    nredo: int = 1
-    verbose: bool = False
-    spherical: bool = False
-    use_gpu: bool = False
-
-    # Update policy
-    update_frequency: str = "every_n"  # "always", "every_n", "threshold"
-    update_interval: int = 128
-    update_threshold: float = 0.1
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert config to dictionary."""
-        base_dict = super().to_dict()
-        base_dict.update(
-            {
-                "random_seed": self.random_seed,
-                "tolerance": self.tolerance,
-                "nredo": self.nredo,
-                "verbose": self.verbose,
-                "spherical": self.spherical,
-                "use_gpu": self.use_gpu,
                 "update_frequency": self.update_frequency,
                 "update_interval": self.update_interval,
                 "update_threshold": self.update_threshold,

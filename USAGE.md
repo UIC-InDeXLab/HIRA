@@ -92,7 +92,6 @@ Extends `IndexConfig` with K-means specific parameters:
 - `use_gpu`: Whether to use GPU acceleration (default: False)
 - `nredo`: Number of k-means runs (keeps best result) (default: 1)
 - `verbose`: Print FAISS clustering progress (default: False)
-- `spherical`: Use spherical k-means (default: False)
 - `use_float16`: Use float16 for faster computation (default: False)
 
 **Update Policy:**

@@ -9,11 +9,10 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 import torch
 from transformers.cache_utils import Cache
 
-from ..index import Index, KMeansIndex, RandomizedClustering
+from ..index import Index, KMeansIndex
 from ..index.config import (
     IndexConfig,
     KMeansIndexConfig,
-    RandomizedClusteringConfig,
 )
 
 

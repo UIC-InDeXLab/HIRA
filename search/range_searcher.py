@@ -8,294 +8,131 @@ with cluster radii to efficiently traverse the index.
 
 from typing import List, Optional, TYPE_CHECKING
 import torch
-
-if TYPE_CHECKING:
-    from ..index.index import KMeansIndex
+from ..index.index import KMeansIndex
 
 
 class HalfspaceSearcher:
-    """
-    Halfspace range searcher using hierarchical pruning with cluster radii.
-
-    This searcher identifies keys k where q·k >= τ (halfspace defined by
-    query q and threshold τ). It uses the hierarchical index with cluster
-    radii to prune clusters that cannot contain any qualifying keys.
-
-    Search Strategy:
-    1. Start from the coarsest level (top of hierarchy)
-    2. For each cluster centroid, decide if children might intersect the halfspace
-    3. Use cluster radius to make pruning decisions:
-       - Compute centroid score: s = q·c
-       - If s - radius >= τ, all points in cluster qualify (include all)
-       - If s + radius < τ, no points in cluster qualify (prune)
-       - Otherwise, recurse into children at finer level
-    4. At the leaf level, check individual keys exactly
-
-    Args:
-        max_candidates: Maximum number of candidate keys to return (optional)
-    """
-
     def __init__(
         self,
-        max_candidates: Optional[int] = None,
+        enable_profiling: bool = False,
     ):
-        """
-        Initialize the halfspace searcher.
+        self.enable_profiling = enable_profiling
+        self.reset_stats()
 
+    def reset_stats(self):
+        """Reset profiling statistics"""
+        self.stats = {
+            "num_distance_computations": 0,
+            "num_clusters_visited": 0,
+            "num_clusters_pruned": 0,
+            "num_clusters_fully_included": 0,
+            "time_per_level": [],
+            "time_centroid_scoring": 0,
+            "time_radius_checking": 0,
+            "time_exact_filtering": 0,
+            "time_data_movement": 0,
+            "num_keys_per_level": [],
+            "pruning_rate_per_level": [],
+            "clusters_examined_per_level": [],
+            "clusters_kept_per_level": [],
+        }
+
+    def search(self, query, threshold, index: "KMeansIndex"):
+        """
         Args:
-            max_candidates: Maximum number of keys to return (None for all qualifying keys)
+            threshold (_type_): The points with x.q >= threshold are returned
         """
-        self.max_candidates = max_candidates
+        # normalize query
+        query = query / torch.norm(query, p=2)
 
-    def search(
-        self,
-        query: torch.Tensor,
-        threshold: float,
-        index: "KMeansIndex",
-        keys: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Perform halfspace range search using hierarchical pruning.
+        # search root
+        root = index.levels[-1]
+        scores = torch.matmul(root.key_centers, query)
+        mask = (scores + root.key_radii) >= threshold
+        intersecting_cluster_ptrs = root.key_ptrs[mask]
 
-        Args:
-            query: Query vector [head_dim]
-            threshold: Score threshold τ
-            index: KMeansIndex with hierarchy
-            keys: All key vectors [num_keys, head_dim]
-
-        Returns:
-            Tensor of key indices where q·k >= τ
-        """
-        if index.num_levels() == 0:
-            raise ValueError("Index has no levels")
-
-        # Ensure query is on the same device as keys
-        query = query.to(keys.device)
-
-        # Normalize query if using spherical k-means
-        if hasattr(index, "spherical") and index.spherical:
-            query = torch.nn.functional.normalize(query, dim=0)
-
-        # Start search from the coarsest level
-        candidate_clusters = self._search_level(
-            query=query,
-            threshold=threshold,
-            level_idx=0,
-            index=index,
-            keys=keys,
-        )
-
-        # Recursively refine through finer levels
-        for level_idx in range(1, index.num_levels()):
-            candidate_clusters = self._refine_search(
-                query=query,
-                threshold=threshold,
-                level_idx=level_idx,
-                parent_candidates=candidate_clusters,
-                index=index,
-                keys=keys,
+        # recursively search down the tree
+        levels = index.levels[::-1][1:]  # skip root, reverse order
+        for level in levels:
+            # find children
+            children_indexes = []
+            for parent_ptr in intersecting_cluster_ptrs.tolist():
+                if parent_ptr in level.cluster_assignments:
+                    children_indexes.append(level.cluster_assignments[parent_ptr])
+            children_indexes = (
+                torch.cat(children_indexes)
+                if children_indexes
+                else torch.tensor([], device=query.device, dtype=torch.long)
             )
 
-            # Early exit if no candidates remain
-            if len(candidate_clusters) == 0:
-                return torch.tensor([], dtype=torch.long, device=keys.device)
+            # get centers and radii
+            child_centers = level.key_centers[children_indexes]
+            child_radii = level.key_radii[children_indexes]
+            pointers = level.key_ptrs[children_indexes]
 
-        # Get candidate key indices from finest level
-        candidate_keys = self._get_keys_from_clusters(
-            cluster_ids=candidate_clusters,
-            level=index.get_level(index.num_levels() - 1),
-        )
+            # scores
+            scores = torch.matmul(child_centers, query)
+            mask = (scores + child_radii) >= threshold
+            intersecting_cluster_ptrs = pointers[mask]
 
-        # Final filtering: compute exact scores and filter by threshold
-        qualifying_keys = self._exact_filter(
-            query=query,
-            threshold=threshold,
-            candidate_keys=candidate_keys,
-            keys=keys,
-        )
+            if len(intersecting_cluster_ptrs) == 0:
+                return torch.tensor([], dtype=torch.long, device=query.device)
 
-        # Apply max_candidates limit if specified
-        if (
-            self.max_candidates is not None
-            and len(qualifying_keys) > self.max_candidates
+        # exact filter on final candidates
+        keys = index.keys[intersecting_cluster_ptrs]
+        final_scores = torch.matmul(keys, query)
+        final_mask = final_scores >= threshold
+        qualifying_keys = intersecting_cluster_ptrs[final_mask]
+
+        return qualifying_keys  # indices of keys satisfying q.k >= threshold
+
+    def print_stats(self):
+        """Print detailed profiling statistics"""
+        if not self.enable_profiling:
+            print("Profiling not enabled")
+            return
+
+        if "total_time" not in self.stats:
+            print("No profiling data available (search may have failed)")
+            return
+
+        print("\n" + "=" * 80)
+        print("HIERARCHICAL SEARCH PROFILING STATISTICS")
+        print("=" * 80)
+        print(f"Total time: {self.stats['total_time']*1000:.3f} ms")
+        print(f"\nTime breakdown:")
+        print(f"  Centroid scoring: {self.stats['time_centroid_scoring']*1000:.3f} ms")
+        print(f"  Radius checking: {self.stats['time_radius_checking']*1000:.3f} ms")
+        print(f"  Data movement: {self.stats['time_data_movement']*1000:.3f} ms")
+        print(f"  Exact filtering: {self.stats['time_exact_filtering']*1000:.3f} ms")
+
+        print(f"\nPer-level timing:")
+        for i, t in enumerate(self.stats["time_per_level"]):
+            print(f"  Level {i}: {t*1000:.3f} ms")
+
+        print(f"\nDistance computations:")
+        print(f"  Total: {self.stats['num_distance_computations']}")
+        print(f"  Clusters visited: {self.stats['num_clusters_visited']}")
+        print(f"  Clusters pruned: {self.stats['num_clusters_pruned']}")
+
+        print(f"\nPruning effectiveness (higher = better):")
+        for i, (examined, kept) in enumerate(
+            zip(
+                self.stats["clusters_examined_per_level"],
+                self.stats["clusters_kept_per_level"],
+            )
         ):
-            # Return top-k by score
-            scores = torch.matmul(keys[qualifying_keys], query)
-            top_k_indices = torch.topk(scores, k=self.max_candidates, largest=True)[1]
-            qualifying_keys = qualifying_keys[top_k_indices]
+            if examined > 0:
+                pruning_rate = 1.0 - (kept / examined)
+                print(
+                    f"  Level {i}: examined {examined}, kept {kept} → {pruning_rate*100:.1f}% pruned"
+                )
+            else:
+                print(f"  Level {i}: examined {examined}, kept {kept} → N/A")
 
-        return qualifying_keys
-
-    def _search_level(
-        self,
-        query: torch.Tensor,
-        threshold: float,
-        level_idx: int,
-        index: "KMeansIndex",
-        keys: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Search a single level to find candidate clusters using cluster radii.
-
-        Args:
-            query: Query vector [head_dim]
-            threshold: Score threshold
-            level_idx: Index of this level
-            index: KMeansIndex
-            keys: All key vectors
-
-        Returns:
-            Tensor of cluster IDs that may contain qualifying keys
-        """
-        level = index.get_level(level_idx)
-        ball_centers = level.cluster_centers.to(query.device)
-        radii = level.cluster_radii.to(query.device)
-
-        # Compute scores for ball centers: s = q·c
-        center_scores = torch.matmul(ball_centers, query)  # [num_clusters]
-
-        # Pruning decisions based on smallest enclosing ball:
-        # - If s - radius >= threshold: all points qualify (mark for inclusion)
-        # - If s + radius < threshold: no points qualify (prune)
-        # - Otherwise: may contain qualifying points (need to recurse)
-
-        # For non-leaf levels, we return clusters that may contain qualifying keys
-        # This includes clusters where s + radius >= threshold
-        candidate_mask = (center_scores + radii) >= threshold
-        candidate_clusters = torch.nonzero(candidate_mask, as_tuple=False).squeeze(-1)
-
-        return candidate_clusters
-
-    def _refine_search(
-        self,
-        query: torch.Tensor,
-        threshold: float,
-        level_idx: int,
-        parent_candidates: torch.Tensor,
-        index: "KMeansIndex",
-        keys: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Refine search at a finer level given parent candidates.
-
-        Args:
-            query: Query vector [head_dim]
-            threshold: Score threshold
-            level_idx: Current (finer) level index
-            parent_candidates: Cluster IDs from parent level
-            index: KMeansIndex
-            keys: All key vectors
-
-        Returns:
-            Tensor of cluster IDs at this level that may contain qualifying keys
-        """
-        if len(parent_candidates) == 0:
-            return torch.tensor([], dtype=torch.long, device=query.device)
-
-        level = index.get_level(level_idx)
-        centroids = level.centroids.to(query.device)
-        radii = level.cluster_radii.to(query.device)
-        parent_assignments = level.parent_assignments.to(query.device)
-
-        # Find clusters at this level that belong to candidate parent clusters
-        child_mask = torch.isin(parent_assignments, parent_candidates)
-        child_clusters = torch.nonzero(child_mask, as_tuple=False).squeeze(-1)
-
-        if len(child_clusters) == 0:
-            return torch.tensor([], dtype=torch.long, device=query.device)
-
-        # Among these child clusters, prune those that can't contain qualifying keys
-        child_centroids = centroids[child_clusters]
-        child_radii = radii[child_clusters]
-        centroid_scores = torch.matmul(child_centroids, query)
-
-        # Keep clusters where s + radius >= threshold
-        qualifying_mask = (centroid_scores + child_radii) >= threshold
-
-        return child_clusters[qualifying_mask]
-
-    def _get_keys_from_clusters(
-        self,
-        cluster_ids: torch.Tensor,
-        level,
-    ) -> torch.Tensor:
-        """
-        Get all key indices belonging to the given clusters.
-
-        Args:
-            cluster_ids: Cluster IDs [num_clusters]
-            level: KMeansIndex.Level
-
-        Returns:
-            Tensor of key indices [num_candidate_keys]
-        """
-        if len(cluster_ids) == 0:
-            return torch.tensor([], dtype=torch.long, device=cluster_ids.device)
-
-        assignments = level.assignments.to(cluster_ids.device)
-
-        # Find all keys assigned to any of the candidate clusters
-        mask = torch.isin(assignments, cluster_ids)
-        key_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-
-        return key_indices
-
-    def _exact_filter(
-        self,
-        query: torch.Tensor,
-        threshold: float,
-        candidate_keys: torch.Tensor,
-        keys: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Perform exact filtering on candidate keys.
-
-        Args:
-            query: Query vector [head_dim]
-            threshold: Score threshold
-            candidate_keys: Candidate key indices [num_candidates]
-            keys: All key vectors [num_keys, head_dim]
-
-        Returns:
-            Tensor of key indices that exactly satisfy q·k >= τ
-        """
-        if len(candidate_keys) == 0:
-            return torch.tensor([], dtype=torch.long, device=keys.device)
-
-        # Compute exact scores
-        candidate_key_vectors = keys[candidate_keys]
-        scores = torch.matmul(candidate_key_vectors, query)
-
-        # Filter by threshold
-        qualifying_mask = scores >= threshold
-        qualifying_keys = candidate_keys[qualifying_mask]
-
-        return qualifying_keys
-
-    def batch_search(
-        self,
-        queries: torch.Tensor,
-        thresholds: torch.Tensor,
-        index: "KMeansIndex",
-        keys: torch.Tensor,
-    ) -> List[torch.Tensor]:
-        """
-        Perform batch range search for multiple queries.
-
-        Args:
-            queries: Query vectors [num_queries, head_dim]
-            thresholds: Thresholds for each query [num_queries]
-            index: KMeansIndex
-            keys: All key vectors [num_keys, head_dim]
-
-        Returns:
-            List of qualifying key index tensors, one per query
-        """
-        results = []
-        for i in range(queries.shape[0]):
-            query = queries[i]
-            threshold = thresholds[i].item()
-            result = self.search(query, threshold, index, keys)
-            results.append(result)
-
-        return results
+        print(f"\nCandidate reduction:")
+        for i, count in enumerate(self.stats["num_keys_per_level"]):
+            print(f"  After level {i}: {count} candidates")
+        print(f"  Final candidates: {self.stats['final_candidates']}")
+        print(f"  Final qualifying: {self.stats['final_qualifying']}")
+        print("=" * 80)
