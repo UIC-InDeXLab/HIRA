@@ -21,7 +21,50 @@ class Index(ABC):
         pass  # TODO
 
     def total_memory_usage(self) -> Dict[str, float]:
-        pass  # TODO
+        """Calculate total memory usage of the index."""
+        total_bytes = 0
+        breakdown = {}
+
+        # Keys
+        if self.keys is not None:
+            keys_bytes = self.keys.element_size() * self.keys.numel()
+            breakdown["keys"] = keys_bytes
+            total_bytes += keys_bytes
+
+        # Per-level data structures
+        for i, level in enumerate(self.levels):
+            level_bytes = 0
+
+            # key_centers
+            if hasattr(level, "key_centers") and level.key_centers is not None:
+                level_bytes += (
+                    level.key_centers.element_size() * level.key_centers.numel()
+                )
+
+            # key_radii
+            if hasattr(level, "key_radii") and level.key_radii is not None:
+                level_bytes += level.key_radii.element_size() * level.key_radii.numel()
+
+            # key_ptrs
+            if hasattr(level, "key_ptrs") and level.key_ptrs is not None:
+                level_bytes += level.key_ptrs.element_size() * level.key_ptrs.numel()
+
+            # cluster_assignments (dict overhead is approximate)
+            if hasattr(level, "cluster_assignments") and level.cluster_assignments:
+                # Approximate: dict overhead + tensor data
+                dict_overhead = len(level.cluster_assignments) * 100  # rough estimate
+                level_bytes += dict_overhead
+                for tensor in level.cluster_assignments.values():
+                    if isinstance(tensor, torch.Tensor):
+                        level_bytes += tensor.element_size() * tensor.numel()
+
+            breakdown[f"level_{i}"] = level_bytes
+            total_bytes += level_bytes
+
+        breakdown["total"] = total_bytes
+        breakdown["total_mb"] = total_bytes / (1024 * 1024)
+
+        return breakdown
 
     def __repr__(self) -> str:
         """String representation of the index."""
@@ -67,9 +110,9 @@ class KMeansIndex(Index):
     class Level:
         level_idx: int
         key_ptrs: torch.Tensor  # index in the original list (cluster representatives)
-        cluster_assignments: Optional[
-            Dict[int, torch.Tensor]
-        ]  # parent_key_ptr -> index of key inside key_ptrs
+        child2parent: Optional[
+            torch.Tensor
+        ]  # child2parent[i]: local index of parent to local key index i
         key_centers: torch.Tensor  # center of ball in the lower level (# key_ptrs)
         key_radii: torch.Tensor  # radius of ball in the lower level (# key_ptrs)
         device: torch.device
@@ -98,9 +141,9 @@ class KMeansIndex(Index):
         # first level (all the points)
         level_0 = KMeansIndex.Level(
             level_idx=current_level_idx,
-            key_ptrs=current_indexes,
-            cluster_assignments={},  # to be updated
-            key_centers=self.keys,
+            key_ptrs=current_indexes.contiguous(),
+            child2parent=None,
+            key_centers=self.keys.contiguous(),
             key_radii=torch.zeros(self.num_keys, device=self.device),
             device=self.device,
             size=current_size,
@@ -116,6 +159,7 @@ class KMeansIndex(Index):
 
             pointers = current_indexes
             points = self.keys[pointers]
+
             (
                 cluster_reps,
                 assignment_dict,
@@ -123,18 +167,50 @@ class KMeansIndex(Index):
                 cluster_radii,
             ) = self._k_means(points, pointers, num_clusters)
 
+            # BUG FIX: 100% RECALL
+            # child level: the level we are clustering to build its parents
+            child_level = self.levels[current_level_idx]
+
+            # Recompute radii so they bound *all leaves* in each parent's subtree
+            # using triangle inequality: R_parent = max_c (R_child[c] + ||mu_child[c] - mu_parent||)
+            if child_level.key_radii is not None and child_level.key_radii.numel() > 0:
+                new_radii = torch.empty_like(cluster_radii)
+
+                child_centers = child_level.key_centers  # [num_children, dim]
+                child_radii = child_level.key_radii  # [num_children]
+
+                for parent_idx, child_local_idx in assignment_dict.items():
+                    # child_local_idx: indices of child clusters for this parent
+                    # NOTE: these indices are consistent with child_level.key_centers order
+                    parent_center = cluster_centers[parent_idx].unsqueeze(0)  # [1, dim]
+
+                    dists = torch.norm(
+                        child_centers[child_local_idx] - parent_center, dim=1
+                    )
+                    # radius up to leaves under this parent
+                    new_radii[parent_idx] = torch.max(
+                        child_radii[child_local_idx] + dists
+                    )
+
+                cluster_radii = new_radii  # overwrite with subtree-aware radii
+
             # Create new level
-            level = KMeansIndex.Level(
+            parent_level = KMeansIndex.Level(
                 level_idx=current_level_idx + 1,
-                key_ptrs=cluster_reps,
-                cluster_assignments={},  # to be assigned (none for highest level)
-                key_centers=cluster_centers,
-                key_radii=cluster_radii,
+                key_ptrs=cluster_reps.contiguous(),
+                # cluster_assignments={},  # to be assigned (none for highest level)
+                child2parent=None,
+                key_centers=cluster_centers.contiguous(),
+                key_radii=cluster_radii.contiguous(),
                 device=self.device,
                 size=len(cluster_reps),
             )
-            self.levels.append(level)
-            self.levels[current_level_idx].cluster_assignments = assignment_dict
+            self.levels.append(parent_level)
+
+            # OPTIMIZED
+            self.levels[current_level_idx].child2parent = (
+                self._flatten_child_parent_dict(assignment_dict, len(current_indexes))
+            )
 
             current_level_idx += 1
             current_size = len(cluster_reps)
@@ -154,8 +230,8 @@ class KMeansIndex(Index):
             # Handle edge case: each point is its own cluster
             cluster_reps = pointers
             assignment_dict = {
-                ptr.item(): torch.tensor([idx], device=points.device)
-                for idx, ptr in enumerate(pointers)
+                idx: torch.tensor([idx], device=points.device)
+                for idx in range(len(pointers))
             }
             cluster_centers = points
             cluster_radii = torch.zeros(len(pointers), device=points.device)
@@ -180,6 +256,25 @@ class KMeansIndex(Index):
         assignment_dict = {}
         cluster_centers = []  # mean of points in each cluster
         cluster_radii = []  # max distance from center
+        counter = 0
+
+        # sizes = torch.bincount(assignments, minlength=num_clusters)
+
+        # nonempty_sizes = sizes[sizes > 0]  # real clusters only
+
+        # min_cluster_size = nonempty_sizes.min().item()
+        # max_cluster_size = nonempty_sizes.max().item()
+        # mean_cluster_size = nonempty_sizes.float().mean().item()
+        # std_cluster_size = nonempty_sizes.float().std().item()
+
+        # num_empty = (sizes == 0).sum().item()
+
+        # print(
+        #     f"KMeans clustering into {num_clusters} clusters: "
+        #     f"real clusters = {len(nonempty_sizes)}, empty clusters = {num_empty}, "
+        #     f"min size {min_cluster_size}, max size {max_cluster_size}, "
+        #     f"mean {mean_cluster_size:.2f}, std {std_cluster_size:.2f}"
+        # )
 
         for cluster_idx, centroid in enumerate(centroids):
             cluster_points_indexes = (assignments == cluster_idx).nonzero(
@@ -192,14 +287,13 @@ class KMeansIndex(Index):
                 dists = torch.norm(
                     points[cluster_points_indexes] - centroid.unsqueeze(0), dim=1
                 )
-                
+
                 # closest point to centroid as representative
                 cluster_rep = cluster_members[torch.argmin(dists)]
-                assignment_dict[cluster_rep.item()] = (
-                    cluster_points_indexes  # the local index
-                )
                 cluster_reps.append(cluster_rep)
-                
+                assignment_dict[counter] = cluster_points_indexes  # the local index
+                counter += 1
+
                 max_dist = torch.max(dists)
                 cluster_radii.append(max_dist)
             else:
@@ -224,3 +318,11 @@ class KMeansIndex(Index):
         )
 
         return cluster_reps, assignment_dict, cluster_centers, cluster_radii
+
+    def _flatten_child_parent_dict(
+        self, assignment: Dict[int, torch.Tensor], num_children: int
+    ) -> torch.Tensor:
+        child2parent = -torch.ones(num_children, dtype=torch.long, device=self.device)
+        for parent, child in assignment.items():
+            child2parent[child] = parent
+        return child2parent.contiguous()
