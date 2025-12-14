@@ -258,24 +258,6 @@ class KMeansIndex(Index):
         cluster_radii = []  # max distance from center
         counter = 0
 
-        # sizes = torch.bincount(assignments, minlength=num_clusters)
-
-        # nonempty_sizes = sizes[sizes > 0]  # real clusters only
-
-        # min_cluster_size = nonempty_sizes.min().item()
-        # max_cluster_size = nonempty_sizes.max().item()
-        # mean_cluster_size = nonempty_sizes.float().mean().item()
-        # std_cluster_size = nonempty_sizes.float().std().item()
-
-        # num_empty = (sizes == 0).sum().item()
-
-        # print(
-        #     f"KMeans clustering into {num_clusters} clusters: "
-        #     f"real clusters = {len(nonempty_sizes)}, empty clusters = {num_empty}, "
-        #     f"min size {min_cluster_size}, max size {max_cluster_size}, "
-        #     f"mean {mean_cluster_size:.2f}, std {std_cluster_size:.2f}"
-        # )
-
         for cluster_idx, centroid in enumerate(centroids):
             cluster_points_indexes = (assignments == cluster_idx).nonzero(
                 as_tuple=True
