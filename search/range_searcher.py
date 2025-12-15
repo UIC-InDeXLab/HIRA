@@ -9,6 +9,13 @@ with cluster radii to efficiently traverse the index.
 import torch
 from ..index.index import KMeansIndex
 
+# Dummy profile decorator (can be overridden by line_profiler if installed)
+try:
+    profile
+except NameError:
+    def profile(func):
+        return func
+
 
 class HalfspaceSearcher:
     def __init__(

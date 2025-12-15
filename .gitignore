@@ -157,3 +157,6 @@ results/
 tmp/
 temp/
 *.tmp
+
+# KV cache data directories
+kv_data/
