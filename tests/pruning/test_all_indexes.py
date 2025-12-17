@@ -22,12 +22,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 from kmeans_ball_index import KMeansBallIndex
 from kmeans_hyperrectangle_index import KMeansHyperrectangleIndex
 from kmeans_convexhull_index import KMeansConvexHullIndex
+from kmeans_ellipsoid_index import KMeansEllipsoidIndex
 from pq_ball_index import PQBallIndex
 from pq_hyperrectangle_index import PQHyperrectangleIndex
 from pq_convexhull_index import PQConvexHullIndex
 from random_ball_index import RandomBallIndex
 from random_hyperrectangle_index import RandomHyperrectangleIndex
 from random_convexhull_index import RandomConvexHullIndex
+from random_exact_ball_index import RandomExactBallIndex
+from random_ellipsoid_index import RandomEllipsoidIndex
 
 
 # Test fixtures and helper functions
@@ -195,6 +198,30 @@ class TestKMeansConvexHullIndex:
         assert 0.0 <= pct <= 100.0
 
 
+class TestKMeansEllipsoidIndex:
+    
+    def test_basic_build(self, sample_keys_high_dim):
+        index = KMeansEllipsoidIndex(num_clusters=8, device='cpu')
+        index.build(sample_keys_high_dim)
+        
+        assert len(index.ellipsoids) == 8
+    
+    def test_clusters_contained(self, clustered_keys):
+        index = KMeansEllipsoidIndex(num_clusters=4, device='cpu')
+        index.build(clustered_keys)
+        
+        for cluster_idx, ellipsoid in enumerate(index.ellipsoids):
+            mask = index.assignments == cluster_idx
+            cluster_points = clustered_keys[mask]
+            if len(cluster_points) == 0:
+                continue
+            diff = cluster_points - ellipsoid.center
+            # Convert inverse shape matrix back to shape matrix for membership test
+            shape_matrix = torch.linalg.pinv(ellipsoid.inv_shape_matrix)
+            quad = torch.einsum('bi,ij,bj->b', diff, shape_matrix, diff)
+            assert torch.all(quad <= 1.0 + 2e-2)
+
+
 # Test class for PQ Ball Index
 class TestPQBallIndex:
     
@@ -328,6 +355,49 @@ class TestRandomConvexHullIndex:
         index.build(sample_keys_high_dim)
         
         assert len(index.convex_hulls) == 20
+
+
+class TestRandomEllipsoidIndex:
+    
+    def test_basic_build(self, sample_keys_high_dim):
+        index = RandomEllipsoidIndex(num_centroids=12, seed=7, device='cpu')
+        index.build(sample_keys_high_dim)
+        
+        assert len(index.ellipsoids) == 12
+    
+    def test_cluster_containment(self, clustered_keys):
+        index = RandomEllipsoidIndex(num_centroids=5, seed=0, device='cpu')
+        index.build(clustered_keys)
+        
+        for centroid_idx, ellipsoid in enumerate(index.ellipsoids):
+            mask = index.assignments == centroid_idx
+            cluster_points = clustered_keys[mask]
+            if len(cluster_points) == 0:
+                continue
+            diff = cluster_points - ellipsoid.center
+            shape_matrix = torch.linalg.pinv(ellipsoid.inv_shape_matrix)
+            quad = torch.einsum('bi,ij,bj->b', diff, shape_matrix, diff)
+            assert torch.all(quad <= 1.0 + 2e-2)
+
+
+class TestRandomExactBallIndex:
+    def test_basic_build(self, sample_keys_high_dim):
+        index = RandomExactBallIndex(num_centroids=10, seed=42, device="cpu")
+        index.build(sample_keys_high_dim)
+
+        assert len(index.balls) == 10
+
+    def test_exact_ball_contains_cluster(self, clustered_keys):
+        index = RandomExactBallIndex(num_centroids=3, seed=0, device="cpu")
+        index.build(clustered_keys)
+
+        for idx, ball in enumerate(index.balls):
+            mask = index.assignments == idx
+            cluster_points = clustered_keys[mask]
+            if len(cluster_points) == 0:
+                continue
+            distances = torch.norm(cluster_points - ball.center, dim=1)
+            assert torch.all(distances <= ball.radius + 1e-5)
 
 
 # Cross-index comparison tests

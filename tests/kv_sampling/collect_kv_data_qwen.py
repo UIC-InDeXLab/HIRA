@@ -1,9 +1,9 @@
-"""Utility to sample key/query vectors from a LLaMA-style model for kv sampling tests.
+"""Utility to sample key/query vectors from a Qwen3-style model for kv sampling tests.
 
-The script loads a causal language model (default: Meta Llama 3) and runs it on a
-set of prompts. It captures the key cache for a target layer to build a realistic
-sample of key vectors and computes the corresponding query vectors, emitting a
-smaller randomly-subsampled set for downstream benchmarks.
+The script loads a Qwen3 causal language model and runs it on a set of prompts.
+It captures the key cache for a target layer to build a realistic sample of key
+vectors and computes the corresponding query vectors, emitting a smaller randomly-
+subsampled set for downstream benchmarks.
 """
 
 from __future__ import annotations
@@ -27,12 +27,16 @@ except Exception:  # pragma: no cover - transformers may be missing during impor
     Cache = None  # type: ignore[assignment]
 
 try:
-    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
-except Exception as exc:  # pragma: no cover
-    raise RuntimeError(
-        "collect_kv_data currently relies on the LLaMA attention implementation. "
-        "Please ensure `transformers` is installed with LLaMA support."
-    ) from exc
+    from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+except Exception:
+    # Fallback: try generic rotary embedding if Qwen2 specific import fails
+    try:
+        from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(
+            "collect_kv_data_qwen requires transformers with Qwen2 or compatible support. "
+            "Please ensure `transformers` is installed with Qwen support."
+        ) from exc
 
 
 DEFAULT_PROMPTS: Sequence[str] = (
@@ -67,8 +71,8 @@ def parse_args() -> SamplingConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model",
-        default="meta-llama/Meta-Llama-3-8B-Instruct",
-        help="Hugging Face model id of the LLaMA-style checkpoint.",
+        default="Qwen/Qwen2.5-7B-Instruct",
+        help="Hugging Face model id of the Qwen3-style checkpoint.",
     )
     parser.add_argument("--revision", default=None, help="Optional model revision.")
     parser.add_argument(
@@ -132,7 +136,7 @@ def parse_args() -> SamplingConfig:
     )
     parser.add_argument(
         "--file-prefix",
-        default="kv_data",
+        default="kv_data_qwen",
         help="Prefix for the saved sample file names.",
     )
     parser.add_argument(
@@ -270,48 +274,61 @@ def compute_query_states(
     layer_input: torch.Tensor,
     position_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Replicates the LLaMA attention projections to obtain query vectors with RoPE."""
+    """Replicates the Qwen2 attention projections to obtain query vectors with RoPE."""
     attn = layer.self_attn
     bsz, seq_len, _ = layer_input.shape
+    
+    # Project to query and key states
     query_states = attn.q_proj(layer_input)
     key_states = attn.k_proj(layer_input)
 
+    # Reshape for multi-head attention
     query_states = query_states.view(bsz, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, seq_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
 
+    # Apply RoPE (Rotary Position Embedding)
     rotary = getattr(attn, "rotary_emb", None)
     if rotary is not None:
         kv_seq_len = key_states.shape[-2]
         rotary_call = getattr(rotary, "forward", rotary)
         rotary_kwargs = {}
+        
+        # Determine the correct signature for the rotary embedding
         try:
             signature = inspect.signature(rotary_call)
         except (TypeError, ValueError):  # pragma: no cover - some C++ impls lack signature
             signature = None
+            
         if signature is not None:
             params = signature.parameters
             if "seq_len" in params:
                 rotary_kwargs["seq_len"] = kv_seq_len
             if "position_ids" in params:
                 rotary_kwargs["position_ids"] = position_ids
+                
         try:
             cos, sin = rotary(key_states, **rotary_kwargs)
         except TypeError:
-            # Fall back to positional invocation for older transformers versions.
+            # Fall back to positional invocation for older transformers versions
             if rotary_kwargs.get("position_ids") is not None:
                 cos, sin = rotary(key_states, rotary_kwargs["position_ids"])
             else:
                 cos, sin = rotary(key_states)
+                
+        # Apply rotary embeddings
         query_states, _ = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        
     return query_states
 
 
 def flatten_heads(tensor: torch.Tensor) -> torch.Tensor:
+    """Flatten the head dimension into the batch dimension."""
     last_dim = tensor.shape[-1]
     return tensor.reshape(-1, last_dim).contiguous()
 
 
 def sample_rows(array: np.ndarray, target: int, rng: np.random.Generator) -> np.ndarray:
+    """Randomly sample rows from an array."""
     if target <= 0 or array.shape[0] <= target:
         return array
     indices = rng.choice(array.shape[0], size=target, replace=False)
@@ -319,6 +336,7 @@ def sample_rows(array: np.ndarray, target: int, rng: np.random.Generator) -> np.
 
 
 def collect_samples(cfg: SamplingConfig) -> dict:
+    """Main collection function that processes prompts and samples key/query vectors."""
     torch.manual_seed(cfg.seed)
     np_rng = np.random.default_rng(cfg.seed)
 
@@ -326,9 +344,11 @@ def collect_samples(cfg: SamplingConfig) -> dict:
     if cfg.hf_token:
         token_kwargs["token"] = cfg.hf_token
 
+    # Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, revision=cfg.revision, **token_kwargs)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+        
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name,
         revision=cfg.revision,
@@ -356,6 +376,7 @@ def collect_samples(cfg: SamplingConfig) -> dict:
 
             cache = ensure_legacy_cache(outputs.past_key_values)
             num_layers = len(cache)
+            
             if selected_layer_index is None:
                 selected_layer_index = cfg.layer_index if cfg.layer_index >= 0 else num_layers + cfg.layer_index
                 if selected_layer_index < 0 or selected_layer_index >= num_layers:
@@ -364,9 +385,11 @@ def collect_samples(cfg: SamplingConfig) -> dict:
                     )
             layer_index = selected_layer_index
 
+            # Extract keys from cache
             layer_keys = cache[layer_index][0].detach().to(torch.float32).to("cpu")
             key_batches.append(flatten_heads(layer_keys).numpy())
 
+            # Extract hidden states and compute queries
             hidden_states = outputs.hidden_states
             if hidden_states is None:
                 raise RuntimeError("Model did not return hidden_states, can't reconstruct query vectors.")
@@ -375,9 +398,11 @@ def collect_samples(cfg: SamplingConfig) -> dict:
             queries = compute_query_states(model.model.layers[layer_index], layer_input, inputs["position_ids"])
             query_batches.append(flatten_heads(queries.detach().to(torch.float32).to("cpu")).numpy())
 
+    # Concatenate all batches
     all_keys = np.concatenate(key_batches, axis=0).astype(np.float32)
     all_queries = np.concatenate(query_batches, axis=0).astype(np.float32)
 
+    # Sample to target sizes
     sampled_keys = sample_rows(all_keys, cfg.key_sample_size, np_rng)
     target_query_samples = min(cfg.query_sample_size, sampled_keys.shape[0])
     sampled_queries = sample_rows(all_queries, target_query_samples, np_rng)
@@ -385,10 +410,12 @@ def collect_samples(cfg: SamplingConfig) -> dict:
     if selected_layer_index is None:
         raise RuntimeError("Sampling failed before any prompts were processed.")
 
+    # Generate output filenames with timestamp
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     base = f"{cfg.prefix}_{Path(cfg.model_name).name}_layer{selected_layer_index}_{timestamp}"
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Save NPZ file
     npz_path = cfg.output_dir / f"{base}.npz"
     np.savez_compressed(
         npz_path,
@@ -396,12 +423,14 @@ def collect_samples(cfg: SamplingConfig) -> dict:
         queries=sampled_queries,
     )
 
+    # Save metadata JSON
     metadata = {
         "model": cfg.model_name,
         "revision": cfg.revision,
         "layer_index": selected_layer_index,
         "num_key_vectors": int(sampled_keys.shape[0]),
         "num_query_vectors": int(sampled_queries.shape[0]),
+        "vector_dimension": int(sampled_keys.shape[1]),
         "max_sequence_length": cfg.max_sequence_length,
         "prompts": list(cfg.prompts),
         "prompt_source": cfg.prompt_source,
@@ -429,6 +458,7 @@ def main() -> None:
             {
                 "keys": result["metadata"]["num_key_vectors"],
                 "queries": result["metadata"]["num_query_vectors"],
+                "dimension": result["metadata"]["vector_dimension"],
                 "npz": str(result["npz_path"]),
                 "metadata": str(result["metadata_path"]),
             },
