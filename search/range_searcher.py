@@ -13,6 +13,7 @@ from ..index.index import KMeansIndex
 try:
     profile
 except NameError:
+
     def profile(func):
         return func
 
@@ -28,88 +29,116 @@ class HalfspaceSearcher:
         self.optimized = optimized
 
     def reset_stats(self):
-        """Reset profiling statistics"""
         self.stats = {"all_keys": [], "active_keys": [], "exact_checks": -1}
 
     @profile
     def search(self, query, threshold, index: "KMeansIndex"):
-        """
-        Args:
-            threshold (_type_): The points with x.q >= threshold are returned
-        """
-
         # normalize query
         query = query / torch.norm(query, p=2)
+
+        # corner case
+        if len(index.levels) == 1:
+            scores = index.keys @ query  # [N]
+            qualifying_idx = (scores >= threshold).nonzero(as_tuple=True)[0]
+            if self.enable_profiling:
+                self.stats["all_keys"] = [index.keys.shape[0]]
+                self.stats["active_keys"] = [qualifying_idx.numel()]
+                self.stats["exact_checks"] = index.keys.shape[0]
+            return qualifying_idx
 
         # search root
         root = index.levels[-1]
 
-        scores = torch.matmul(root.key_centers, query)
-        mask = (scores + root.key_radii) >= threshold
+        scores = torch.matmul(root.ball_centers, query)
+        mask = (scores + root.ball_radii) >= threshold
         active_cluster_idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
-        parent_size = len(root.key_ptrs)
 
         if self.enable_profiling:
-            self.stats["all_keys"].append(len(root.key_ptrs))
+            self.stats["all_keys"].append(root.size)
             self.stats["active_keys"].append(len(active_cluster_idx))
 
         # recursively search down the tree
         levels = index.levels[::-1][1:-1]  # skip root, reverse order, skip level 0
-        for level_idx, level in enumerate(levels):
+        for level in levels:
             # level here is the child level of previous one
-            # OPTIMIZED
-            parent_mask = torch.zeros(
-                parent_size, dtype=torch.bool, device=query.device
-            )
-            parent_mask[active_cluster_idx] = True
-            child_mask = parent_mask[level.child2parent]
 
-            # get radii and centers
-            child_idx = torch.nonzero(child_mask, as_tuple=False).squeeze(1)
-            child_radii = level.key_radii.index_select(0, child_idx)
-            child_centers = level.key_centers.index_select(0, child_idx)
+            if active_cluster_idx.numel() == 0:
+                return torch.tensor([], dtype=torch.long, device=query.device)
+
+            # CSR is fast for small fraction of parents, otherwise use child2parent
+            use_csr = False  # hardcoded for now
+
+            if use_csr:
+                active_parents = active_cluster_idx
+                rowptr = level.p_pointer
+                p2c = level.parent2child
+
+                active_parents, _ = torch.sort(active_parents)
+
+                starts = rowptr[active_parents]  # [A]
+                ends = rowptr[active_parents + 1]  # [A]
+                counts = ends - starts  # [A]
+                total = counts.sum()
+
+                if total.item() == 0:
+                    return torch.empty((0,), dtype=torch.long, device=query.device)
+
+                base = torch.repeat_interleave(starts, counts)  # [total]
+                csum = torch.cumsum(counts, dim=0)
+                seg_starts = csum - counts
+                inner = torch.arange(
+                    total, device=query.device
+                ) - torch.repeat_interleave(seg_starts, counts)
+
+                idx_in_p2c = base + inner
+                child_idx = p2c[idx_in_p2c]  # [total] child local ids
+            else:
+                p = level.child2parent  # [C]
+                parent_mask = torch.zeros(
+                    level.num_parents, dtype=torch.bool, device=query.device
+                )
+                parent_mask[active_cluster_idx] = True
+
+                child_mask = parent_mask[p]  # [C] bool
+                child_idx = child_mask.nonzero(as_tuple=True)[0]  # child local ids
+
+            child_radii = level.ball_radii.index_select(0, child_idx)
+            child_centers = level.ball_centers.index_select(0, child_idx)
 
             # scores
             scores = torch.matmul(child_centers, query)
             mask = (scores + child_radii) >= threshold
             active_cluster_idx = child_idx[mask]
 
-            # option 2
-            # mask = torch.add(child_radii, torch.mv(child_centers, query)).ge(threshold)
-            # active_cluster_ptrs = pointers[mask]
-
-            parent_size = len(level.key_ptrs)
-
             if self.enable_profiling:
                 self.stats["all_keys"].append(len(child_centers))
                 self.stats["active_keys"].append(len(active_cluster_idx))
 
-            if len(active_cluster_idx) == 0:
-                return torch.tensor([], dtype=torch.long, device=query.device)
+        # LEVEL 1 -> 0
+        level0 = index.levels[0]  # keys
+        level1 = index.levels[1]  # clusters of keys
 
-        # ONLY LAST LEVEL: level 1->0
-        parent_mask = torch.zeros(parent_size, dtype=torch.bool, device=query.device)
+        # active_cluster_idx are indices into level1 (parents of level0)
+        P1 = level1.size
+
+        parent_mask = torch.zeros(P1, dtype=torch.bool, device=query.device)
         parent_mask[active_cluster_idx] = True
-        child_mask = parent_mask[index.levels[0].child2parent]
 
-        # get radii and centers
-        child_idx = torch.nonzero(child_mask, as_tuple=False).squeeze(1)
-
-        if self.enable_profiling:
-            self.stats["exact_checks"] = len(child_idx)
+        # level0.child2parent: [num_keys] mapping key_id -> parent_id in level1
+        leaf_idx = parent_mask[level0.child2parent].nonzero(as_tuple=True)[0]
 
         # TODO: DANGER Remove
         # child_idx = child_idx[:len(index.keys) // 5]
-        # self.stats["exact_checks"] = len(child_idx)
+        # self.stats["exact_checks"] = len(child_idx)?
 
-        # exact filter on final candidates
-        active_cluster_ptrs = index.levels[0].key_ptrs[child_idx]
-        keys = index.keys[active_cluster_ptrs]
-        final_scores = torch.matmul(keys, query)
-        final_mask = final_scores >= threshold
-        qualifying_keys = active_cluster_ptrs[final_mask]
+        if self.enable_profiling:
+            self.stats["exact_checks"] = len(leaf_idx)
 
-        return qualifying_keys  # indices of keys satisfying q.k >= threshold
+        # exact check
+        scores = index.keys[leaf_idx] @ query
+        qualifying_idx = leaf_idx[scores >= threshold]
+
+        return qualifying_idx  # indices of keys satisfying q.k >= threshold
 
     def print_stats(self):
         """Print detailed profiling statistics"""

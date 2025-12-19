@@ -60,12 +60,12 @@ class TestIndexConstruction:
 
         # Level 0 should have all keys
         assert level_0.size == num_keys
-        assert len(level_0.key_ptrs) == num_keys
+        assert len(level_0.ball_centers) == num_keys
 
         # All indices should be present
-        expected_indices = set(range(num_keys))
-        actual_indices = set(level_0.key_ptrs.tolist())
-        assert actual_indices == expected_indices
+        # expected_indices = set(range(num_keys))
+        # actual_indices = set(level_0.ball_centers.tolist())
+        assert level_0.ball_centers.equal(keys)
 
     def test_hierarchical_size_reduction(self):
         """Test that each level reduces size by approximately branching_factor."""
@@ -113,22 +113,30 @@ class TestIndexConstruction:
 
             # child2parent should exist for all levels except the last
             assert level.child2parent is not None
-            
+
             # child2parent should have same length as number of keys in level
             assert len(level.child2parent) == level.size
-            
+
             # All parent indices should be valid
             next_level = index.levels[level_idx + 1]
             valid_parent_indices = set(range(next_level.size))
-            
+
             for child_idx, parent_idx in enumerate(level.child2parent.tolist()):
                 # Parent index should be valid (0 to next_level.size - 1)
-                assert parent_idx >= 0, f"Invalid parent index {parent_idx} at child {child_idx}"
-                assert parent_idx < next_level.size, f"Parent index {parent_idx} out of bounds (max: {next_level.size - 1})"
-                
+                assert (
+                    parent_idx >= 0
+                ), f"Invalid parent index {parent_idx} at child {child_idx}"
+                assert (
+                    parent_idx < next_level.size
+                ), f"Parent index {parent_idx} out of bounds (max: {next_level.size - 1})"
+
             # Verify that each parent in next level has at least one child
-            parent_counts = torch.bincount(level.child2parent, minlength=next_level.size)
-            assert torch.all(parent_counts > 0), "Some parents in next level have no children"
+            parent_counts = torch.bincount(
+                level.child2parent, minlength=next_level.size
+            )
+            assert torch.all(
+                parent_counts > 0
+            ), "Some parents in next level have no children"
 
     def test_cluster_radii_properties(self):
         """Test that cluster radii properly bound their points."""
@@ -147,29 +155,29 @@ class TestIndexConstruction:
             level = index.levels[level_idx]
 
             # All radii should be non-negative
-            assert torch.all(level.key_radii >= 0)
+            assert torch.all(level.ball_radii >= 0)
 
             # Centers should have the correct dimension
-            assert level.key_centers.shape == (level.size, head_dim)
+            assert level.ball_centers.shape == (level.size, head_dim)
 
             # For each cluster in this level, verify the radius bounds all its children
             # The child2parent mapping is stored in the PREVIOUS level
             prev_level = index.levels[level_idx - 1]
-            
+
             if prev_level.child2parent is not None:
                 # For each parent cluster in the current level
                 for parent_idx in range(level.size):
                     # Find all children that belong to this parent
                     child_mask = prev_level.child2parent == parent_idx
                     child_indices = torch.nonzero(child_mask, as_tuple=True)[0]
-                    
+
                     if len(child_indices) > 0:
-                        center = level.key_centers[parent_idx]
-                        radius = level.key_radii[parent_idx]
+                        center = level.ball_centers[parent_idx]
+                        radius = level.ball_radii[parent_idx]
 
                         # Get the actual child points from the previous level
-                        child_points_ptrs = prev_level.key_ptrs[child_indices]
-                        child_points = index.keys[child_points_ptrs]
+                        child_points = prev_level.ball_centers[child_indices]
+                        # child_points = index.keys[child_points_ptrs]
 
                         # All points should be within radius of center
                         distances = torch.norm(
@@ -179,8 +187,9 @@ class TestIndexConstruction:
 
                         # Radius should be at least as large as max distance
                         # (allow small numerical tolerance)
-                        assert radius >= max_distance - 1e-5, \
-                            f"Cluster {parent_idx}: radius {radius:.6f} < max_distance {max_distance:.6f}"
+                        assert (
+                            radius >= max_distance - 1e-5
+                        ), f"Cluster {parent_idx}: radius {radius:.6f} < max_distance {max_distance:.6f}"
 
 
 class TestRangeSearchEmpty:
@@ -315,7 +324,9 @@ class TestRangeSearchManyResults:
         # No false positives
         if len(result_set) > 0:
             precision = len(result_set & ground_truth_set) / len(result_set)
-            assert precision == 1.0, f"Found {len(result_set - ground_truth_set)} false positives"
+            assert (
+                precision == 1.0
+            ), f"Found {len(result_set - ground_truth_set)} false positives"
 
         # Should have many results
         assert len(ground_truth) > num_keys * 0.3
@@ -357,11 +368,13 @@ class TestRangeSearchManyResults:
         if len(ground_truth_set) > 0:
             recall = len(result_set & ground_truth_set) / len(ground_truth_set)
             assert recall >= 0.99, f"Recall {recall*100:.2f}% is below 99%"
-        
+
         # No false positives
         if len(result_set) > 0:
             precision = len(result_set & ground_truth_set) / len(result_set)
-            assert precision == 1.0, f"Found {len(result_set - ground_truth_set)} false positives"
+            assert (
+                precision == 1.0
+            ), f"Found {len(result_set - ground_truth_set)} false positives"
 
         # Should have many results
         assert len(ground_truth) > num_keys * 0.2
@@ -399,7 +412,7 @@ class TestRangeSearchManyResults:
 
         recall = len(result_set & ground_truth_set) / len(ground_truth_set)
         assert recall >= 0.99, f"Recall {recall*100:.2f}% is below 99%"
-        
+
         # No false positives
         if len(result_set) > 0:
             precision = len(result_set & ground_truth_set) / len(result_set)
@@ -483,12 +496,16 @@ class TestRangeSearchRecall:
 
             if len(ground_truth_set) > 0:
                 recall = len(result_set & ground_truth_set) / len(ground_truth_set)
-                assert recall >= 0.99, f"Recall {recall*100:.2f}% is below 99% for head_dim={head_dim}"
-            
+                assert (
+                    recall >= 0.99
+                ), f"Recall {recall*100:.2f}% is below 99% for head_dim={head_dim}"
+
             # No false positives
             if len(result_set) > 0:
                 precision = len(result_set & ground_truth_set) / len(result_set)
-                assert precision == 1.0, f"Found false positives for head_dim={head_dim}"
+                assert (
+                    precision == 1.0
+                ), f"Found false positives for head_dim={head_dim}"
 
     def test_recall_with_different_branching_factors(self):
         """Test 99%+ recall with different branching factors."""
@@ -520,12 +537,16 @@ class TestRangeSearchRecall:
 
             if len(ground_truth_set) > 0:
                 recall = len(result_set & ground_truth_set) / len(ground_truth_set)
-                assert recall >= 0.99, f"Recall {recall*100:.2f}% is below 99% for branching_factor={branching_factor}"
-            
+                assert (
+                    recall >= 0.99
+                ), f"Recall {recall*100:.2f}% is below 99% for branching_factor={branching_factor}"
+
             # No false positives
             if len(result_set) > 0:
                 precision = len(result_set & ground_truth_set) / len(result_set)
-                assert precision == 1.0, f"Found false positives for branching_factor={branching_factor}"
+                assert (
+                    precision == 1.0
+                ), f"Found false positives for branching_factor={branching_factor}"
 
     def test_recall_boundary_cases(self):
         """Test 99%+ recall at threshold boundaries."""
@@ -563,12 +584,16 @@ class TestRangeSearchRecall:
 
             if len(ground_truth_set) > 0:
                 recall = len(result_set & ground_truth_set) / len(ground_truth_set)
-                assert recall >= 0.99, f"Recall {recall*100:.2f}% is below 99% at boundary threshold={threshold:.4f}"
-            
+                assert (
+                    recall >= 0.99
+                ), f"Recall {recall*100:.2f}% is below 99% at boundary threshold={threshold:.4f}"
+
             # No false positives
             if len(result_set) > 0:
                 precision = len(result_set & ground_truth_set) / len(result_set)
-                assert precision == 1.0, f"Found false positives at threshold={threshold:.4f}"
+                assert (
+                    precision == 1.0
+                ), f"Found false positives at threshold={threshold:.4f}"
 
 
 class TestRangeSearchEdgeCases:
@@ -626,7 +651,7 @@ class TestRangeSearchEdgeCases:
         if len(ground_truth_set) > 0:
             recall = len(result_set & ground_truth_set) / len(ground_truth_set)
             assert recall >= 0.99, f"Recall {recall*100:.2f}% is below 99%"
-        
+
         # No false positives
         if len(result_set) > 0:
             precision = len(result_set & ground_truth_set) / len(result_set)
@@ -661,12 +686,12 @@ class TestRangeSearchEdgeCases:
 
         # Key at index 100 should be included (>= not just >)
         assert 100 in result_set
-        
+
         # Verify recall >= 99%
         if len(ground_truth_set) > 0:
             recall = len(result_set & ground_truth_set) / len(ground_truth_set)
             assert recall >= 0.99, f"Recall {recall*100:.2f}% is below 99%"
-        
+
         # No false positives
         if len(result_set) > 0:
             precision = len(result_set & ground_truth_set) / len(result_set)
@@ -704,11 +729,284 @@ class TestRangeSearchEdgeCases:
         if len(ground_truth_set) > 0:
             recall = len(result_set & ground_truth_set) / len(ground_truth_set)
             assert recall >= 0.99, f"Recall {recall*100:.2f}% is below 99%"
-        
+
         # No false positives
         if len(result_set) > 0:
             precision = len(result_set & ground_truth_set) / len(result_set)
             assert precision == 1.0, f"Found false positives"
+
+
+def brute_force_halfspace(keys: torch.Tensor, q: torch.Tensor, threshold: float):
+    q = q / q.norm(p=2)
+    scores = keys @ q
+    return (scores >= threshold).nonzero(as_tuple=True)[0]
+
+
+def assert_csr_valid(
+    child2parent: torch.Tensor,
+    parent2child: torch.Tensor,
+    rowptr: torch.Tensor,
+    num_parents: int,
+):
+    """
+    CSR encoding: parent2child[rowptr[p]:rowptr[p+1]] are children with parent p.
+    child2parent[c] = p.
+    """
+    assert child2parent.dtype == torch.long
+    assert parent2child.dtype == torch.long
+    assert rowptr.dtype == torch.long
+
+    C = child2parent.numel()
+    assert parent2child.numel() == C
+    assert rowptr.numel() == num_parents + 1
+
+    # rowptr monotone, starts at 0, ends at C
+    assert rowptr[0].item() == 0
+    assert rowptr[-1].item() == C
+    assert torch.all(rowptr[1:] >= rowptr[:-1]).item()
+
+    # child2parent in range
+    assert child2parent.min().item() >= 0
+    assert child2parent.max().item() < num_parents
+
+    # parent2child is a permutation of 0..C-1 if it was built by argsort(child2parent)
+    # (Your _parent_csr returns children_sorted = argsort(child2parent))
+    # So parent2child should contain each child exactly once.
+    sorted_children = torch.sort(parent2child).values
+    assert torch.equal(
+        sorted_children, torch.arange(C, device=child2parent.device, dtype=torch.long)
+    )
+
+    # Consistency: every child in parent2child slice must map to that parent in child2parent
+    for p in range(num_parents):
+        s = rowptr[p].item()
+        e = rowptr[p + 1].item()
+        if e <= s:
+            continue
+        children = parent2child[s:e]
+        assert torch.all(child2parent[children] == p).item()
+
+
+@pytest.fixture(scope="module")
+def device():
+    # Keep tests deterministic and simple: CPU
+    return torch.device("cpu")
+
+
+def make_config(device, num_levels=4, branching_factor=4, max_iterations=20):
+    return KMeansIndexConfig(
+        max_iterations=max_iterations,
+        device=device,
+        num_levels=num_levels,
+        branching_factor=branching_factor,
+    )
+
+
+def make_keys(n=200, d=32, seed=0, device=torch.device("cpu")):
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    x = torch.randn(n, d, generator=g)
+    # Optional: normalize keys if your app assumes that
+    # x = x / x.norm(dim=1, keepdim=True)
+    return x.to(device)
+
+
+def test_build_basic_invariants(device):
+    keys = make_keys(n=257, d=24, seed=1, device=device)
+    cfg = make_config(
+        device=device, num_levels=5, branching_factor=4, max_iterations=10
+    )
+    index = KMeansIndex(cfg).build(keys)
+
+    assert index.keys is not None
+    assert index.num_keys == keys.shape[0]
+    assert index.dim == keys.shape[1]
+    assert len(index.levels) >= 1
+
+    # Level 0: balls correspond to keys
+    L0 = index.levels[0]
+    assert L0.level_idx == 0
+    assert L0.ball_centers.shape == keys.shape
+    assert L0.ball_radii.shape == (keys.shape[0],)
+    assert torch.allclose(L0.ball_centers, keys)
+
+    # Root should exist if num_levels>1 AND branching allows it; otherwise it might stop early.
+    # But levels should be ordered by level_idx
+    for i, L in enumerate(index.levels):
+        assert L.level_idx == i
+        assert L.size == L.ball_centers.shape[0]
+        assert L.ball_radii.shape[0] == L.size
+
+
+def test_parent_child_links_present_for_internal_levels(device):
+    keys = make_keys(n=300, d=16, seed=2, device=device)
+    cfg = make_config(
+        device=device, num_levels=6, branching_factor=5, max_iterations=15
+    )
+    index = KMeansIndex(cfg).build(keys)
+
+    # For every child level that has a parent (i.e., levels 0..(h-1)),
+    # we expect child2parent/CSR/num_parents to be filled.
+    # The last level (root) has no parent mapping.
+    for i in range(len(index.levels) - 1):
+        child = index.levels[i]
+        parent = index.levels[i + 1]
+
+        assert child.child2parent is not None
+        assert child.parent2child is not None
+        assert child.p_pointer is not None
+        assert child.num_parents is not None
+
+        C = child.size
+        P = child.num_parents
+        assert child.child2parent.shape == (C,)
+        assert P == parent.size  # critical invariant
+        assert_csr_valid(child.child2parent, child.parent2child, child.p_pointer, P)
+
+    # Root has no parent
+    root = index.levels[-1]
+    assert root.child2parent is None
+    assert root.parent2child is None
+    assert root.p_pointer is None
+    assert root.num_parents is None
+
+
+def test_num_parents_matches_parent_size(device):
+    keys = make_keys(n=123, d=20, seed=3, device=device)
+    cfg = make_config(
+        device=device, num_levels=5, branching_factor=3, max_iterations=10
+    )
+    index = KMeansIndex(cfg).build(keys)
+
+    for i in range(len(index.levels) - 1):
+        child = index.levels[i]
+        parent = index.levels[i + 1]
+        assert child.num_parents == parent.size
+
+
+def test_search_matches_bruteforce_random_queries(device):
+    keys = make_keys(n=400, d=32, seed=4, device=device)
+    cfg = make_config(
+        device=device, num_levels=6, branching_factor=4, max_iterations=20
+    )
+    index = KMeansIndex(cfg).build(keys)
+    searcher = HalfspaceSearcher(enable_profiling=True)
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(0)
+
+    for t in [0.0, 0.2, 0.5]:
+        for _ in range(10):
+            q = torch.randn(keys.shape[1], generator=g, device=device)
+            # threshold in dot space; pick something reasonable
+            threshold = t
+
+            got = searcher.search(q, threshold, index)  # should return indices
+            exp = brute_force_halfspace(keys, q, threshold)
+
+            got_sorted = torch.sort(got).values
+            exp_sorted = torch.sort(exp).values
+
+            # Correctness: hierarchical pruning should not drop true positives
+            assert torch.equal(
+                got_sorted, exp_sorted
+            ), f"Mismatch at threshold={threshold}"
+
+
+def test_search_extreme_thresholds(device):
+    keys = make_keys(n=200, d=16, seed=5, device=device)
+    cfg = make_config(
+        device=device, num_levels=5, branching_factor=4, max_iterations=10
+    )
+    index = KMeansIndex(cfg).build(keys)
+    searcher = HalfspaceSearcher(enable_profiling=False)
+
+    q = torch.randn(keys.shape[1], device=device)
+
+    # Very high threshold -> usually empty
+    got = searcher.search(q, threshold=10.0, index=index)
+    assert got.numel() == 0
+
+    # Very low threshold -> all keys qualify
+    got = searcher.search(q, threshold=-10.0, index=index)
+    assert got.numel() == keys.shape[0]
+
+
+def test_search_one_level_fallback(device):
+    """
+    Covers the case len(index.levels)==1 (no hierarchy).
+    This requires your search() to handle that case explicitly.
+    """
+    keys = make_keys(n=50, d=8, seed=6, device=device)
+    cfg = make_config(device=device, num_levels=1, branching_factor=4, max_iterations=5)
+    index = KMeansIndex(cfg).build(keys)
+    assert len(index.levels) == 1
+
+    searcher = HalfspaceSearcher(enable_profiling=True)
+    q = torch.randn(keys.shape[1], device=device)
+    thr = 0.1
+
+    got = searcher.search(q, thr, index)
+    exp = brute_force_halfspace(keys, q, thr)
+
+    assert torch.equal(torch.sort(got).values, torch.sort(exp).values)
+
+
+def test_search_two_levels_only(device):
+    """
+    Covers len(index.levels)==2 (level0 + root/level1) where manual L1->L0 expansion must work.
+    """
+    keys = make_keys(n=80, d=12, seed=7, device=device)
+    cfg = make_config(
+        device=device, num_levels=2, branching_factor=4, max_iterations=10
+    )
+    index = KMeansIndex(cfg).build(keys)
+    assert len(index.levels) == 2
+
+    searcher = HalfspaceSearcher(enable_profiling=False)
+    q = torch.randn(keys.shape[1], device=device)
+    thr = 0.0
+
+    got = searcher.search(q, thr, index)
+    exp = brute_force_halfspace(keys, q, thr)
+
+    assert torch.equal(torch.sort(got).values, torch.sort(exp).values)
+
+
+def test_refined_radii_upper_bound_property(device):
+    """
+    Sanity: refined parent radius should upper bound all children balls:
+      For each child c assigned to parent p:
+         ||center_c - center_p|| + radius_c <= radius_p
+    This checks your triangle-inequality refinement logic.
+    """
+    keys = make_keys(n=300, d=10, seed=8, device=device)
+    cfg = make_config(
+        device=device, num_levels=5, branching_factor=5, max_iterations=15
+    )
+    index = KMeansIndex(cfg).build(keys)
+
+    for i in range(len(index.levels) - 1):
+        child = index.levels[i]
+        parent = index.levels[i + 1]
+
+        # Skip if mapping isn't present (shouldn't happen except root)
+        assert child.child2parent is not None
+        c2p = child.child2parent
+
+        child_centers = child.ball_centers
+        child_radii = child.ball_radii
+        parent_centers = parent.ball_centers
+        parent_radii = parent.ball_radii
+
+        # compute for all children at once:
+        # dist(child_center, parent_center[child2parent])
+        dist = torch.norm(child_centers - parent_centers[c2p], dim=1)
+        lhs = dist + child_radii
+        rhs = parent_radii[c2p]
+
+        # Allow tiny floating error
+        assert torch.all(lhs <= rhs + 1e-5).item()
 
 
 if __name__ == "__main__":
