@@ -114,18 +114,49 @@ class HalfspaceSearcher:
                 self.stats["all_keys"].append(len(child_centers))
                 self.stats["active_keys"].append(len(active_cluster_idx))
 
-        # LEVEL 1 -> 0
-        level0 = index.levels[0]  # keys
-        level1 = index.levels[1]  # clusters of keys
+        if not use_csr:
+            # LEVEL 1 -> 0 (child2parent expansion)
+            level0 = index.levels[0]  # keys
+            level1 = index.levels[1]  # clusters of keys
 
-        # active_cluster_idx are indices into level1 (parents of level0)
-        P1 = level1.size
+            # active_cluster_idx are indices into level1 (parents of level0)
+            P1 = level1.size
 
-        parent_mask = torch.zeros(P1, dtype=torch.bool, device=query.device)
-        parent_mask[active_cluster_idx] = True
+            parent_mask = torch.zeros(P1, dtype=torch.bool, device=query.device)
+            parent_mask[active_cluster_idx] = True
 
-        # level0.child2parent: [num_keys] mapping key_id -> parent_id in level1
-        leaf_idx = parent_mask[level0.child2parent].nonzero(as_tuple=True)[0]
+            # level0.child2parent: [num_keys] mapping key_id -> parent_id in level1
+            leaf_idx = parent_mask[level0.child2parent].nonzero(as_tuple=True)[0]
+        else:
+            # LEVEL 1 -> 0 (CSR expansion)
+            level0 = index.levels[0]  # child level (keys)
+            level1 = index.levels[1]  # parent level (clusters)
+
+            active_parents = active_cluster_idx  # indices into level1
+            rowptr = level0.p_pointer  # [P1 + 1]
+            p2c = level0.parent2child  # [num_keys]
+
+            # Sort active parents (important for CSR correctness)
+            active_parents, _ = torch.sort(active_parents)
+
+            # CSR ranges
+            starts = rowptr[active_parents]  # [A]
+            ends = rowptr[active_parents + 1]  # [A]
+            counts = ends - starts  # [A]
+            total = counts.sum()
+
+            if total.item() == 0:
+                return torch.empty((0,), dtype=torch.long, device=query.device)
+
+            # Expand CSR
+            base = torch.repeat_interleave(starts, counts)  # [total]
+            csum = torch.cumsum(counts, dim=0)
+            seg_starts = csum - counts
+            inner = torch.arange(total, device=query.device) - torch.repeat_interleave(
+                seg_starts, counts
+            )
+
+            leaf_idx = p2c[base + inner]  # [total] key indices
 
         # TODO: DANGER Remove
         # child_idx = child_idx[:len(index.keys) // 5]
@@ -134,11 +165,25 @@ class HalfspaceSearcher:
         if self.enable_profiling:
             self.stats["exact_checks"] = len(leaf_idx)
 
-        # exact check
-        scores = index.keys[leaf_idx] @ query
-        qualifying_idx = leaf_idx[scores >= threshold]
+        # # exact check
+        # ids = index.keys[leaf_idx]
+        # scores = torch.matmul(ids, query)
+        # qualifying_idx = leaf_idx[scores >= threshold]
+        qualifying_idx = self.exact_filter_chunked(
+            index.keys, leaf_idx, query, threshold
+        )
 
         return qualifying_idx  # indices of keys satisfying q.k >= threshold
+
+    def exact_filter_chunked(self, keys, leaf_idx, query, threshold, chunk=1024 * 8):
+        out = []
+        for s in range(0, leaf_idx.numel(), chunk):
+            sub = leaf_idx[s : s + chunk]
+            scores = keys.index_select(0, sub).matmul(query)  # matmul or @
+            keep = scores >= threshold
+            if keep.any():
+                out.append(sub[keep])
+        return torch.cat(out) if out else leaf_idx.new_empty((0,))
 
     def print_stats(self):
         """Print detailed profiling statistics"""

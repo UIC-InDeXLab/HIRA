@@ -15,6 +15,7 @@ To profile specific functions, add the @profile decorator to them in the source 
 import argparse
 import math
 import torch
+import numpy as np
 import sys
 from pathlib import Path
 
@@ -57,27 +58,63 @@ def generate_anisotropic_gaussian_data(
 
 
 def generate_mixture_of_gaussians_data(
-    num_keys: int, dim: int, num_gaussians: int = 5, seed: int = 42
+    num_keys: int, dim: int, num_gaussians: int = 10, seed: int = 42
 ) -> torch.Tensor:
-    """Generate mixture of Gaussians with random means and covariances."""
+    """Generate mixture of Gaussians using fitted parameters from real data."""
     torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    # Generate random means for each Gaussian
-    means = torch.randn(num_gaussians, dim) * 2
+    # Component parameters from GMM fitted to real KV cache data
+    gmm_weights = np.array(
+        [0.1255, 0.2067, 0.0046, 0.1678, 0.0027, 0.0928, 0.0143, 0.3021, 0.0258, 0.0576]
+    )
+    gmm_weights = (
+        gmm_weights / gmm_weights.sum()
+    )  # Normalize to ensure sum is exactly 1.0
+    gmm_means = [
+        1.3819,
+        -0.9039,
+        -12.4851,
+        0.6147,
+        10.9554,
+        -1.9572,
+        4.2475,
+        -0.0570,
+        -3.3843,
+        2.4689,
+    ]
+    gmm_stds = [
+        0.3879,
+        0.3699,
+        2.1610,
+        0.3008,
+        1.9482,
+        0.5171,
+        1.0753,
+        0.2514,
+        1.0471,
+        0.5737,
+    ]
 
-    # Generate random covariance scales for each Gaussian
-    scales = torch.rand(num_gaussians, dim) * 0.5 + 0.3
+    # Sample component assignments based on weights
+    component_assignments = np.random.choice(
+        num_gaussians, size=num_keys, p=gmm_weights
+    )
 
-    # Assign each point to a random Gaussian component
-    assignments = torch.randint(0, num_gaussians, (num_keys,))
-
-    # Generate points from their assigned Gaussian
+    # Generate points from each component
     keys = torch.zeros(num_keys, dim)
     for i in range(num_gaussians):
-        mask = assignments == i
-        num_in_component = mask.sum().item()
-        if num_in_component > 0:
-            keys[mask] = means[i] + torch.randn(num_in_component, dim) * scales[i]
+        # Find indices assigned to this component
+        component_mask = component_assignments == i
+        n_points_in_component = component_mask.sum()
+
+        if n_points_in_component > 0:
+            # Generate points from this Gaussian component
+            # Use the fitted mean and std for each dimension
+            component_points = (
+                torch.randn(n_points_in_component, dim) * gmm_stds[i] + gmm_means[i]
+            )
+            keys[component_mask] = component_points
 
     return keys
 
@@ -132,8 +169,43 @@ def generate_zipf_data(
     return keys
 
 
+def generate_real_data(
+    num_keys: int, dim: int, real_data_path: str, seed: int = 42
+) -> torch.Tensor:
+    """Load real KV cache data from NPZ file.
+
+    Args:
+        num_keys: Number of keys to use (will subsample if needed)
+        dim: Expected dimension (for validation)
+        real_data_path: Path to .npz file containing 'keys' array
+        seed: Random seed for subsampling
+
+    Returns:
+        Tensor of shape (num_keys, dim) containing real KV cache keys
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    print(f"  Loading real data from: {real_data_path}")
+    data = np.load(real_data_path)
+    keys = torch.from_numpy(data["keys"]).float()
+
+    # Subsample if needed
+    if len(keys) > num_keys:
+        indices = torch.randperm(len(keys))[:num_keys]
+        keys = keys[indices]
+
+    print(f"  Loaded {len(keys)} real keys (dimension={keys.shape[1]})")
+
+    return keys
+
+
 def generate_data(
-    num_keys: int, dim: int, distribution: str = "uniform", seed: int = 42
+    num_keys: int,
+    dim: int,
+    distribution: str = "uniform",
+    seed: int = 42,
+    real_data_path: str = None,
 ) -> torch.Tensor:
     """Generate test data based on distribution type."""
     if distribution == "uniform":
@@ -146,32 +218,40 @@ def generate_data(
         return generate_mixture_of_gaussians_data(num_keys, dim, seed=seed)
     elif distribution == "zipf":
         return generate_zipf_data(num_keys, dim, seed=seed)
+    elif distribution == "real":
+        if real_data_path is None:
+            raise ValueError("real_data_path must be provided for 'real' distribution")
+        return generate_real_data(num_keys, dim, real_data_path, seed=seed)
     else:
         raise ValueError(
-            f"Unknown distribution: {distribution}. Choose from: uniform, uniform_sphere, anisotropic_gaussian, mixture_of_gaussians, zipf"
+            f"Unknown distribution: {distribution}. Choose from: uniform, uniform_sphere, anisotropic_gaussian, mixture_of_gaussians, zipf, real"
         )
 
 
 @profile
-def brute_force_search(index: "Index", query: torch.Tensor, threshold: float):
+def brute_force_search(
+    index: "Index", query: torch.Tensor, threshold: float, num_runs: int = 1
+):
     """Brute-force search."""
-    query_norm = query / torch.norm(query, p=2)
-    scores = torch.matmul(index.keys, query_norm)
-    result = (scores >= threshold).nonzero(as_tuple=True)[0]
+    for _ in range(num_runs):
+        query_norm = query / torch.norm(query, p=2)
+        scores = torch.matmul(index.keys, query_norm)
+        result = (scores >= threshold).nonzero(as_tuple=True)[0]
     return result
 
 
 @profile
-def profile_indexed_search(index, query, threshold):
+def profile_indexed_search(index, query, threshold, num_runs: int = 1):
     """Profile the indexed search."""
-    searcher = HalfspaceSearcher(enable_profiling=True)
-    result = searcher.search(query, threshold, index)
+    for _ in range(num_runs):
+        searcher = HalfspaceSearcher(enable_profiling=True)
+        result = searcher.search(query, threshold, index)
     return result, searcher
 
 
-def profile_brute_force(index, query, threshold):
+def profile_brute_force(index, query, threshold, num_runs: int = 1):
     """Profile brute-force search."""
-    return brute_force_search(index, query, threshold)
+    return brute_force_search(index, query, threshold, num_runs=num_runs)
 
 
 DEFAULT_NUM_KEYS = 100000
@@ -182,6 +262,7 @@ DEFAULT_ITERATIONS = 1
 DEFAULT_DISTRIBUTION = "uniform"
 DEFAULT_DEVICE = "cpu"
 DEFAULT_TARGET_RESULTS = 10
+DEFAULT_NUM_RUNS = 1
 
 
 def parse_args():
@@ -229,8 +310,15 @@ def parse_args():
             "anisotropic_gaussian",
             "mixture_of_gaussians",
             "zipf",
+            "real",
         ],
         help="Data distribution type (default: uniform)",
+    )
+    parser.add_argument(
+        "--real-data-path",
+        type=str,
+        default="/home/mohsen/kvcache/hira/tests/kv_sampling/kv_data/kv_data_Meta-Llama-3-8B-Instruct_layer31_20251219_005742.npz",
+        help="Path to .npz file containing real KV cache data (required when --distribution=real)",
     )
     parser.add_argument(
         "--device",
@@ -244,6 +332,12 @@ def parse_args():
         type=int,
         default=DEFAULT_TARGET_RESULTS,
         help="Target number of results to find (default: 10)",
+    )
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=DEFAULT_NUM_RUNS,
+        help="Number of runs to average for profiling (default: 1)",
     )
     return parser.parse_args()
 
@@ -270,6 +364,7 @@ def main():
     data_distribution = args.distribution
     device = args.device
     target_results = args.target_results
+    num_runs = args.num_runs
     # =========================
 
     print(f"Configuration:")
@@ -284,7 +379,12 @@ def main():
     print()
 
     print("Generating data...")
-    keys = generate_data(num_keys, dim, distribution=data_distribution)
+    keys = generate_data(
+        num_keys,
+        dim,
+        distribution=data_distribution,
+        real_data_path=args.real_data_path,
+    )
 
     print("Building index...")
     config = KMeansIndexConfig(
@@ -313,12 +413,12 @@ def main():
 
     # Profile indexed search
     print("  Indexed search...")
-    result_indexed, searcher = profile_indexed_search(index, query, threshold)
+    result_indexed, searcher = profile_indexed_search(index, query, threshold, num_runs)
     print(f"    Found {len(result_indexed)} results")
 
     # Profile brute-force search
     print("  Brute-force search...")
-    result_bf = profile_brute_force(index, query, threshold)
+    result_bf = profile_brute_force(index, query, threshold, num_runs)
     print(f"    Found {len(result_bf)} results")
 
     print("STATS")

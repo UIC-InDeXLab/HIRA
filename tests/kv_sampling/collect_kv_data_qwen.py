@@ -12,6 +12,7 @@ import argparse
 import inspect
 import json
 import sys
+import tqdm
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -365,7 +366,7 @@ def collect_samples(cfg: SamplingConfig) -> dict:
     selected_layer_index: int | None = None
 
     with torch.no_grad():
-        for prompt in cfg.prompts:
+        for prompt in tqdm.tqdm(cfg.prompts):
             inputs = prepare_inputs(tokenizer, prompt, cfg.device, cfg.max_sequence_length)
             outputs = model(
                 **inputs,

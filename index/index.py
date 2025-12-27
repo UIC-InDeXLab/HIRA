@@ -124,7 +124,7 @@ class KMeansIndex(Index):
         ball_centers = self.keys
 
         # first level (all the points)
-        print(f"Building level {level_idx}...")
+        # print(f"Building level {level_idx}...")
         level_0 = KMeansIndex.Level(
             level_idx=level_idx,
             ball_centers=ball_centers.contiguous(),
@@ -140,12 +140,12 @@ class KMeansIndex(Index):
         self.levels.append(level_0)
 
         while True:
-            print(f"Building level {level_idx + 1}...")
-
             level_size = level_size // self.branching_factor
 
             if level_size < 1 or level_idx + 1 >= self.num_levels:
                 break
+
+            # print(f"Building level {level_idx + 1}...")
 
             # STEP 1: cluster
             (
