@@ -244,7 +244,9 @@ def brute_force_search(
 def profile_indexed_search(index, query, threshold, num_runs: int = 1):
     """Profile the indexed search."""
     for _ in range(num_runs):
-        searcher = HalfspaceSearcher(enable_profiling=True)
+        searcher = HalfspaceSearcher(
+            enable_profiling=True
+        )  # make True if you want stats
         result = searcher.search(query, threshold, index)
     return result, searcher
 
@@ -385,6 +387,7 @@ def main():
         distribution=data_distribution,
         real_data_path=args.real_data_path,
     )
+    keys = keys.to(device)
 
     print("Building index...")
     config = KMeansIndexConfig(
@@ -397,7 +400,7 @@ def main():
     index.build(keys)
 
     print("Creating query...")
-    query = torch.randn(dim)
+    query = torch.randn(dim).to(device)
 
     # Find threshold for target number of results
     query_norm = query / torch.norm(query, p=2)
