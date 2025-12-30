@@ -160,3 +160,4 @@ temp/
 
 # KV cache data directories
 kv_data/
+*.lprof

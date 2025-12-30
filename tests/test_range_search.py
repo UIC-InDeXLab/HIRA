@@ -1009,5 +1009,229 @@ def test_refined_radii_upper_bound_property(device):
         assert torch.all(lhs <= rhs + 1e-5).item()
 
 
+class TestCUDASupport:
+    """Test that indexing and searching work correctly on CUDA devices."""
+
+    @pytest.fixture
+    def cuda_device(self):
+        """Fixture that provides CUDA device if available, otherwise skips test."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        return torch.device("cuda")
+
+    def test_build_basic_invariants_cuda(self, cuda_device):
+        """Test that index builds correctly on CUDA with same invariants as CPU."""
+        keys = make_keys(n=257, d=24, seed=1, device=cuda_device)
+        cfg = make_config(
+            device=cuda_device, num_levels=5, branching_factor=4, max_iterations=10
+        )
+        index = KMeansIndex(cfg).build(keys)
+
+        assert index.keys is not None
+        assert index.num_keys == keys.shape[0]
+        assert index.dim == keys.shape[1]
+        assert len(index.levels) >= 1
+
+        # Level 0: balls correspond to keys
+        L0 = index.levels[0]
+        assert L0.level_idx == 0
+        assert L0.ball_centers.shape == keys.shape
+        assert L0.ball_radii.shape == (keys.shape[0],)
+        assert torch.allclose(L0.ball_centers, keys)
+
+        # Verify tensors are on CUDA
+        assert L0.ball_centers.device.type == "cuda"
+        assert L0.ball_radii.device.type == "cuda"
+
+    def test_search_matches_bruteforce_cuda(self, cuda_device):
+        """Test that search on CUDA matches brute force results."""
+        keys = make_keys(n=400, d=32, seed=4, device=cuda_device)
+        cfg = make_config(
+            device=cuda_device, num_levels=6, branching_factor=4, max_iterations=20
+        )
+        index = KMeansIndex(cfg).build(keys)
+        searcher = HalfspaceSearcher(enable_profiling=True)
+
+        g = torch.Generator(device="cpu")
+        g.manual_seed(5)
+        
+        for _ in range(10):
+            q = torch.randn(32, generator=g).to(cuda_device)
+            q = q / q.norm(p=2)
+            threshold = torch.rand(1, generator=g).item() * 2 - 1
+
+            result_ids = searcher.search(q, threshold, index)
+            expected_ids = brute_force_halfspace(keys, q, threshold)
+
+            result_set = set(result_ids.cpu().tolist())
+            expected_set = set(expected_ids.cpu().tolist())
+            assert result_set == expected_set, (
+                f"Mismatch for threshold={threshold:.3f}: "
+                f"got {len(result_set)}, expected {len(expected_set)}"
+            )
+
+    def test_parent_child_links_cuda(self, cuda_device):
+        """Test that parent-child relationships are correct on CUDA."""
+        keys = make_keys(n=300, d=16, seed=2, device=cuda_device)
+        cfg = make_config(
+            device=cuda_device, num_levels=6, branching_factor=5, max_iterations=15
+        )
+        index = KMeansIndex(cfg).build(keys)
+
+        # Check internal levels have parent-child links
+        for i in range(len(index.levels) - 1):
+            child_level = index.levels[i]
+            assert child_level.child2parent is not None
+            assert child_level.parent2child is not None
+            assert child_level.p_pointer is not None
+            assert child_level.num_parents is not None
+
+            # Verify tensors are on CUDA
+            assert child_level.child2parent.device.type == "cuda"
+            assert child_level.parent2child.device.type == "cuda"
+            assert child_level.p_pointer.device.type == "cuda"
+
+            # Verify CSR structure
+            assert_csr_valid(
+                child_level.child2parent,
+                child_level.parent2child,
+                child_level.p_pointer,
+                child_level.num_parents,
+            )
+
+    def test_recall_cuda(self, cuda_device):
+        """Test that recall is high (99%+) on CUDA."""
+        num_keys = 1000
+        head_dim = 64
+        threshold = 0.5
+
+        keys = make_keys(n=num_keys, d=head_dim, seed=42, device=cuda_device)
+        cfg = make_config(
+            device=cuda_device, num_levels=5, branching_factor=4, max_iterations=20
+        )
+        index = KMeansIndex(cfg).build(keys)
+        searcher = HalfspaceSearcher()
+
+        g = torch.Generator(device="cpu")
+        g.manual_seed(100)
+        
+        total_relevant = 0
+        total_retrieved_correct = 0
+
+        for _ in range(20):
+            query = torch.randn(head_dim, generator=g).to(cuda_device)
+            query = F.normalize(query, p=2, dim=0)
+
+            relevant_ids = brute_force_halfspace(keys, query, threshold)
+            retrieved_ids = searcher.search(query, threshold, index)
+
+            relevant_set = set(relevant_ids.cpu().tolist())
+            retrieved_set = set(retrieved_ids.cpu().tolist())
+
+            correct = len(relevant_set & retrieved_set)
+            total_relevant += len(relevant_set)
+            total_retrieved_correct += correct
+
+        recall = (
+            total_retrieved_correct / total_relevant if total_relevant > 0 else 1.0
+        )
+        assert recall >= 0.99, f"Recall {recall:.4f} is below 99%"
+
+    def test_cpu_cuda_consistency(self, cuda_device):
+        """Test that CPU and CUDA produce consistent results."""
+        # Build on CPU
+        keys_cpu = make_keys(n=200, d=32, seed=7, device=torch.device("cpu"))
+        cfg_cpu = make_config(
+            device=torch.device("cpu"), num_levels=4, branching_factor=4, max_iterations=15
+        )
+        index_cpu = KMeansIndex(cfg_cpu).build(keys_cpu)
+        searcher = HalfspaceSearcher()
+
+        # Build on CUDA
+        keys_cuda = keys_cpu.to(cuda_device)
+        cfg_cuda = make_config(
+            device=cuda_device, num_levels=4, branching_factor=4, max_iterations=15
+        )
+        index_cuda = KMeansIndex(cfg_cuda).build(keys_cuda)
+
+        # Compare search results for multiple queries
+        g = torch.Generator(device="cpu")
+        g.manual_seed(8)
+        
+        for _ in range(10):
+            q_cpu = torch.randn(32, generator=g)
+            q_cpu = q_cpu / q_cpu.norm(p=2)
+            q_cuda = q_cpu.to(cuda_device)
+            
+            threshold = torch.rand(1, generator=g).item() * 2 - 1
+
+            result_cpu = searcher.search(q_cpu, threshold, index_cpu)
+            result_cuda = searcher.search(q_cuda, threshold, index_cuda)
+
+            # Results should be identical (both should find the same keys)
+            result_cpu_set = set(result_cpu.tolist())
+            result_cuda_set = set(result_cuda.cpu().tolist())
+            
+            assert result_cpu_set == result_cuda_set, (
+                f"CPU and CUDA results differ for threshold={threshold:.3f}"
+            )
+
+    def test_large_scale_cuda(self, cuda_device):
+        """Test indexing and search with larger datasets on CUDA."""
+        keys = make_keys(n=5000, d=128, seed=99, device=cuda_device)
+        cfg = make_config(
+            device=cuda_device, num_levels=7, branching_factor=8, max_iterations=25
+        )
+        index = KMeansIndex(cfg).build(keys)
+        searcher = HalfspaceSearcher()
+
+        # Verify index was built
+        assert index.num_keys == 5000
+        assert index.dim == 128
+
+        # Test a few searches
+        g = torch.Generator(device="cpu")
+        g.manual_seed(999)
+        
+        for _ in range(5):
+            q = torch.randn(128, generator=g).to(cuda_device)
+            q = q / q.norm(p=2)
+            threshold = 0.7
+
+            result_ids = searcher.search(q, threshold, index)
+            expected_ids = brute_force_halfspace(keys, q, threshold)
+
+            result_set = set(result_ids.cpu().tolist())
+            expected_set = set(expected_ids.cpu().tolist())
+            
+            # Check recall
+            if len(expected_set) > 0:
+                recall = len(result_set & expected_set) / len(expected_set)
+                assert recall >= 0.99, f"Recall {recall:.4f} below 99%"
+
+    def test_edge_cases_cuda(self, cuda_device):
+        """Test edge cases on CUDA."""
+        # Very small dataset
+        keys = make_keys(n=10, d=16, seed=11, device=cuda_device)
+        cfg = make_config(
+            device=cuda_device, num_levels=2, branching_factor=3, max_iterations=10
+        )
+        index = KMeansIndex(cfg).build(keys)
+        searcher = HalfspaceSearcher()
+
+        q = torch.randn(16, device=cuda_device)
+        q = q / q.norm(p=2)
+
+        # Very low threshold - should return most or all keys
+        result_low = searcher.search(q, -1.0, index)
+        expected_low = brute_force_halfspace(keys, q, -1.0)
+        assert set(result_low.cpu().tolist()) == set(expected_low.cpu().tolist())
+
+        # Very high threshold - should return few or no keys
+        result_high = searcher.search(q, 0.99, index)
+        expected_high = brute_force_halfspace(keys, q, 0.99)
+        assert set(result_high.cpu().tolist()) == set(expected_high.cpu().tolist())
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
