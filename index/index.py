@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 import faiss
 from .config import KMeansIndexConfig
+import math
 
 
 class Index(ABC):
@@ -14,9 +15,6 @@ class Index(ABC):
         self.dim: int = 0
         self.device: Optional[torch.device] = None
         self.metadata: Dict[str, Any] = {}
-
-    def _validate(self):
-        pass  # TODO
 
     def total_memory_usage(self) -> Dict[str, float]:
         """Calculate total memory usage of the index."""
@@ -107,6 +105,7 @@ class KMeansIndex(Index):
         # idx is local parent idx
         p_pointer: Optional[torch.Tensor]  # pointers into parent2child
         num_parents: Optional[int] = None
+        parent_mask_buf: Optional[torch.Tensor] = None
 
     def __init__(self, config: "KMeansIndexConfig"):
         super().__init__()
@@ -124,7 +123,7 @@ class KMeansIndex(Index):
         ball_centers = self.keys
 
         # first level (all the points)
-        # print(f"Building level {level_idx}...")
+        print(f"Building level {level_idx}...")
         level_0 = KMeansIndex.Level(
             level_idx=level_idx,
             ball_centers=ball_centers.contiguous(),
@@ -158,7 +157,7 @@ class KMeansIndex(Index):
             child_level = self.levels[level_idx]
 
             # STEP 2: fill child2parent mapping in child level
-            self.levels[level_idx].child2parent = assignments.contiguous()
+            child_level.child2parent = assignments.contiguous()
 
             # STEP 3: approximate small enclosing balls
             ball_radii = self._refine_ball_radii(child_level, assignments, ball_centers)
@@ -167,9 +166,9 @@ class KMeansIndex(Index):
             parent2child, p_pointer = self._parent_csr(assignments, level_size)
 
             # STEP 5: assign child <-> parent for previous level
-            self.levels[level_idx].parent2child = parent2child.contiguous()
-            self.levels[level_idx].p_pointer = p_pointer.contiguous()
-            self.levels[level_idx].num_parents = level_size
+            child_level.parent2child = parent2child.contiguous()
+            child_level.p_pointer = p_pointer.contiguous()
+            child_level.num_parents = level_size
 
             # Create new level
             parent_level = KMeansIndex.Level(
@@ -188,10 +187,17 @@ class KMeansIndex(Index):
 
             level_idx += 1
 
-        # validate
-        self._validate()
+        # add buffers (ASSUMED STATIC LEVELS)
+        self.preallocate_search_buffers()
 
         return self
+
+    def preallocate_search_buffers(self):
+        for lvl in self.levels:
+            if lvl.num_parents is not None:
+                lvl.parent_mask_buf = torch.empty(
+                    lvl.num_parents, dtype=torch.bool, device=lvl.device
+                )
 
     def _k_means(self, points, num_centroids):
         # verify num_centroids

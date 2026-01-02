@@ -58,25 +58,28 @@ def search_gpu(query, threshold, index):
     with record_function("* level1 filter"):
         scores = torch.matmul(level1.ball_centers, query_norm)
         ub = scores + level1.ball_radii
+        # st = ub >= threshold
         # top_parent = torch.argmax(ub)
-        _, parents = torch.topk(ub, k=4, largest=True, sorted=False)
+        _, parents = torch.topk(ub, k=10, largest=True, sorted=False)
 
     with record_function("* map 1 -> 0"):
         # child_mask = parent_mask[level0.child2parent]
-        start = level0.p_pointer[parents[0]]
-        end = level0.p_pointer[parents[0] + 1]
+        # start = level0.p_pointer[parents[0]]
+        # end = level0.p_pointer[parents[0] + 1]
+        starts = parents * 256
+        ends = starts + 256
 
     with record_function("* retrieve"):
-        keys = index.keys[start:end]
+        keys = index.keys[starts[0] : ends[0]]
         # keys = torch.cat([index.keys[start_1:end_1], index.keys[start_2:end_2]], dim=0)
 
     with record_function("* final scoring"):
         scores = torch.matmul(keys, query_norm)
-        output = (scores >= threshold).nonzero(as_tuple=True)[0]
+        # output = (scores >= threshold).nonzero(as_tuple=True)[0]
 
     # print(f"  Indexed search found {output.numel()} results")
 
-    return output
+    return None
 
 
 def brute_force_gpu(index: "Index", query: torch.Tensor, threshold: float):
@@ -84,11 +87,11 @@ def brute_force_gpu(index: "Index", query: torch.Tensor, threshold: float):
     query_norm = query / torch.norm(query, p=2)
     with record_function("* brute-force"):
         scores = torch.matmul(index.keys, query_norm)
-        result = (scores >= threshold).nonzero(as_tuple=True)[0]
+        # result = (scores >= threshold).nonzero(as_tuple=True)[0]
 
     # print(f"  Brute-force search found {result.numel()} results")
 
-    return result
+    return None
 
 
 def index_prep(index):
@@ -99,7 +102,7 @@ def index_prep(index):
     inds = torch.arange(len(level1.ball_centers))
     avg_size = level0.p_pointer[inds + 1] - level0.p_pointer[inds]
     print(f"Single cluster size: {torch.mean(avg_size.float()).item():.2f}")
-    # breakpoint()
+    breakpoint()
     return index
 
 
