@@ -92,9 +92,10 @@ class HalfspaceSearcher:
             child_radii = level.ball_radii.index_select(0, child_idx)
             child_centers = level.ball_centers.index_select(0, child_idx)
 
-            active_cluster_idx = HalfspaceSearcher.score_and_filter(
-                child_centers, child_radii, query, threshold, child_idx
-            )
+            # scores
+            scores = torch.matmul(child_centers, query)
+            mask = (scores + child_radii) >= threshold
+            active_cluster_idx = child_idx[mask]
 
             if self.enable_profiling:
                 self.stats["all_keys"].append(len(child_centers))
@@ -151,7 +152,7 @@ class HalfspaceSearcher:
 
         return qualifying_idx  # indices of keys satisfying q.k >= threshold
 
-    def exact_filter_chunked(self, keys, leaf_idx, query, threshold, chunk=1024 * 8):
+    def exact_filter_chunked(self, keys, leaf_idx, query, threshold, chunk=1024):
         out = []
         for s in range(0, leaf_idx.numel(), chunk):
             sub = leaf_idx[s : s + chunk]

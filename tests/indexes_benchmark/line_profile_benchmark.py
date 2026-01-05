@@ -28,6 +28,12 @@ from hira.search import HalfspaceSearcher
 # Force single-threaded execution
 torch.set_num_threads(1)
 
+try:
+    profile
+except NameError:
+
+    def profile(func):
+        return func
 
 def generate_uniform_data(num_keys: int, dim: int, seed: int = 42) -> torch.Tensor:
     """Generate uniformly distributed random vectors (Gaussian distribution)."""
