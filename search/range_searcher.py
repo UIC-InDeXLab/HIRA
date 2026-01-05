@@ -1,11 +1,3 @@
-"""
-Halfspace range searcher for efficient key selection using hierarchical indexes.
-
-The HalfspaceSearcher performs halfspace range searches to identify keys whose
-dot product with a query exceeds a threshold. It uses hierarchical pruning
-with cluster radii to efficiently traverse the index.
-"""
-
 import torch
 from ..index.index import KMeansIndex
 
@@ -65,10 +57,8 @@ class HalfspaceSearcher:
             if active_cluster_idx.numel() == 0:
                 return torch.tensor([], dtype=torch.long, device=query.device)
 
-            # CSR is fast for small fraction of parents, otherwise use child2parent
-            use_csr = False  # hardcoded for now
-
-            if use_csr:
+            if False:
+                # CSR expansion
                 active_parents = active_cluster_idx
                 rowptr = level.p_pointer
                 p2c = level.parent2child
@@ -94,39 +84,29 @@ class HalfspaceSearcher:
                 child_idx = p2c[idx_in_p2c]  # [total] child local ids
             else:
                 p = level.child2parent  # [C]
-                parent_mask = torch.zeros(
-                    level.num_parents, dtype=torch.bool, device=query.device
-                )
-                parent_mask[active_cluster_idx] = True
-
-                child_mask = parent_mask[p]  # [C] bool
-                child_idx = child_mask.nonzero(as_tuple=True)[0]  # child local ids
+                buf = level.parent_mask_buf
+                buf.zero_()
+                buf[active_cluster_idx] = True
+                child_idx = torch.nonzero(buf[p], as_tuple=False).squeeze(1)
 
             child_radii = level.ball_radii.index_select(0, child_idx)
             child_centers = level.ball_centers.index_select(0, child_idx)
 
-            # scores
-            scores = torch.matmul(child_centers, query)
-            mask = (scores + child_radii) >= threshold
-            active_cluster_idx = child_idx[mask]
+            active_cluster_idx = HalfspaceSearcher.score_and_filter(
+                child_centers, child_radii, query, threshold, child_idx
+            )
 
             if self.enable_profiling:
                 self.stats["all_keys"].append(len(child_centers))
                 self.stats["active_keys"].append(len(active_cluster_idx))
 
-        if not use_csr:
+        if True:
             # LEVEL 1 -> 0 (child2parent expansion)
             level0 = index.levels[0]  # keys
-            level1 = index.levels[1]  # clusters of keys
-
-            # active_cluster_idx are indices into level1 (parents of level0)
-            P1 = level1.size
-
-            parent_mask = torch.zeros(P1, dtype=torch.bool, device=query.device)
-            parent_mask[active_cluster_idx] = True
-
-            # level0.child2parent: [num_keys] mapping key_id -> parent_id in level1
-            leaf_idx = parent_mask[level0.child2parent].nonzero(as_tuple=True)[0]
+            buf = level0.parent_mask_buf
+            buf.zero_()
+            buf[active_cluster_idx] = True
+            leaf_idx = buf[level0.child2parent].nonzero(as_tuple=True)[0]
         else:
             # LEVEL 1 -> 0 (CSR expansion)
             level0 = index.levels[0]  # child level (keys)
@@ -159,16 +139,12 @@ class HalfspaceSearcher:
             leaf_idx = p2c[base + inner]  # [total] key indices
 
         # TODO: DANGER Remove
-        # child_idx = child_idx[:len(index.keys) // 5]
-        # self.stats["exact_checks"] = len(child_idx)?
+        # leaf_idx = leaf_idx[:10]
 
         if self.enable_profiling:
             self.stats["exact_checks"] = len(leaf_idx)
 
-        # # exact check
-        # ids = index.keys[leaf_idx]
-        # scores = torch.matmul(ids, query)
-        # qualifying_idx = leaf_idx[scores >= threshold]
+        # exact check
         qualifying_idx = self.exact_filter_chunked(
             index.keys, leaf_idx, query, threshold
         )
