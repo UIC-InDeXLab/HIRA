@@ -151,12 +151,17 @@ def three_level_filter_kernel_v1(
     r1 = tl.load(R1_ptr + p1_ids)
     passes1 = (p1_dots + r1) > t
 
+    # masking
+    mask_p = passes1[:, None, None]  # [B,1,1] -> broadcast to [B,B,128]
+    mask_d = d[None, None, :] < n_cols  # [1,1,128]
+    maskK = mask_p & mask_d  # [B,B,128]
+
     j = tl.arange(0, branch)
 
     # calculate all, but only store the passed ones
     k_ids = p1_ids[:, None] * branch + j[None, :]
     k_ptrs = K_ptr + k_ids[:, :, None] * K_row_stride + d[None, None, :]
-    K_tile = tl.load(k_ptrs)
+    K_tile = tl.load(k_ptrs, mask=maskK)
 
     scores = tl.sum(K_tile * q[None, None, :], axis=2)  # [B, B]
 
