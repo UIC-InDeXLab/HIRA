@@ -129,7 +129,7 @@ def generate_parent_child_structure(
     seed: int = 42,
     real_data_path: Optional[
         str
-    ] = "/home/mohsen/kvcache/hira/tests/kv_sampling/kv_data/kv_data_Meta-Llama-3-8B-Instruct_layer31_20251219_005742.npz",
+    ] = "../../tests/kv_sampling/kv_data/kv_data_Meta-Llama-3-8B-Instruct_layer31_20251219_005742.npz",
     device: str = "cpu",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
@@ -300,7 +300,7 @@ def generate_three_level_structure(
     seed: int = 42,
     real_data_path: Optional[
         str
-    ] = "/home/mohsen/kvcache/hira/tests/kv_sampling/kv_data/kv_data_Meta-Llama-3-8B-Instruct_layer31_20251219_005742.npz",
+    ] = "../../tests/kv_sampling/kv_data/kv_data_Meta-Llama-3-8B-Instruct_layer31_20251219_005742.npz",
     device: str = "cpu",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate a three-level hierarchical structure: K -> P1 -> P2.

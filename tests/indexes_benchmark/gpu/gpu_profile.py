@@ -169,8 +169,8 @@ DEFAULT_ITERATIONS = 1
 DEFAULT_DEVICE = "cuda"
 DEFAULT_TARGET_RESULTS = 10
 DEFAULT_NUM_RUNS = 50
-# DEFAULT_DATA_PATH = "/home/mohsen/kvcache/hira/tests/kv_sampling/kv_data/kv_data_qwen_Qwen2.5-3B-Instruct_layer35_20251227_223030.npz"
-DEFAULT_DATA_PATH = "/home/mohsen/kvcache/hira/tests/kv_sampling/kv_data/kv_data_Meta-Llama-3-8B-Instruct_layer31_20251219_004657.npz"
+# DEFAULT_DATA_PATH = "../../tests/kv_sampling/kv_data/kv_data_qwen_Qwen2.5-3B-Instruct_layer35_20251227_223030.npz"
+DEFAULT_DATA_PATH = "../../tests/kv_sampling/kv_data/kv_data_Meta-Llama-3-8B-Instruct_layer31_20251219_004657.npz"
 
 
 def main():

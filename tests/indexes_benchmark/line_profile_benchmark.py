@@ -325,7 +325,7 @@ def parse_args():
     parser.add_argument(
         "--real-data-path",
         type=str,
-        default="/home/mohsen/kvcache/hira/tests/kv_sampling/kv_data/kv_data_Meta-Llama-3-8B-Instruct_layer31_20251219_005742.npz",
+        default="../../tests/kv_sampling/kv_data/kv_data_Meta-Llama-3-8B-Instruct_layer31_20251219_005742.npz",
         help="Path to .npz file containing real KV cache data (required when --distribution=real)",
     )
     parser.add_argument(
