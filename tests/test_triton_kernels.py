@@ -19,11 +19,11 @@ import torch.nn.functional as F
 import sys
 import os
 
-# Add parent directory to path to import kernels
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from triton_wrappers import triton_two_level_filter, triton_three_level_filter_v1
-from bench.generate_level import (
+from hira.kernels.triton_wrappers import (
+    triton_two_level_filter,
+    triton_three_level_filter_v1,
+)
+from hira.benchmark_area.cuda_bench.generate_level import (
     generate_three_level_structure,
     generate_parent_child_structure,
 )

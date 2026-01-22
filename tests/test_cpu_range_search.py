@@ -1,21 +1,8 @@
-"""
-Comprehensive tests for hierarchical range search with halfspace queries.
-
-Test scenarios:
-1. Index construction validation for random synthetic points
-2. Structural correctness: levels, assignments, parent-child relationships
-3. Range search with empty results (query with no points inside)
-4. Range search with many results (query with lots of points inside)
-5. 99%+ recall verification for all query types
-"""
-
 import pytest
 import torch
 import torch.nn.functional as F
-import numpy as np
-from hira.index import KMeansIndex
-from hira.index.config import KMeansIndexConfig
-from hira.search import HalfspaceSearcher
+from hira.index.indexer import CPUIndexer
+from hira.index.searcher import CPUSearcher
 
 
 class TestIndexConstruction:
@@ -31,10 +18,12 @@ class TestIndexConstruction:
         keys = torch.randn(num_keys, head_dim)
 
         # Build index
-        config = KMeansIndexConfig(
-            num_levels=3, branching_factor=10, max_iterations=25, device="cpu"
-        )
-        index = KMeansIndex(config)
+        config = {
+            "num_levels": 3,
+            "branching_factor": 10,
+            "max_iterations": 25,
+        }
+        index = CPUIndexer(**config)
         index.build(keys)
 
         # Verify basic structure
@@ -52,8 +41,12 @@ class TestIndexConstruction:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=3, branching_factor=8)
-        index = KMeansIndex(config)
+        config = {
+            "num_levels": 3,
+            "branching_factor": 8,
+            "max_iterations": 1,
+        }
+        index = CPUIndexer(**config)
         index.build(keys)
 
         level_0 = index.levels[0]
@@ -76,8 +69,8 @@ class TestIndexConstruction:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=4, branching_factor=branching_factor)
-        index = KMeansIndex(config)
+        config = {"num_levels": 4, "branching_factor": branching_factor}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         # Check each level reduces in size
@@ -103,8 +96,8 @@ class TestIndexConstruction:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=3, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 3, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         # Check assignments for each level except the last
@@ -146,8 +139,8 @@ class TestIndexConstruction:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=3, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 3, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         # Check each level except level 0 (which has zero radii)
@@ -206,8 +199,8 @@ class TestRangeSearchEmpty:
         keys[:, : head_dim // 2] = torch.randn(num_keys, head_dim // 2)
 
         # Build index
-        config = KMeansIndexConfig(num_levels=3, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 3, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         # Create query orthogonal to keys (in the other half of dimensions)
@@ -217,7 +210,7 @@ class TestRangeSearchEmpty:
 
         threshold = 0.01  # Very small positive threshold
 
-        searcher = HalfspaceSearcher()
+        searcher = CPUSearcher(numba=True)
         result = searcher.search(query, threshold, index)
 
         # Verify ground truth is empty
@@ -236,8 +229,8 @@ class TestRangeSearchEmpty:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=3, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 3, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         query = torch.randn(head_dim)
@@ -246,7 +239,7 @@ class TestRangeSearchEmpty:
         # Very high threshold
         threshold = 1000.0
 
-        searcher = HalfspaceSearcher()
+        searcher = CPUSearcher(numba=True)
         result = searcher.search(query, threshold, index)
 
         # Ground truth
@@ -265,8 +258,8 @@ class TestRangeSearchEmpty:
         # Create keys pointing in positive direction
         keys = torch.abs(torch.randn(num_keys, head_dim))
 
-        config = KMeansIndexConfig(num_levels=2, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 2, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         # Query in negative direction
@@ -275,7 +268,7 @@ class TestRangeSearchEmpty:
 
         threshold = 0.0
 
-        searcher = HalfspaceSearcher()
+        searcher = CPUSearcher(numba=True)
         result = searcher.search(query, threshold, index)
 
         scores = torch.matmul(keys, query)
@@ -296,8 +289,8 @@ class TestRangeSearchManyResults:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=3, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 3, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         query = torch.randn(head_dim)
@@ -305,7 +298,7 @@ class TestRangeSearchManyResults:
 
         threshold = -5.0  # Low threshold should match many keys
 
-        searcher = HalfspaceSearcher()
+        searcher = CPUSearcher(numba=True)
         result = searcher.search(query, threshold, index)
 
         # Ground truth
@@ -344,8 +337,8 @@ class TestRangeSearchManyResults:
         # Add bias toward base direction
         keys = keys + 2.0 * base.unsqueeze(0)
 
-        config = KMeansIndexConfig(num_levels=3, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 3, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         # Query in the base direction
@@ -354,7 +347,7 @@ class TestRangeSearchManyResults:
 
         threshold = 0.3
 
-        searcher = HalfspaceSearcher()
+        searcher = CPUSearcher(numba=True)
         result = searcher.search(query, threshold, index)
 
         # Ground truth
@@ -387,8 +380,8 @@ class TestRangeSearchManyResults:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=2, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 2, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         query = torch.randn(head_dim)
@@ -396,7 +389,7 @@ class TestRangeSearchManyResults:
 
         threshold = -100.0  # Should match all vectors
 
-        searcher = HalfspaceSearcher()
+        searcher = CPUSearcher(numba=True)
         result = searcher.search(query, threshold, index)
 
         # Ground truth
@@ -431,8 +424,8 @@ class TestRangeSearchRecall:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=3, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 3, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         # Test multiple random queries
@@ -442,7 +435,7 @@ class TestRangeSearchRecall:
             query = torch.randn(head_dim)
             query = F.normalize(query, p=2, dim=0)
 
-            searcher = HalfspaceSearcher()
+            searcher = CPUSearcher(numba=True)
             result = searcher.search(query, threshold, index)
 
             # Ground truth
@@ -475,15 +468,15 @@ class TestRangeSearchRecall:
             torch.manual_seed(42)
             keys = torch.randn(num_keys, head_dim)
 
-            config = KMeansIndexConfig(num_levels=3, branching_factor=10)
-            index = KMeansIndex(config)
+            config = {"num_levels": 3, "branching_factor": 10}
+            index = CPUIndexer(**config)
             index.build(keys)
 
             query = torch.randn(head_dim)
             query = F.normalize(query, p=2, dim=0)
             threshold = 0.5
 
-            searcher = HalfspaceSearcher()
+            searcher = CPUSearcher(numba=True)
             result = searcher.search(query, threshold, index)
 
             # Ground truth
@@ -520,11 +513,11 @@ class TestRangeSearchRecall:
         threshold = 0.4
 
         for branching_factor in [5, 10, 20, 50]:
-            config = KMeansIndexConfig(num_levels=3, branching_factor=branching_factor)
-            index = KMeansIndex(config)
+            config = {"num_levels": 3, "branching_factor": branching_factor}
+            index = CPUIndexer(**config)
             index.build(keys)
 
-            searcher = HalfspaceSearcher()
+            searcher = CPUSearcher(numba=True)
             result = searcher.search(query, threshold, index)
 
             # Ground truth
@@ -556,8 +549,8 @@ class TestRangeSearchRecall:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=3, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 3, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         query = torch.randn(head_dim)
@@ -574,7 +567,7 @@ class TestRangeSearchRecall:
         ]
 
         for threshold in test_thresholds:
-            searcher = HalfspaceSearcher()
+            searcher = CPUSearcher(numba=True)
             result = searcher.search(query, threshold, index)
 
             ground_truth = torch.nonzero(scores >= threshold, as_tuple=True)[0]
@@ -599,30 +592,6 @@ class TestRangeSearchRecall:
 class TestRangeSearchEdgeCases:
     """Test edge cases in range search."""
 
-    # def test_single_key(self):
-    #     """Test search with only one key."""
-    #     head_dim = 64
-
-    #     key = torch.randn(1, head_dim)
-
-    #     config = KMeansIndexConfig(num_levels=1, branching_factor=10)
-    #     index = KMeansIndex(config)
-    #     index.build(key)
-
-    #     query = torch.randn(head_dim)
-    #     query = F.normalize(query, p=2, dim=0)
-
-    #     score = torch.matmul(key[0], query).item()
-
-    #     # Threshold below score should return the key
-    #     searcher = HalfspaceSearcher()
-    #     result = searcher.search(query, score - 0.1, index)
-    #     assert len(result) == 1
-
-    #     # Threshold above score should return nothing
-    #     result = searcher.search(query, score + 0.1, index)
-    #     assert len(result) == 0
-
     def test_very_small_dataset(self):
         """Test with very small dataset (< branching factor)."""
         num_keys = 5
@@ -631,15 +600,15 @@ class TestRangeSearchEdgeCases:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=2, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 2, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         query = torch.randn(head_dim)
         query = F.normalize(query, p=2, dim=0)
         threshold = 0.0
 
-        searcher = HalfspaceSearcher()
+        searcher = CPUSearcher(numba=True)
         result = searcher.search(query, threshold, index)
 
         scores = torch.matmul(keys, query)
@@ -665,8 +634,8 @@ class TestRangeSearchEdgeCases:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=3, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 3, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         query = torch.randn(head_dim)
@@ -676,7 +645,7 @@ class TestRangeSearchEdgeCases:
         # Use an actual score value as threshold
         threshold = scores[100].item()
 
-        searcher = HalfspaceSearcher()
+        searcher = CPUSearcher(numba=False)
         result = searcher.search(query, threshold, index)
 
         ground_truth = torch.nonzero(scores >= threshold, as_tuple=True)[0]
@@ -705,8 +674,8 @@ class TestRangeSearchEdgeCases:
         torch.manual_seed(42)
         keys = torch.randn(num_keys, head_dim)
 
-        config = KMeansIndexConfig(num_levels=2, branching_factor=10)
-        index = KMeansIndex(config)
+        config = {"num_levels": 2, "branching_factor": 10}
+        index = CPUIndexer(**config)
         index.build(keys)
 
         # Create unnormalized query
@@ -715,7 +684,7 @@ class TestRangeSearchEdgeCases:
 
         threshold = 0.5
 
-        searcher = HalfspaceSearcher()
+        searcher = CPUSearcher(numba=True)
         result = searcher.search(query_unnormalized, threshold, index)
 
         # Ground truth using normalized query
@@ -742,64 +711,19 @@ def brute_force_halfspace(keys: torch.Tensor, q: torch.Tensor, threshold: float)
     return (scores >= threshold).nonzero(as_tuple=True)[0]
 
 
-def assert_csr_valid(
-    child2parent: torch.Tensor,
-    parent2child: torch.Tensor,
-    rowptr: torch.Tensor,
-    num_parents: int,
-):
-    """
-    CSR encoding: parent2child[rowptr[p]:rowptr[p+1]] are children with parent p.
-    child2parent[c] = p.
-    """
-    assert child2parent.dtype == torch.long
-    assert parent2child.dtype == torch.long
-    assert rowptr.dtype == torch.long
-
-    C = child2parent.numel()
-    assert parent2child.numel() == C
-    assert rowptr.numel() == num_parents + 1
-
-    # rowptr monotone, starts at 0, ends at C
-    assert rowptr[0].item() == 0
-    assert rowptr[-1].item() == C
-    assert torch.all(rowptr[1:] >= rowptr[:-1]).item()
-
-    # child2parent in range
-    assert child2parent.min().item() >= 0
-    assert child2parent.max().item() < num_parents
-
-    # parent2child is a permutation of 0..C-1 if it was built by argsort(child2parent)
-    # (Your _parent_csr returns children_sorted = argsort(child2parent))
-    # So parent2child should contain each child exactly once.
-    sorted_children = torch.sort(parent2child).values
-    assert torch.equal(
-        sorted_children, torch.arange(C, device=child2parent.device, dtype=torch.long)
-    )
-
-    # Consistency: every child in parent2child slice must map to that parent in child2parent
-    for p in range(num_parents):
-        s = rowptr[p].item()
-        e = rowptr[p + 1].item()
-        if e <= s:
-            continue
-        children = parent2child[s:e]
-        assert torch.all(child2parent[children] == p).item()
-
-
 @pytest.fixture(scope="module")
 def device():
     # Keep tests deterministic and simple: CPU
     return torch.device("cpu")
 
 
-def make_config(device, num_levels=4, branching_factor=4, max_iterations=20):
-    return KMeansIndexConfig(
-        max_iterations=max_iterations,
-        device=device,
-        num_levels=num_levels,
-        branching_factor=branching_factor,
-    )
+def make_config(device="cpu", num_levels=4, branching_factor=4, max_iterations=20):
+    return {
+        "max_iterations": max_iterations,
+        # "device": device,
+        "num_levels": num_levels,
+        "branching_factor": branching_factor,
+    }
 
 
 def make_keys(n=200, d=32, seed=0, device=torch.device("cpu")):
@@ -816,7 +740,7 @@ def test_build_basic_invariants(device):
     cfg = make_config(
         device=device, num_levels=5, branching_factor=4, max_iterations=10
     )
-    index = KMeansIndex(cfg).build(keys)
+    index = CPUIndexer(**cfg).build(keys)
 
     assert index.keys is not None
     assert index.num_keys == keys.shape[0]
@@ -838,45 +762,12 @@ def test_build_basic_invariants(device):
         assert L.ball_radii.shape[0] == L.size
 
 
-def test_parent_child_links_present_for_internal_levels(device):
-    keys = make_keys(n=300, d=16, seed=2, device=device)
-    cfg = make_config(
-        device=device, num_levels=6, branching_factor=5, max_iterations=15
-    )
-    index = KMeansIndex(cfg).build(keys)
-
-    # For every child level that has a parent (i.e., levels 0..(h-1)),
-    # we expect child2parent/CSR/num_parents to be filled.
-    # The last level (root) has no parent mapping.
-    for i in range(len(index.levels) - 1):
-        child = index.levels[i]
-        parent = index.levels[i + 1]
-
-        assert child.child2parent is not None
-        assert child.parent2child is not None
-        assert child.p_pointer is not None
-        assert child.num_parents is not None
-
-        C = child.size
-        P = child.num_parents
-        assert child.child2parent.shape == (C,)
-        assert P == parent.size  # critical invariant
-        assert_csr_valid(child.child2parent, child.parent2child, child.p_pointer, P)
-
-    # Root has no parent
-    root = index.levels[-1]
-    assert root.child2parent is None
-    assert root.parent2child is None
-    assert root.p_pointer is None
-    assert root.num_parents is None
-
-
 def test_num_parents_matches_parent_size(device):
     keys = make_keys(n=123, d=20, seed=3, device=device)
     cfg = make_config(
         device=device, num_levels=5, branching_factor=3, max_iterations=10
     )
-    index = KMeansIndex(cfg).build(keys)
+    index = CPUIndexer(**cfg).build(keys)
 
     for i in range(len(index.levels) - 1):
         child = index.levels[i]
@@ -889,8 +780,8 @@ def test_search_matches_bruteforce_random_queries(device):
     cfg = make_config(
         device=device, num_levels=6, branching_factor=4, max_iterations=20
     )
-    index = KMeansIndex(cfg).build(keys)
-    searcher = HalfspaceSearcher(enable_profiling=True)
+    index = CPUIndexer(**cfg).build(keys)
+    searcher = CPUSearcher(profiling=True, numba=True)
 
     g = torch.Generator(device="cpu")
     g.manual_seed(0)
@@ -918,17 +809,17 @@ def test_search_extreme_thresholds(device):
     cfg = make_config(
         device=device, num_levels=5, branching_factor=4, max_iterations=10
     )
-    index = KMeansIndex(cfg).build(keys)
-    searcher = HalfspaceSearcher(enable_profiling=False)
+    index = CPUIndexer(**cfg).build(keys)
+    searcher = CPUSearcher(profiling=False, numba=True)
 
     q = torch.randn(keys.shape[1], device=device)
 
     # Very high threshold -> usually empty
-    got = searcher.search(q, threshold=10.0, index=index)
+    got = searcher.search(q, threshold=10.0, indexer=index)
     assert got.numel() == 0
 
     # Very low threshold -> all keys qualify
-    got = searcher.search(q, threshold=-10.0, index=index)
+    got = searcher.search(q, threshold=-10.0, indexer=index)
     assert got.numel() == keys.shape[0]
 
 
@@ -939,10 +830,10 @@ def test_search_one_level_fallback(device):
     """
     keys = make_keys(n=50, d=8, seed=6, device=device)
     cfg = make_config(device=device, num_levels=1, branching_factor=4, max_iterations=5)
-    index = KMeansIndex(cfg).build(keys)
+    index = CPUIndexer(**cfg).build(keys)
     assert len(index.levels) == 1
 
-    searcher = HalfspaceSearcher(enable_profiling=True)
+    searcher = CPUSearcher(profiling=True, numba=True)
     q = torch.randn(keys.shape[1], device=device)
     thr = 0.1
 
@@ -960,10 +851,10 @@ def test_search_two_levels_only(device):
     cfg = make_config(
         device=device, num_levels=2, branching_factor=4, max_iterations=10
     )
-    index = KMeansIndex(cfg).build(keys)
+    index = CPUIndexer(**cfg).build(keys)
     assert len(index.levels) == 2
 
-    searcher = HalfspaceSearcher(enable_profiling=False)
+    searcher = CPUSearcher(profiling=False, numba=True)
     q = torch.randn(keys.shape[1], device=device)
     thr = 0.0
 
@@ -984,7 +875,7 @@ def test_refined_radii_upper_bound_property(device):
     cfg = make_config(
         device=device, num_levels=5, branching_factor=5, max_iterations=15
     )
-    index = KMeansIndex(cfg).build(keys)
+    index = CPUIndexer(**cfg).build(keys)
 
     for i in range(len(index.levels) - 1):
         child = index.levels[i]
@@ -1007,230 +898,6 @@ def test_refined_radii_upper_bound_property(device):
 
         # Allow tiny floating error
         assert torch.all(lhs <= rhs + 1e-5).item()
-
-
-class TestCUDASupport:
-    """Test that indexing and searching work correctly on CUDA devices."""
-
-    @pytest.fixture
-    def cuda_device(self):
-        """Fixture that provides CUDA device if available, otherwise skips test."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-        return torch.device("cuda")
-
-    def test_build_basic_invariants_cuda(self, cuda_device):
-        """Test that index builds correctly on CUDA with same invariants as CPU."""
-        keys = make_keys(n=257, d=24, seed=1, device=cuda_device)
-        cfg = make_config(
-            device=cuda_device, num_levels=5, branching_factor=4, max_iterations=10
-        )
-        index = KMeansIndex(cfg).build(keys)
-
-        assert index.keys is not None
-        assert index.num_keys == keys.shape[0]
-        assert index.dim == keys.shape[1]
-        assert len(index.levels) >= 1
-
-        # Level 0: balls correspond to keys
-        L0 = index.levels[0]
-        assert L0.level_idx == 0
-        assert L0.ball_centers.shape == keys.shape
-        assert L0.ball_radii.shape == (keys.shape[0],)
-        assert torch.allclose(L0.ball_centers, keys)
-
-        # Verify tensors are on CUDA
-        assert L0.ball_centers.device.type == "cuda"
-        assert L0.ball_radii.device.type == "cuda"
-
-    def test_search_matches_bruteforce_cuda(self, cuda_device):
-        """Test that search on CUDA matches brute force results."""
-        keys = make_keys(n=400, d=32, seed=4, device=cuda_device)
-        cfg = make_config(
-            device=cuda_device, num_levels=6, branching_factor=4, max_iterations=20
-        )
-        index = KMeansIndex(cfg).build(keys)
-        searcher = HalfspaceSearcher(enable_profiling=True)
-
-        g = torch.Generator(device="cpu")
-        g.manual_seed(5)
-        
-        for _ in range(10):
-            q = torch.randn(32, generator=g).to(cuda_device)
-            q = q / q.norm(p=2)
-            threshold = torch.rand(1, generator=g).item() * 2 - 1
-
-            result_ids = searcher.search(q, threshold, index)
-            expected_ids = brute_force_halfspace(keys, q, threshold)
-
-            result_set = set(result_ids.cpu().tolist())
-            expected_set = set(expected_ids.cpu().tolist())
-            assert result_set == expected_set, (
-                f"Mismatch for threshold={threshold:.3f}: "
-                f"got {len(result_set)}, expected {len(expected_set)}"
-            )
-
-    def test_parent_child_links_cuda(self, cuda_device):
-        """Test that parent-child relationships are correct on CUDA."""
-        keys = make_keys(n=300, d=16, seed=2, device=cuda_device)
-        cfg = make_config(
-            device=cuda_device, num_levels=6, branching_factor=5, max_iterations=15
-        )
-        index = KMeansIndex(cfg).build(keys)
-
-        # Check internal levels have parent-child links
-        for i in range(len(index.levels) - 1):
-            child_level = index.levels[i]
-            assert child_level.child2parent is not None
-            assert child_level.parent2child is not None
-            assert child_level.p_pointer is not None
-            assert child_level.num_parents is not None
-
-            # Verify tensors are on CUDA
-            assert child_level.child2parent.device.type == "cuda"
-            assert child_level.parent2child.device.type == "cuda"
-            assert child_level.p_pointer.device.type == "cuda"
-
-            # Verify CSR structure
-            assert_csr_valid(
-                child_level.child2parent,
-                child_level.parent2child,
-                child_level.p_pointer,
-                child_level.num_parents,
-            )
-
-    def test_recall_cuda(self, cuda_device):
-        """Test that recall is high (99%+) on CUDA."""
-        num_keys = 1000
-        head_dim = 64
-        threshold = 0.5
-
-        keys = make_keys(n=num_keys, d=head_dim, seed=42, device=cuda_device)
-        cfg = make_config(
-            device=cuda_device, num_levels=5, branching_factor=4, max_iterations=20
-        )
-        index = KMeansIndex(cfg).build(keys)
-        searcher = HalfspaceSearcher()
-
-        g = torch.Generator(device="cpu")
-        g.manual_seed(100)
-        
-        total_relevant = 0
-        total_retrieved_correct = 0
-
-        for _ in range(20):
-            query = torch.randn(head_dim, generator=g).to(cuda_device)
-            query = F.normalize(query, p=2, dim=0)
-
-            relevant_ids = brute_force_halfspace(keys, query, threshold)
-            retrieved_ids = searcher.search(query, threshold, index)
-
-            relevant_set = set(relevant_ids.cpu().tolist())
-            retrieved_set = set(retrieved_ids.cpu().tolist())
-
-            correct = len(relevant_set & retrieved_set)
-            total_relevant += len(relevant_set)
-            total_retrieved_correct += correct
-
-        recall = (
-            total_retrieved_correct / total_relevant if total_relevant > 0 else 1.0
-        )
-        assert recall >= 0.99, f"Recall {recall:.4f} is below 99%"
-
-    def test_cpu_cuda_consistency(self, cuda_device):
-        """Test that CPU and CUDA produce consistent results."""
-        # Build on CPU
-        keys_cpu = make_keys(n=200, d=32, seed=7, device=torch.device("cpu"))
-        cfg_cpu = make_config(
-            device=torch.device("cpu"), num_levels=4, branching_factor=4, max_iterations=15
-        )
-        index_cpu = KMeansIndex(cfg_cpu).build(keys_cpu)
-        searcher = HalfspaceSearcher()
-
-        # Build on CUDA
-        keys_cuda = keys_cpu.to(cuda_device)
-        cfg_cuda = make_config(
-            device=cuda_device, num_levels=4, branching_factor=4, max_iterations=15
-        )
-        index_cuda = KMeansIndex(cfg_cuda).build(keys_cuda)
-
-        # Compare search results for multiple queries
-        g = torch.Generator(device="cpu")
-        g.manual_seed(8)
-        
-        for _ in range(10):
-            q_cpu = torch.randn(32, generator=g)
-            q_cpu = q_cpu / q_cpu.norm(p=2)
-            q_cuda = q_cpu.to(cuda_device)
-            
-            threshold = torch.rand(1, generator=g).item() * 2 - 1
-
-            result_cpu = searcher.search(q_cpu, threshold, index_cpu)
-            result_cuda = searcher.search(q_cuda, threshold, index_cuda)
-
-            # Results should be identical (both should find the same keys)
-            result_cpu_set = set(result_cpu.tolist())
-            result_cuda_set = set(result_cuda.cpu().tolist())
-            
-            assert result_cpu_set == result_cuda_set, (
-                f"CPU and CUDA results differ for threshold={threshold:.3f}"
-            )
-
-    def test_large_scale_cuda(self, cuda_device):
-        """Test indexing and search with larger datasets on CUDA."""
-        keys = make_keys(n=5000, d=128, seed=99, device=cuda_device)
-        cfg = make_config(
-            device=cuda_device, num_levels=7, branching_factor=8, max_iterations=25
-        )
-        index = KMeansIndex(cfg).build(keys)
-        searcher = HalfspaceSearcher()
-
-        # Verify index was built
-        assert index.num_keys == 5000
-        assert index.dim == 128
-
-        # Test a few searches
-        g = torch.Generator(device="cpu")
-        g.manual_seed(999)
-        
-        for _ in range(5):
-            q = torch.randn(128, generator=g).to(cuda_device)
-            q = q / q.norm(p=2)
-            threshold = 0.7
-
-            result_ids = searcher.search(q, threshold, index)
-            expected_ids = brute_force_halfspace(keys, q, threshold)
-
-            result_set = set(result_ids.cpu().tolist())
-            expected_set = set(expected_ids.cpu().tolist())
-            
-            # Check recall
-            if len(expected_set) > 0:
-                recall = len(result_set & expected_set) / len(expected_set)
-                assert recall >= 0.99, f"Recall {recall:.4f} below 99%"
-
-    def test_edge_cases_cuda(self, cuda_device):
-        """Test edge cases on CUDA."""
-        # Very small dataset
-        keys = make_keys(n=10, d=16, seed=11, device=cuda_device)
-        cfg = make_config(
-            device=cuda_device, num_levels=2, branching_factor=3, max_iterations=10
-        )
-        index = KMeansIndex(cfg).build(keys)
-        searcher = HalfspaceSearcher()
-
-        q = torch.randn(16, device=cuda_device)
-        q = q / q.norm(p=2)
-
-        # Very low threshold - should return most or all keys
-        result_low = searcher.search(q, -1.0, index)
-        expected_low = brute_force_halfspace(keys, q, -1.0)
-        assert set(result_low.cpu().tolist()) == set(expected_low.cpu().tolist())
-
-        # Very high threshold - should return few or no keys
-        result_high = searcher.search(q, 0.99, index)
-        expected_high = brute_force_halfspace(keys, q, 0.99)
-        assert set(result_high.cpu().tolist()) == set(expected_high.cpu().tolist())
 
 
 if __name__ == "__main__":

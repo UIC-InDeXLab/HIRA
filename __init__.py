@@ -15,7 +15,7 @@ from .index import (
 
 from .search import HalfspaceSearcher
 
-from .attention import HiraAttention, HiraAttentionProcessor, patch_model_with_hira_attention
+# from .attention import HiraAttention, HiraAttentionProcessor, patch_model_with_hira_attention
 
 from .cache import HiraCache
 

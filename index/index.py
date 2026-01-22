@@ -1,10 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List, TYPE_CHECKING, Tuple
+from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 import torch
 import faiss
 from .config import KMeansIndexConfig
-import math
 
 
 class Index(ABC):

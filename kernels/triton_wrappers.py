@@ -1,4 +1,4 @@
-from triton_kernels import *
+from hira.kernels.triton_kernels import *
 
 
 # wrapper

@@ -1,0 +1,8 @@
+device_mode: "cpu_only" # "cpu_only" or "cuda_only" or "cpu-cuda"
+
+cuda_memory_limit: 4096  # "cuda" memory limit in MB (only for "cpu-cuda")
+
+indexing:
+  num_levels: 5
+  max_iterations: 1 # max iterations for k-means
+  branching_factor: 10
