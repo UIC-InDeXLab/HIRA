@@ -215,6 +215,8 @@ class CUDAIndexer(Indexer):
         self.parent_radii: Optional[torch.Tensor] = None  # level 1
         self.grand_parents: Optional[torch.Tensor] = None  # level 2
         self.grand_parent_radii: Optional[torch.Tensor] = None  # level 2
+        # buffer
+        self.buffer: Optional[torch.Tensor] = None
 
     @torch.no_grad()
     def build(self, keys: torch.Tensor):
@@ -238,6 +240,11 @@ class CUDAIndexer(Indexer):
             )
             self.parent_radii = self._compute_parent_radii_from_layout()
             self.grand_parent_radii = self._compute_grandparent_radii_from_layout()
+
+        # buffer for storing the scores
+        self.buffer = torch.zeros(
+            (self.children.shape[0],), device="cuda", dtype=torch.float32
+        )
 
         return self
 

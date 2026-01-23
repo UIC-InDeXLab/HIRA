@@ -562,21 +562,24 @@ class TestCUDASearcherRangeSearch:
         children = indexer.children
         assert children is not None
 
+        valid = _valid_rows_mask(children, pad_value=pad_value)
+        assert valid.any(), "Expected at least one non-padded child row"
+
         q = _normalize_query(torch.randn(d, device="cuda", dtype=torch.float32))
-        scores = children @ q
+        scores = children[valid] @ q
         searcher = CUDASearcher(block_c=min(16, bf))
 
         # Very high threshold => empty.
         t_hi = float(scores.max().item() + 1.0)
         out_hi = searcher.search(q, t_hi, indexer)
-        got_hi = (out_hi >= t_hi).nonzero(as_tuple=True)[0]
+        got_hi = ((out_hi >= t_hi) & valid).nonzero(as_tuple=True)[0]
         assert got_hi.numel() == 0
 
         # Very low threshold => all.
         t_lo = float(scores.min().item() - 1.0)
         out_lo = searcher.search(q, t_lo, indexer)
-        got_lo = (out_lo >= t_lo).nonzero(as_tuple=True)[0]
-        assert got_lo.numel() == children.shape[0]
+        got_lo = ((out_lo >= t_lo) & valid).nonzero(as_tuple=True)[0]
+        assert got_lo.numel() == int(valid.sum().item())
 
     @pytest.mark.parametrize(
         "bf,g,d,threshold",

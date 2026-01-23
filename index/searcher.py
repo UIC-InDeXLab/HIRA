@@ -136,9 +136,12 @@ class CUDASearcher(Searcher):
         super().__init__()
         self.block_c = block_c
 
-    def search(self, query, threshold, indexer):
+    def search(self, query, threshold, indexer: CUDAIndexer):
         # normalize query
-        query = query / torch.norm(query, p=2)
+        # query = query / torch.norm(query, p=2)
+        # Query is already normalized
+
+        indexer.buffer.zero_()
 
         if indexer.depth == CUDAIndexer.DEPTH.TWO_LEVELS:
             output = triton_two_level_filter(
@@ -147,7 +150,7 @@ class CUDASearcher(Searcher):
                 indexer.parent_radii,
                 query,
                 threshold,
-                out=None,  # check
+                out=indexer.buffer,  # check
                 BLOCK_C=self.block_c,
                 branch=indexer.branching_factor,
             )
@@ -160,7 +163,7 @@ class CUDASearcher(Searcher):
                 indexer.grand_parent_radii,
                 query,
                 threshold,
-                out=None,  # check
+                out=indexer.buffer,  # check
                 branch=indexer.branching_factor,
             )
         return output
