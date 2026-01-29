@@ -11,6 +11,18 @@ class Indexer(ABC):
     def build(self, keys: torch.Tensor):
         raise NotImplementedError
 
+    def update(self, new_keys: torch.Tensor):
+        raise NotImplementedError
+
+    @staticmethod
+    def sample_max_level(new_keys, branching_factor: int):
+        U = torch.rand(new_keys.shape[0], device=new_keys.device)
+        L = 1 + torch.floor(
+            torch.log(U)
+            / torch.log(torch.tensor(1.0 / branching_factor, device=new_keys.device))
+        )
+        return L.long()
+
 
 class CPUIndexer(Indexer):
 
@@ -33,6 +45,7 @@ class CPUIndexer(Indexer):
         branching_factor: int,
         max_iterations: int = 1,
         verbose: bool = False,
+        balance_every: int = 0,  # balance every # new added keys (0 = never)
     ):
         super().__init__()
         self.max_iterations = max_iterations
@@ -44,6 +57,14 @@ class CPUIndexer(Indexer):
         self.num_keys: int = 0
         self.keys: Optional[torch.Tensor] = None
         self.dim: int = 0
+
+        # ====== UPDATE ======
+        # Cache for fast nearest-parent assignment during incremental updates.
+        # Valid as long as level-1 parent centers stay unchanged.
+        self._faiss_l1_index: Optional[Any] = None
+        self._faiss_l1_index_ntotal: int = 0
+        self.balance_every = balance_every
+        self.update_count = 0
 
     @torch.no_grad()
     def build(self, keys: torch.Tensor):
@@ -110,9 +131,299 @@ class CPUIndexer(Indexer):
             level_idx += 1
 
         # add buffers (ASSUMED STATIC LEVELS)
+        if len(self.levels) >= 2:
+            self._build_l1_faiss(self.levels[1])
+
         self.preallocate_search_buffers()
 
         return self
+
+    @torch.no_grad()
+    def update(self, new_keys: torch.Tensor, fast: bool = True):
+        if new_keys.numel() == 0:
+            return self
+        if new_keys.ndim != 2:
+            raise ValueError(f"new_keys must be (n,d), got {tuple(new_keys.shape)}")
+        if not self.levels:
+            raise RuntimeError("CPUIndexer.update() called before build()")
+
+        new_keys_cpu = new_keys.to(self.device).contiguous()
+
+        # 1) Append to base storage (keep self.keys and level-0 centers consistent)
+        base_level = self.levels[0]
+
+        self.keys = torch.cat([self.keys, new_keys_cpu], dim=0).contiguous()
+
+        self.num_keys = self.keys.shape[0]
+        base_level.ball_centers = self.keys
+        base_level.size = self.num_keys
+
+        # Leaf radii are always 0 (leaf balls are points)
+        base_level.ball_radii = torch.zeros(
+            (self.num_keys,), device=self.device, dtype=new_keys_cpu.dtype
+        )
+
+        # If there is no parent level, nothing to connect to.
+        if len(self.levels) < 2:
+            return self
+
+        # 2) Assign each new key to the closest parent (level 1) using FAISS
+        parent_level = self.levels[1]
+        parent_centers = parent_level.ball_centers
+        if parent_centers.ndim != 2 or parent_centers.shape[1] != self.dim:
+            raise RuntimeError(
+                f"Invalid parent centers shape: {tuple(parent_centers.shape)} (expected (*,{self.dim}))"
+            )
+
+        x_np = new_keys_cpu.detach().cpu().float().contiguous().numpy()
+        d2_np, idx_np = self._faiss_l1_index.search(x_np, 1)  # (m,1), (m,1)
+
+        closest_parent_idx = torch.from_numpy(idx_np.reshape(-1)).to(
+            device=self.device, dtype=torch.long
+        )
+        base_level.child2parent = torch.cat(
+            [base_level.child2parent, closest_parent_idx], dim=0
+        )
+
+        # 3) Incrementally update parent radii if new keys extend the enclosing ball.
+        # parent ball radius is max(||child_center - parent_center|| + child_radius).
+        # leaf child_radius is 0, so this is just the max distance.
+        dist = (
+            torch.from_numpy(d2_np.reshape(-1))
+            .to(device=self.device, dtype=torch.float32)
+            .clamp_min_(0.0)
+            .sqrt_()
+        )
+
+        pr = parent_level.ball_radii
+        if pr.shape[0] != parent_level.size:
+            raise RuntimeError(
+                f"Parent radii shape mismatch: {tuple(pr.shape)} vs size {parent_level.size}"
+            )
+
+        # Fast path (PyTorch scatter_reduce_)
+        if fast:
+            upd = torch.full(
+                (parent_level.size,),
+                float("-inf"),
+                device=self.device,
+                dtype=dist.dtype,
+            )
+            upd.scatter_reduce_(
+                0, closest_parent_idx, dist, reduce="amax", include_self=True
+            )
+            upd = torch.where(torch.isfinite(upd), upd, torch.zeros_like(upd))
+            parent_level.ball_radii = torch.maximum(pr, upd.to(dtype=pr.dtype))
+        else:
+            for p in closest_parent_idx.unique().tolist():
+                mask = closest_parent_idx == p
+                m = dist[mask].max()
+                if m > parent_level.ball_radii[p]:
+                    parent_level.ball_radii[p] = m.to(
+                        dtype=parent_level.ball_radii.dtype
+                    )
+
+        # 4) Rebalance if needed
+        self.update_count += new_keys_cpu.shape[0]
+        if self.balance_every > 0 and self.update_count >= self.balance_every:
+            self._balance(use_faiss=True)
+            self.update_count = 0
+
+        return self
+
+    def _balance(self, use_faiss: bool = True):
+        """Rebalance the hierarchy by splitting oversized level-1 parents.
+
+        Policy:
+        - If a level-1 parent has > 2*branching_factor level-0 children, split its children
+          into two groups (2-means), keep one centroid in-place, append the other as a new parent.
+        - Update level-0 child2parent for the split children.
+                - Assign both affected parents (the overwritten one and the appended one) to the closest
+                    grandparent (level 2) if present, and update the affected level-2 radii.
+
+        Notes:
+        - Radii are only ever increased (never decreased), so this is safe for pruning.
+        - This intentionally does NOT propagate radius updates to levels >= 3.
+        """
+        if len(self.levels) < 2:
+            return
+
+        level0 = self.levels[0]
+        level1 = self.levels[1]
+
+        bf = int(self.branching_factor)
+
+        any_change = False
+
+        # Single-pass: split each currently-oversized parent at most once.
+        counts = torch.bincount(level0.child2parent, minlength=level1.size)
+        large_parents = (counts > 2 * bf).nonzero(as_tuple=True)[0]
+        if large_parents.numel() == 0:
+            return
+
+        if self.verbose:
+            print(f"Rebalancing: splitting {large_parents.numel()} oversized parents")
+
+        for parent_idx in large_parents.tolist():
+            child_idx = (level0.child2parent == parent_idx).nonzero(as_tuple=True)[0]
+            if child_idx.numel() <= 2 * bf:
+                continue
+            if child_idx.numel() < 2:
+                continue
+
+            pts = level0.ball_centers.index_select(0, child_idx)
+            pts_f = pts.detach().cpu().float().contiguous()
+            pts_np = pts_f.numpy()
+
+            # --- split with 2-means (faiss) ---
+            if use_faiss:
+                kmeans = faiss.Kmeans(
+                    d=self.dim,
+                    k=2,
+                    niter=1,
+                    nredo=1,
+                    verbose=False,
+                    gpu=False,
+                )
+                kmeans.train(pts_np)
+                d2_np, a_np = kmeans.index.search(pts_np, 1)
+                assign = torch.from_numpy(a_np.reshape(-1)).to(
+                    device=self.device, dtype=torch.long
+                )
+                centroids = torch.from_numpy(kmeans.centroids).to(
+                    device=self.device, dtype=level1.ball_centers.dtype
+                )
+            else:
+                # Fallback: random half split
+                perm = torch.randperm(child_idx.numel(), device=self.device)
+                assign = torch.zeros(
+                    child_idx.numel(), device=self.device, dtype=torch.long
+                )
+                assign[perm[child_idx.numel() // 2 :]] = 1
+                c0 = pts.index_select(0, perm[: child_idx.numel() // 2]).mean(dim=0)
+                c1 = pts.index_select(0, perm[child_idx.numel() // 2 :]).mean(dim=0)
+                centroids = torch.stack([c0, c1], dim=0).to(
+                    dtype=level1.ball_centers.dtype
+                )
+
+            # Compute radii for the two clusters (leaf children have radius 0)
+            pts_dev = pts.to(self.device)
+            dists = torch.norm(pts_dev - centroids.index_select(0, assign), dim=1)
+            r0 = dists[assign == 0].max() if (assign == 0).any() else torch.tensor(0.0)
+            r1 = dists[assign == 1].max() if (assign == 1).any() else torch.tensor(0.0)
+
+            # Overwrite existing parent with centroid 0, append centroid 1
+            level1.ball_centers[parent_idx] = centroids[0]
+            level1.ball_radii[parent_idx] = r0.to(dtype=level1.ball_radii.dtype)
+
+            new_parent_idx = level1.size
+            level1.ball_centers = torch.cat(
+                [level1.ball_centers, centroids[1:2].contiguous()], dim=0
+            )
+            level1.ball_radii = torch.cat(
+                [
+                    level1.ball_radii,
+                    r1.to(device=self.device, dtype=level1.ball_radii.dtype).view(1),
+                ],
+                dim=0,
+            )
+            level1.size = level1.ball_centers.shape[0]
+
+            # Keep level-1 child2parent length consistent with level-1 size (if it exists)
+            if (
+                level1.child2parent is not None
+                and level1.child2parent.numel() != level1.size
+            ):
+                if level1.child2parent.numel() != level1.size - 1:
+                    raise RuntimeError(
+                        "Level-1 child2parent is out of sync with level-1 size. "
+                        f"Expected size-1, got {level1.child2parent.numel()} vs {level1.size}."
+                    )
+                level1.child2parent = torch.cat(
+                    [
+                        level1.child2parent,
+                        torch.zeros(
+                            (1,),
+                            device=self.device,
+                            dtype=level1.child2parent.dtype,
+                        ),
+                    ],
+                    dim=0,
+                )
+
+            # Reassign children: cluster 1 -> new parent index
+            moved_child = child_idx[assign == 1]
+            if moved_child.numel() > 0:
+                level0.child2parent.index_fill_(0, moved_child, int(new_parent_idx))
+
+            any_change = True
+
+            # Update bookkeeping for L0 after parent count changes
+            level0.num_parents = level1.size
+            level0.parent_mask_buf = torch.empty(
+                level0.num_parents, dtype=torch.bool, device=self.device
+            )
+
+            # Update level1->level2 assignment and radii (no propagation above level 2)
+            if len(self.levels) >= 3:
+                level2 = self.levels[2]
+                if level1.child2parent is None:
+                    raise RuntimeError(
+                        "Level-1 child2parent is None; cannot rebalance with 3+ levels."
+                    )
+
+                # Build temporary FAISS index for level-2 centers
+                gp_index = faiss.IndexFlatL2(self.dim)
+                gp_np = level2.ball_centers.detach().cpu().float().contiguous().numpy()
+                gp_index.add(gp_np)
+
+                affected = torch.tensor(
+                    [parent_idx, new_parent_idx], device=self.device, dtype=torch.long
+                )
+                aff_np = (
+                    level1.ball_centers.index_select(0, affected)
+                    .detach()
+                    .cpu()
+                    .float()
+                    .contiguous()
+                    .numpy()
+                )
+                d2g_np, gidx_np = gp_index.search(aff_np, 1)
+                gidx = torch.from_numpy(gidx_np.reshape(-1)).to(
+                    device=self.device, dtype=torch.long
+                )
+                level1.child2parent.index_copy_(0, affected, gidx)
+
+                # Update level-2 radii for affected grandparents
+                dist_gp = (
+                    torch.from_numpy(d2g_np.reshape(-1))
+                    .to(device=self.device, dtype=torch.float32)
+                    .clamp_min_(0.0)
+                    .sqrt_()
+                )
+                total = dist_gp + level1.ball_radii.index_select(0, affected).float()
+
+                upd = torch.full(
+                    (level2.size,),
+                    float("-inf"),
+                    device=self.device,
+                    dtype=total.dtype,
+                )
+                upd.scatter_reduce_(0, gidx, total, reduce="amax", include_self=True)
+                upd = torch.where(torch.isfinite(upd), upd, torch.zeros_like(upd))
+                level2.ball_radii = torch.maximum(
+                    level2.ball_radii, upd.to(level2.ball_radii.dtype)
+                )
+
+        if any_change:
+            self._build_l1_faiss(level1)
+
+    def _build_l1_faiss(self, level1):
+        parents_np = level1.ball_centers.contiguous().numpy()
+        index = faiss.IndexFlatL2(self.dim)
+        index.add(parents_np)
+        self._faiss_l1_index = index
+        self._faiss_l1_index_ntotal = parents_np.shape[0]
 
     def preallocate_search_buffers(self):
         for lvl in self.levels:
@@ -502,4 +813,32 @@ class CUDAIndexer(Indexer):
 
 
 class CPUCUDAIndexer(Indexer):
-    pass
+    def __init__(
+        self,
+        gpu_cache_size: int,
+        gpu_max_size: int,
+        cpu_num_levels: int,
+        cpu_branching_factor: int,
+        cpu_max_iterations: int = 1,
+    ):
+        super().__init__()
+        self.gpu_cache_size = gpu_cache_size
+        self.gpu_max_size = gpu_max_size
+        self.cpu_indexer = CPUIndexer(
+            num_levels=cpu_num_levels,
+            branching_factor=cpu_branching_factor,
+            max_iterations=cpu_max_iterations,
+        )
+
+        self.gpu_cached_keys: Optional[torch.Tensor] = None
+
+    @torch.no_grad()
+    def build(self, keys: torch.Tensor):  # keys are on CUDA
+        self.cpu_indexer.build(keys)
+
+        # store last gpu_cache_size keys on GPU
+        num_keys = keys.shape[0]
+        cache_start = max(0, num_keys - self.gpu_cache_size)
+        self.gpu_cached_keys = keys[cache_start:]
+
+        return self

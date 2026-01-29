@@ -900,5 +900,263 @@ def test_refined_radii_upper_bound_property(device):
         assert torch.all(lhs <= rhs + 1e-5).item()
 
 
+class TestIndexerUpdate:
+    def test_update_from_empty_one_level(self, device):
+        """Starting from an empty index (no hierarchy), update should append keys and search should match brute force."""
+        d = 16
+        cfg = make_config(
+            device=device, num_levels=1, branching_factor=4, max_iterations=5
+        )
+
+        empty = torch.empty((0, d), device=device)
+        index = CPUIndexer(**cfg).build(empty)
+        assert index.num_keys == 0
+        assert len(index.levels) == 1
+
+        new1 = make_keys(n=50, d=d, seed=10, device=device)
+        index.update(new1)
+
+        assert index.keys is not None
+        assert index.keys.shape == new1.shape
+        assert torch.allclose(index.keys, new1)
+        L0 = index.levels[0]
+        assert L0.size == new1.shape[0]
+        assert L0.child2parent is None
+        assert L0.ball_radii.shape == (new1.shape[0],)
+        assert torch.all(L0.ball_radii == 0)
+
+        # Second update should still work
+        new2 = make_keys(n=30, d=d, seed=11, device=device)
+        index.update(new2)
+        all_keys = torch.cat([new1, new2], dim=0)
+        assert index.keys.shape == all_keys.shape
+        assert torch.allclose(index.keys, all_keys)
+
+        searcher = CPUSearcher(numba=True)
+        g = torch.Generator(device="cpu")
+        g.manual_seed(123)
+        for thr in [0.0, 0.2, 0.5]:
+            for _ in range(5):
+                q = torch.randn(d, generator=g, device=device)
+                got = searcher.search(q, thr, index)
+                exp = brute_force_halfspace(all_keys, q, thr)
+                assert torch.equal(torch.sort(got).values, torch.sort(exp).values)
+
+    def test_update_two_level_assigns_parent_and_updates_radii(self, device):
+        """With 2 levels, update() must (1) append keys, (2) append assignments, (3) expand parent radii as needed."""
+        n0, d = 128, 24
+        cfg = make_config(
+            device=device, num_levels=2, branching_factor=4, max_iterations=10
+        )
+        keys0 = make_keys(n=n0, d=d, seed=20, device=device)
+        index = CPUIndexer(**cfg).build(keys0)
+        assert len(index.levels) == 2
+
+        L0 = index.levels[0]
+        L1 = index.levels[1]
+        assert L0.child2parent is not None
+        assert L0.parent_mask_buf is not None
+        assert L0.parent_mask_buf.shape == (L1.size,)
+
+        radii_before = L1.ball_radii.clone()
+
+        new = make_keys(n=37, d=d, seed=21, device=device)
+        index.update(new)
+
+        # Base storage
+        assert index.num_keys == n0 + new.shape[0]
+        assert index.keys.shape == (n0 + new.shape[0], d)
+        assert L0.size == n0 + new.shape[0]
+        assert L0.ball_centers.shape == (n0 + new.shape[0], d)
+        assert L0.child2parent.shape == (n0 + new.shape[0],)
+
+        # Parent ids valid
+        new_assign = L0.child2parent[-new.shape[0] :]
+        assert torch.all((new_assign >= 0) & (new_assign < L1.size)).item()
+
+        # Parent radii monotonic non-decreasing
+        assert torch.all(L1.ball_radii >= radii_before - 1e-6).item()
+
+        # Each new key should be within assigned parent's radius
+        parent_centers = L1.ball_centers
+        dist = torch.norm(new - parent_centers[new_assign], dim=1)
+        assert torch.all(dist <= L1.ball_radii[new_assign] + 1e-5).item()
+
+    def test_update_windowed_matches_bruteforce_on_final_keys(self, device):
+        """Windowed updates should not crash and should preserve search correctness on the final key set (2-level index)."""
+        N, d = 500, 32
+        n0 = 200
+        w = 37
+        cfg = make_config(
+            device=device, num_levels=2, branching_factor=4, max_iterations=15
+        )
+
+        all_keys = make_keys(n=N, d=d, seed=30, device=device)
+        keys0 = all_keys[:n0]
+        tail = all_keys[n0:]
+
+        updated = CPUIndexer(**cfg).build(keys0)
+        assert len(updated.levels) == 2
+
+        # Apply windowed updates
+        start = 0
+        while start < tail.shape[0]:
+            chunk = tail[start : start + w]
+            updated.update(chunk)
+            start += w
+
+        # Sanity vs a fresh build from all keys (structure may differ, keys must match)
+        full = CPUIndexer(**cfg).build(all_keys)
+        assert full.keys is not None
+        assert updated.keys is not None
+        assert torch.allclose(updated.keys, full.keys)
+        assert updated.num_keys == N
+
+        L0u = updated.levels[0]
+        L1u = updated.levels[1]
+        assert L0u.child2parent is not None
+        assert L0u.child2parent.shape == (N,)
+        assert torch.all((L0u.child2parent >= 0) & (L0u.child2parent < L1u.size)).item()
+        assert torch.all(L1u.ball_radii >= 0).item()
+
+        # Search correctness on the final keys
+        searcher = CPUSearcher(numba=True)
+        g = torch.Generator(device="cpu")
+        g.manual_seed(999)
+        for thr in [0.0, 0.2, 0.5]:
+            for _ in range(10):
+                q = torch.randn(d, generator=g, device=device)
+                got = searcher.search(q, thr, updated)
+                exp = brute_force_halfspace(all_keys, q, thr)
+                assert torch.equal(torch.sort(got).values, torch.sort(exp).values)
+
+    def test_update_with_auto_balance_matches_full_build(self, device):
+        """update() with auto-balance should preserve correctness and behave like a fresh build on final keys.
+
+        We compare both indices against brute force on the final key set, and also assert
+        the two indices return identical results for a set of random queries.
+        """
+        bf = 4
+        d = 16
+        n0 = 64
+        chunk = 20
+        num_updates = 4
+
+        cfg_bal = make_config(
+            device=device,
+            num_levels=3,
+            branching_factor=bf,
+            max_iterations=10,
+        )
+        cfg_bal["balance_every"] = 1  # balance on every update call
+
+        keys0 = make_keys(n=n0, d=d, seed=1234, device=device)
+        updated = CPUIndexer(**cfg_bal).build(keys0)
+        assert len(updated.levels) == 3
+
+        L0 = updated.levels[0]
+        L1 = updated.levels[1]
+        assert L0.child2parent is not None
+        l1_size_before = L1.size
+
+        # Make updates heavily concentrate on a single parent to force splitting.
+        target_parent = int(L0.child2parent[0].item())
+        center = L1.ball_centers[target_parent]
+
+        g = torch.Generator(device="cpu")
+        g.manual_seed(2026)
+        new_chunks = []
+        for _ in range(num_updates):
+            new = center + 1e-2 * torch.randn(chunk, d, generator=g, device=device)
+            new_chunks.append(new)
+            updated.update(new)
+
+        all_new = torch.cat(new_chunks, dim=0)
+        all_keys = torch.cat([keys0, all_new], dim=0)
+
+        assert updated.keys is not None
+        assert torch.allclose(updated.keys, all_keys)
+
+        # Balance should have happened and created at least one extra parent.
+        assert updated.levels[1].size > l1_size_before
+
+        # Fresh build baseline on the final keys
+        cfg_full = make_config(
+            device=device,
+            num_levels=3,
+            branching_factor=bf,
+            max_iterations=10,
+        )
+        full = CPUIndexer(**cfg_full).build(all_keys)
+
+        # Compare behavior on random queries
+        searcher = CPUSearcher(numba=True)
+        gq = torch.Generator(device="cpu")
+        gq.manual_seed(999)
+        for thr in [-0.2, 0.0, 0.2]:
+            for _ in range(20):
+                q = torch.randn(d, generator=gq, device=device)
+                exp = brute_force_halfspace(all_keys, q, thr)
+
+                got_updated = searcher.search(q, thr, updated)
+                got_full = searcher.search(q, thr, full)
+
+                assert torch.equal(
+                    torch.sort(got_updated).values, torch.sort(exp).values
+                )
+                assert torch.equal(torch.sort(got_full).values, torch.sort(exp).values)
+                assert torch.equal(
+                    torch.sort(got_updated).values, torch.sort(got_full).values
+                )
+
+        # Invariants: for each level, parent radius must upper-bound child distances.
+        for i in range(len(updated.levels) - 1):
+            child = updated.levels[i]
+            parent = updated.levels[i + 1]
+            assert child.child2parent is not None
+            c2p = child.child2parent
+            dist = torch.norm(child.ball_centers - parent.ball_centers[c2p], dim=1)
+            lhs = dist + child.ball_radii
+            rhs = parent.ball_radii[c2p]
+            assert torch.all(lhs <= rhs + 1e-5).item()
+
+    def test_balance_every_n_keys_triggers_after_multiple_updates(self, device):
+        """balance_every counts *keys*, so balance should trigger after enough updates accumulate."""
+        bf = 4
+        d = 16
+        n0 = 64
+        chunk = 20
+
+        cfg = make_config(
+            device=device,
+            num_levels=3,
+            branching_factor=bf,
+            max_iterations=10,
+        )
+        cfg["balance_every"] = 2 * chunk  # trigger after two updates worth of keys
+
+        keys0 = make_keys(n=n0, d=d, seed=555, device=device)
+        index = CPUIndexer(**cfg).build(keys0)
+        L0 = index.levels[0]
+        L1 = index.levels[1]
+        assert L0.child2parent is not None
+
+        target_parent = int(L0.child2parent[0].item())
+        center = L1.ball_centers[target_parent]
+
+        l1_size_before = L1.size
+
+        g = torch.Generator(device="cpu")
+        g.manual_seed(777)
+
+        # First update: should NOT trigger balance yet
+        index.update(center + 1e-2 * torch.randn(chunk, d, generator=g, device=device))
+        assert index.levels[1].size == l1_size_before
+
+        # Second update: should trigger balance
+        index.update(center + 1e-2 * torch.randn(chunk, d, generator=g, device=device))
+        assert index.levels[1].size > l1_size_before
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
