@@ -1914,35 +1914,3 @@ class CUDAIndexer(Indexer):
                 )
 
         return self
-
-
-class CPUCUDAIndexer(Indexer):
-    def __init__(
-        self,
-        gpu_cache_size: int,
-        gpu_max_size: int,
-        cpu_num_levels: int,
-        cpu_branching_factor: int,
-        cpu_max_iterations: int = 1,
-    ):
-        super().__init__()
-        self.gpu_cache_size = gpu_cache_size
-        self.gpu_max_size = gpu_max_size
-        self.cpu_indexer = CPUIndexer(
-            num_levels=cpu_num_levels,
-            branching_factor=cpu_branching_factor,
-            max_iterations=cpu_max_iterations,
-        )
-
-        self.gpu_cached_keys: Optional[torch.Tensor] = None
-
-    @torch.no_grad()
-    def build(self, keys: torch.Tensor):  # keys are on CUDA
-        self.cpu_indexer.build(keys)
-
-        # store last gpu_cache_size keys on GPU
-        num_keys = keys.shape[0]
-        cache_start = max(0, num_keys - self.gpu_cache_size)
-        self.gpu_cached_keys = keys[cache_start:]
-
-        return self

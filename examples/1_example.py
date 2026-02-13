@@ -5,6 +5,10 @@ This example demonstrates how to use HiraCache and HiraAttention
 with a HuggingFace model.
 """
 
+# SEE THESE:
+from transformers import cache_utils
+from transformers.models.llama import modeling_llama
+
 import sys
 from pathlib import Path
 

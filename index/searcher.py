@@ -167,7 +167,3 @@ class CUDASearcher(Searcher):
                 branch=indexer.branching_factor,
             )
         return output
-
-
-class CPUCUDASearcher(Searcher):
-    pass
