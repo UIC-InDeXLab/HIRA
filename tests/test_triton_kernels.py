@@ -65,6 +65,15 @@ def _bruteforce_children_scores(children: torch.Tensor, query_1h1d: torch.Tensor
     return torch.einsum("hd,hnd->hn", q, children.float())
 
 
+def _grouped_bruteforce_children_scores(
+    children_kv: torch.Tensor, query_1h1d: torch.Tensor, q_head_to_kv: torch.Tensor
+):
+    q = query_1h1d.squeeze(0).squeeze(-2).float()
+    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    children_for_query = children_kv.index_select(0, q_head_to_kv.long())
+    return torch.einsum("hd,hnd->hn", q, children_for_query.float())
+
+
 def _per_head_quantile_threshold(
     scores: torch.Tensor, valid_mask: torch.Tensor, q: float
 ) -> torch.Tensor:
@@ -102,7 +111,7 @@ def test_triton_two_level_filter_high_recall_against_bruteforce(h, n, d, bf, see
     keys = _normalized_keys(h, n, d, seed=seed)
     assert keys.is_cuda
     indexer = CUDAIndexer(
-        depth=CUDAIndexer.DEPTH.TWO_LEVELS,
+        num_levels=CUDAIndexer.DEPTH.TWO_LEVELS,
         max_iterations=2,
         branching_factor=bf,
         pad_value=0.0,
@@ -147,7 +156,7 @@ def test_triton_two_level_filter_accepts_2d_and_4d_query_layouts():
     keys = _normalized_keys(h, n, d, seed=21)
     assert keys.is_cuda
     indexer = CUDAIndexer(
-        depth=CUDAIndexer.DEPTH.TWO_LEVELS,
+        num_levels=CUDAIndexer.DEPTH.TWO_LEVELS,
         max_iterations=2,
         branching_factor=bf,
         pad_value=0.0,
@@ -197,7 +206,7 @@ def test_triton_two_level_filter_writes_to_provided_output_buffer():
     keys = _normalized_keys(h, n, d, seed=31)
     assert keys.is_cuda
     indexer = CUDAIndexer(
-        depth=CUDAIndexer.DEPTH.TWO_LEVELS,
+        num_levels=CUDAIndexer.DEPTH.TWO_LEVELS,
         max_iterations=2,
         branching_factor=bf,
         pad_value=0.0,
@@ -238,7 +247,7 @@ def test_triton_three_level_variants_match_each_other_and_bruteforce():
     keys = _normalized_keys(h, n, d, seed=41)
     assert keys.is_cuda
     indexer = CUDAIndexer(
-        depth=CUDAIndexer.DEPTH.THREE_LEVELS,
+        num_levels=CUDAIndexer.DEPTH.THREE_LEVELS,
         max_iterations=2,
         branching_factor=bf,
         pad_value=0.0,
@@ -308,12 +317,89 @@ def test_triton_three_level_variants_match_each_other_and_bruteforce():
     torch.testing.assert_close(out_wrapper, out_k1, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize(
+    "depth,d,seed",
+    [
+        (CUDAIndexer.DEPTH.TWO_LEVELS, 64, 91),
+        (CUDAIndexer.DEPTH.THREE_LEVELS, 64, 92),
+    ],
+)
+def test_triton_kernels_support_grouped_attention(depth, d, seed):
+    h_kv, group_size, n, bf = 2, 3, 512, 8
+    h_q = h_kv * group_size
+
+    keys = _normalized_keys(h_kv, n, d, seed=seed)
+    indexer = CUDAIndexer(
+        num_levels=depth,
+        max_iterations=2,
+        branching_factor=bf,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    assert indexer.parents is not None
+    assert indexer.parent_radii is not None
+    valid_kv = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+
+    q = _random_query(h_q, d, seed=seed + 1)
+    q_head_to_kv = torch.arange(h_q, device="cuda", dtype=torch.long) // group_size
+    valid_q = valid_kv.index_select(0, q_head_to_kv)
+    gt = _grouped_bruteforce_children_scores(indexer.children, q, q_head_to_kv)
+    th = _per_head_quantile_threshold(gt, valid_q, q=0.75)
+    block_c = _choose_block_c(bf)
+
+    if depth == CUDAIndexer.DEPTH.TWO_LEVELS:
+        out = triton_two_level_filter(
+            indexer.children,
+            indexer.parents,
+            indexer.parent_radii,
+            q,
+            th,
+            branch=bf,
+            BLOCK_C=block_c,
+        )
+        assert out.shape == gt.shape
+        assert _recall(out, gt, th, valid_q) >= 0.99
+        return
+
+    assert indexer.grand_parents is not None
+    assert indexer.grand_parent_radii is not None
+    out_k1 = triton_three_level_filter_kernel_v1(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        indexer.grand_parents,
+        indexer.grand_parent_radii,
+        q,
+        th,
+        branch=bf,
+        BLOCK_C=block_c,
+    )
+    out_k2 = triton_three_level_filter_kernel_v2(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        indexer.grand_parents,
+        indexer.grand_parent_radii,
+        q,
+        th,
+        branch=bf,
+        BLOCK_C=block_c,
+    )
+
+    assert out_k1.shape == gt.shape
+    assert out_k2.shape == gt.shape
+    assert _recall(out_k1, gt, th, valid_q) >= 0.99
+    assert _recall(out_k2, gt, th, valid_q) >= 0.99
+    torch.testing.assert_close(out_k1, out_k2, atol=1e-4, rtol=1e-4)
+
+
 def test_triton_two_level_filter_validates_inputs():
     h, n, d, bf = 2, 64, 32, 8
     keys = _normalized_keys(h, n, d, seed=51)
     assert keys.is_cuda
     indexer = CUDAIndexer(
-        depth=CUDAIndexer.DEPTH.TWO_LEVELS,
+        num_levels=CUDAIndexer.DEPTH.TWO_LEVELS,
         max_iterations=1,
         branching_factor=bf,
         pad_value=0.0,

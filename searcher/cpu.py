@@ -32,7 +32,7 @@ class CPUSearcher(BaseSearcher):
 
         self.strategies = {
             "vectorized_cpp_filter": self._search_vectorized,
-            "fused": self._search_fused_v2,
+            "fused_v1": self._search_fused,
             "fused_v2": self._search_fused_v2,
             "fused_v3": self._search_fused_v3,  # the best
             "fused_v4": self._search_fused_v4,
@@ -61,19 +61,56 @@ class CPUSearcher(BaseSearcher):
         query = query.squeeze(0).squeeze(-2).float().contiguous()
         query = query / query.norm(dim=-1, keepdim=True)
 
-        threshold = threshold.float().contiguous()
+        threshold = self._coerce_threshold(
+            threshold=threshold, num_query_heads=query.shape[0]
+        )
+        q_head_to_kv = self._resolve_q_head_to_kv(
+            num_query_heads=query.shape[0], num_kv_heads=indexer.keys.shape[0]
+        )
 
         if self.profiling:
             self._reset_stats()
 
-        return self.search_alg(query, threshold, indexer)
+        return self.search_alg(query, threshold, indexer, q_head_to_kv=q_head_to_kv)
+
+    @staticmethod
+    def _coerce_threshold(
+        threshold: torch.Tensor, num_query_heads: int
+    ) -> torch.Tensor:
+        t = threshold.float().contiguous().reshape(-1)
+        if t.numel() == 1 and num_query_heads > 1:
+            t = t.expand(num_query_heads)
+        if t.numel() != num_query_heads:
+            raise ValueError(
+                f"threshold must be scalar or length H_q={num_query_heads}, got {t.numel()}"
+            )
+        return t.contiguous()
+
+    @staticmethod
+    def _resolve_q_head_to_kv(num_query_heads: int, num_kv_heads: int) -> torch.Tensor:
+        if num_query_heads <= 0 or num_kv_heads <= 0:
+            raise ValueError(
+                f"Invalid head counts: H_q={num_query_heads}, H_kv={num_kv_heads}"
+            )
+        if num_query_heads == num_kv_heads:
+            return torch.arange(num_query_heads, dtype=torch.long)
+        if (num_query_heads % num_kv_heads) != 0:
+            raise ValueError(
+                f"Unsupported head mapping: H_q={num_query_heads} must be divisible by H_kv={num_kv_heads}"
+            )
+        group_size = num_query_heads // num_kv_heads
+        return torch.arange(num_query_heads, dtype=torch.long) // group_size
 
     # ------------------------------------------------------------------
     # Vectorized path (batched across H heads)
     # ------------------------------------------------------------------
 
-    def _search_vectorized(self, query, threshold, indexer):
+    def _search_vectorized(self, query, threshold, indexer, q_head_to_kv=None):
         """All heads processed in parallel via batched ops."""
+        if q_head_to_kv is not None and query.shape[0] != indexer.keys.shape[0]:
+            raise ValueError(
+                "vectorized_cpp_filter currently requires H_q == H_kv; use fused_v1/v2/v3/v4 for grouped attention"
+            )
         H, D = query.shape
         N = indexer.num_keys
         th = threshold.unsqueeze(-1)  # (H, 1)  for broadcasting
@@ -141,7 +178,11 @@ class CPUSearcher(BaseSearcher):
     # ------------------------------------------------------------------
 
     def _search_fused(
-        self, query: torch.Tensor, threshold: torch.Tensor, indexer: CPUIndexer
+        self,
+        query: torch.Tensor,
+        threshold: torch.Tensor,
+        indexer: CPUIndexer,
+        q_head_to_kv: torch.Tensor,
     ):
         """Fused search using the zero-copy PyTorch C++ extension.
 
@@ -188,10 +229,15 @@ class CPUSearcher(BaseSearcher):
             radii_list,
             c2p_list,
             sizes_list,
+            q_head_to_kv.long().contiguous(),
         )
 
     def _search_fused_v2(
-        self, query: torch.Tensor, threshold: torch.Tensor, indexer: CPUIndexer
+        self,
+        query: torch.Tensor,
+        threshold: torch.Tensor,
+        indexer: CPUIndexer,
+        q_head_to_kv: torch.Tensor,
     ):
         """Fused search using the v2 zero-copy PyTorch C++ extension.
 
@@ -225,10 +271,15 @@ class CPUSearcher(BaseSearcher):
             radii_list,
             c2p_list,
             sizes_list,
+            q_head_to_kv.long().contiguous(),
         )
 
     def _search_fused_v3(
-        self, query: torch.Tensor, threshold: torch.Tensor, indexer: CPUIndexer
+        self,
+        query: torch.Tensor,
+        threshold: torch.Tensor,
+        indexer: CPUIndexer,
+        q_head_to_kv: torch.Tensor,
     ):
         """Fused search using the v3 zero-copy PyTorch C++ extension.
 
@@ -260,10 +311,15 @@ class CPUSearcher(BaseSearcher):
             sizes_list,
             offsets_list,
             children_list,
+            q_head_to_kv.long().contiguous(),
         )
 
     def _search_fused_v4(
-        self, query: torch.Tensor, threshold: torch.Tensor, indexer: CPUIndexer
+        self,
+        query: torch.Tensor,
+        threshold: torch.Tensor,
+        indexer: CPUIndexer,
+        q_head_to_kv: torch.Tensor,
     ):
         """Fused search using the v4 zero-copy PyTorch C++ extension.
 
@@ -300,10 +356,15 @@ class CPUSearcher(BaseSearcher):
             sizes_list,
             offsets_list,
             children_list,
+            q_head_to_kv.long().contiguous(),
         )
 
     def _search_exact_torch(
-        self, query: torch.Tensor, threshold: torch.Tensor, indexer: CPUIndexer
+        self,
+        query: torch.Tensor,
+        threshold: torch.Tensor,
+        indexer: CPUIndexer,
+        q_head_to_kv=None,
     ):
         """Vectorized search using the zero-copy exact-filter kernel.
 

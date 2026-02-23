@@ -28,7 +28,6 @@ class CPUIndexer(BaseIndexer):
         branching_factor: int,
         max_iterations: int = 1,
         verbose: bool = False,
-        balance_every: int = 0,  # balance every # new added keys (0 = never)
         centroid_refine_iters: int = 0,  # 0 keeps random-centroid behavior
     ):
         super().__init__()
@@ -46,7 +45,6 @@ class CPUIndexer(BaseIndexer):
         # Cache for fast nearest-parent assignment during incremental updates.
         # Valid as long as level-1 parent centers stay unchanged.
         # self._faiss_l1_index: Optional[Any] = None
-        self.balance_every = balance_every
         self.update_count = 0
         self.centroid_refine_iters = int(centroid_refine_iters)
 
@@ -379,7 +377,6 @@ class CPUIndexer(BaseIndexer):
             branching_factor=self.branching_factor,
             max_iterations=self.max_iterations,
             verbose=False,
-            balance_every=0,
             centroid_refine_iters=self.centroid_refine_iters,
         ).build(new_keys)
 

@@ -21,6 +21,8 @@
 #include <omp.h>
 #endif
 
+namespace py = pybind11;
+
 static inline float dot(const float* __restrict__ a,
                         const float* __restrict__ b,
                         int64_t D) {
@@ -34,31 +36,60 @@ static inline float dot(const float* __restrict__ a,
 
 torch::Tensor fused_tree_search_v2(
     torch::Tensor keys,                    // (H, N, D) float
-    torch::Tensor query,                   // (H, D) float
-    torch::Tensor thresholds,              // (H,) float
+    torch::Tensor query,                   // (H_q, D) float
+    torch::Tensor thresholds,              // (H_q,) float
     std::vector<torch::Tensor> level_centers,  // (H, K_l, D)
     std::vector<torch::Tensor> level_radii,    // (H, K_l)
     std::vector<torch::Tensor> level_c2p,      // (H, K_l), empty for root
-    std::vector<int64_t> level_sizes) {
+    std::vector<int64_t> level_sizes,
+    torch::Tensor q_head_to_kv) {
 
-    TORCH_CHECK(keys.dim() == 3, "keys must be (H, N, D)");
-    TORCH_CHECK(query.dim() == 2, "query must be (H, D)");
-    TORCH_CHECK(thresholds.dim() == 1, "thresholds must be (H,)");
+    TORCH_CHECK(keys.dim() == 3, "keys must be (H_kv, N, D)");
+    TORCH_CHECK(query.dim() == 2, "query must be (H_q, D)");
+    TORCH_CHECK(thresholds.dim() == 1, "thresholds must be (H_q,)");
     TORCH_CHECK(!level_sizes.empty(), "level_sizes must be non-empty");
 
     keys = keys.contiguous().to(torch::kFloat32);
     query = query.contiguous().to(torch::kFloat32);
     thresholds = thresholds.contiguous().to(torch::kFloat32);
 
-    const int64_t H = keys.size(0);
+    const int64_t H_kv = keys.size(0);
     const int64_t N = keys.size(1);
     const int64_t D = keys.size(2);
+    const int64_t H_q = query.size(0);
     const int64_t num_levels = static_cast<int64_t>(level_sizes.size());
 
-    TORCH_CHECK(query.size(0) == H && query.size(1) == D,
-                "query shape mismatch vs keys");
-    TORCH_CHECK(thresholds.size(0) == H,
-                "threshold shape mismatch vs keys");
+    TORCH_CHECK(query.size(1) == D, "query dim mismatch vs keys");
+    TORCH_CHECK(thresholds.size(0) == H_q,
+                "threshold shape mismatch vs query");
+
+    std::vector<int64_t> q2kv(static_cast<size_t>(H_q), int64_t(0));
+    if (q_head_to_kv.defined() && q_head_to_kv.numel() > 0) {
+        TORCH_CHECK(q_head_to_kv.dim() == 1, "q_head_to_kv must be 1-D (H_q,)");
+        TORCH_CHECK(q_head_to_kv.size(0) == H_q,
+                    "q_head_to_kv must have length H_q");
+        q_head_to_kv = q_head_to_kv.contiguous().to(torch::kInt64).to(torch::kCPU);
+        const int64_t* map_ptr = q_head_to_kv.data_ptr<int64_t>();
+        for (int64_t qh = 0; qh < H_q; ++qh) {
+            const int64_t kv = map_ptr[qh];
+            TORCH_CHECK(kv >= 0 && kv < H_kv,
+                        "q_head_to_kv[", qh, "] out of range: ", kv);
+            q2kv[static_cast<size_t>(qh)] = kv;
+        }
+    } else {
+        if (H_q == H_kv) {
+            for (int64_t qh = 0; qh < H_q; ++qh) {
+                q2kv[static_cast<size_t>(qh)] = qh;
+            }
+        } else {
+            TORCH_CHECK((H_q % H_kv) == 0,
+                        "H_q must be divisible by H_kv when q_head_to_kv is not provided");
+            const int64_t group_size = H_q / H_kv;
+            for (int64_t qh = 0; qh < H_q; ++qh) {
+                q2kv[static_cast<size_t>(qh)] = qh / group_size;
+            }
+        }
+    }
 
     struct LevelData {
         const float* centers;   // (H, K, D)
@@ -94,7 +125,7 @@ torch::Tensor fused_tree_search_v2(
     const float* th_ptr = thresholds.data_ptr<float>();
 
     // Stage 1: traversal -> candidate leaf mask.
-    auto leaf_mask = torch::zeros({H, N}, torch::TensorOptions().dtype(torch::kBool).device(keys.device()));
+    auto leaf_mask = torch::zeros({H_q, N}, torch::TensorOptions().dtype(torch::kBool).device(keys.device()));
     bool* m_ptr = leaf_mask.data_ptr<bool>();
 
     #pragma omp parallel
@@ -103,12 +134,13 @@ torch::Tensor fused_tree_search_v2(
         std::vector<uint8_t> mask_b(static_cast<size_t>(max_nonleaf_k), uint8_t(0));
 
         #pragma omp for schedule(static)
-        for (int64_t h = 0; h < H; ++h) {
-            const float th = th_ptr[h];
-            const float* q_h = q_ptr + h * D;
+        for (int64_t qh = 0; qh < H_q; ++qh) {
+            const int64_t h = q2kv[static_cast<size_t>(qh)];
+            const float th = th_ptr[qh];
+            const float* q_h = q_ptr + qh * D;
 
             if (num_levels == 1) {
-                bool* m_h = m_ptr + h * N;
+                bool* m_h = m_ptr + qh * N;
                 for (int64_t i = 0; i < N; ++i) {
                     m_h[i] = true;
                 }
@@ -149,7 +181,7 @@ torch::Tensor fused_tree_search_v2(
 
             const LevelData& lev0 = levels[0];
             const int64_t* c2p0_h = lev0.c2p + h * N;
-            bool* m_h = m_ptr + h * N;
+            bool* m_h = m_ptr + qh * N;
             for (int64_t i = 0; i < N; ++i) {
                 m_h[i] = static_cast<bool>(parent_mask[c2p0_h[i]]);
             }
@@ -157,20 +189,21 @@ torch::Tensor fused_tree_search_v2(
     }
 
     // Stage 2: exact filter over flat (H * N) space.
-    auto result = torch::zeros({H, N}, keys.options());
+    auto result = torch::zeros({H_q, N}, keys.options());
     float* r_ptr = result.data_ptr<float>();
-    const int64_t total = H * N;
+    const int64_t total = H_q * N;
 
     #pragma omp parallel for schedule(static, 256)
     for (int64_t flat = 0; flat < total; ++flat) {
         if (!m_ptr[flat]) {
             continue;
         }
-        const int64_t h = flat / N;
+        const int64_t qh_idx = flat / N;
         const int64_t i = flat % N;
-        const float* ki = k_ptr + (h * N + i) * D;
-        const float* qh = q_ptr + h * D;
-        const float th = th_ptr[h];
+        const int64_t kv_h = q2kv[static_cast<size_t>(qh_idx)];
+        const float* ki = k_ptr + (kv_h * N + i) * D;
+        const float* qh = q_ptr + qh_idx * D;
+        const float th = th_ptr[qh_idx];
         const float s = dot(ki, qh, D);
         if (s >= th) {
             r_ptr[flat] = s;
@@ -183,6 +216,13 @@ torch::Tensor fused_tree_search_v2(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "HIRA zero-copy C++/OpenMP kernels v2 (reduced high-H overhead)";
     m.def("fused_tree_search_v2", &fused_tree_search_v2,
-          "Fused tree-walk + exact filter (v2)");
+          "Fused tree-walk + exact filter (v2)",
+          py::arg("keys"),
+          py::arg("query"),
+          py::arg("thresholds"),
+          py::arg("level_centers"),
+          py::arg("level_radii"),
+          py::arg("level_c2p"),
+          py::arg("level_sizes"),
+          py::arg("q_head_to_kv") = torch::Tensor());
 }
-

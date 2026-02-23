@@ -20,13 +20,13 @@ class CUDAIndexer(BaseIndexer):
 
     def __init__(
         self,
-        depth: DEPTH,
+        num_levels: DEPTH,
         max_iterations: int,
         branching_factor: int,
         verbose: bool = False,
         pad_value: float = 0.0,
     ):
-        self.depth = depth
+        self.depth = num_levels
         self.max_iterations = max_iterations
         self.branching_factor = branching_factor
         self.verbose = verbose
@@ -62,7 +62,7 @@ class CUDAIndexer(BaseIndexer):
                 self.children,
             ) = self._build_parents_children_from_keys(keys, self.branching_factor)
             self.parent_radii = self._compute_parent_radii_from_layout()
-        else:  # THREE_LEVELS
+        elif self.depth == CUDAIndexer.DEPTH.THREE_LEVELS:
             (
                 self.grand_parents,
                 self.parents,
@@ -72,6 +72,8 @@ class CUDAIndexer(BaseIndexer):
             )
             self.parent_radii = self._compute_parent_radii_from_layout()
             self.grand_parent_radii = self._compute_grandparent_radii_from_layout()
+        else:
+            raise ValueError(f"Unsupported depth {self.depth}")
 
         # buffer for storing the scores
         self.buffer = torch.zeros(

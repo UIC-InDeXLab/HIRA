@@ -21,6 +21,8 @@
 #include <omp.h>
 #endif
 
+namespace py = pybind11;
+
 /* ------------------------------------------------------------------ */
 /*  Helper: dot product with SIMD hint                                */
 /* ------------------------------------------------------------------ */
@@ -121,16 +123,53 @@ torch::Tensor fused_tree_search(
     std::vector<torch::Tensor> level_centers,
     std::vector<torch::Tensor> level_radii,
     std::vector<torch::Tensor> level_c2p,
-    std::vector<int64_t> level_sizes)
+    std::vector<int64_t> level_sizes,
+    torch::Tensor q_head_to_kv)
 {
+    TORCH_CHECK(keys.dim() == 3, "keys must be 3-D (H_kv, N, D)");
+    TORCH_CHECK(query.dim() == 2, "query must be 2-D (H_q, D)");
+    TORCH_CHECK(thresholds.dim() == 1, "thresholds must be 1-D (H_q,)");
+
     keys       = keys.contiguous().to(torch::kFloat32);
     query      = query.contiguous().to(torch::kFloat32);
     thresholds = thresholds.contiguous().to(torch::kFloat32);
 
-    const int64_t H = keys.size(0);
+    const int64_t H_kv = keys.size(0);
     const int64_t N = keys.size(1);
     const int64_t D = keys.size(2);
+    const int64_t H_q = query.size(0);
     const int64_t num_levels = static_cast<int64_t>(level_sizes.size());
+
+    TORCH_CHECK(query.size(1) == D, "query dim mismatch vs keys");
+    TORCH_CHECK(thresholds.size(0) == H_q, "threshold shape mismatch vs query");
+
+    std::vector<int64_t> q2kv(static_cast<size_t>(H_q), int64_t(0));
+    if (q_head_to_kv.defined() && q_head_to_kv.numel() > 0) {
+        TORCH_CHECK(q_head_to_kv.dim() == 1, "q_head_to_kv must be 1-D (H_q,)");
+        TORCH_CHECK(q_head_to_kv.size(0) == H_q,
+                    "q_head_to_kv must have length H_q");
+        q_head_to_kv = q_head_to_kv.contiguous().to(torch::kInt64).to(torch::kCPU);
+        const int64_t* map_ptr = q_head_to_kv.data_ptr<int64_t>();
+        for (int64_t qh = 0; qh < H_q; ++qh) {
+            const int64_t kv = map_ptr[qh];
+            TORCH_CHECK(kv >= 0 && kv < H_kv,
+                        "q_head_to_kv[", qh, "] out of range: ", kv);
+            q2kv[static_cast<size_t>(qh)] = kv;
+        }
+    } else {
+        if (H_q == H_kv) {
+            for (int64_t qh = 0; qh < H_q; ++qh) {
+                q2kv[static_cast<size_t>(qh)] = qh;
+            }
+        } else {
+            TORCH_CHECK((H_q % H_kv) == 0,
+                        "H_q must be divisible by H_kv when q_head_to_kv is not provided");
+            const int64_t group_size = H_q / H_kv;
+            for (int64_t qh = 0; qh < H_q; ++qh) {
+                q2kv[static_cast<size_t>(qh)] = qh / group_size;
+            }
+        }
+    }
 
     const float* k_ptr  = keys.data_ptr<float>();
     const float* q_ptr  = query.data_ptr<float>();
@@ -161,25 +200,26 @@ torch::Tensor fused_tree_search(
         levels[l].K = level_sizes[l];
     }
 
-    auto result = torch::zeros({H, N}, keys.options());
+    auto result = torch::zeros({H_q, N}, keys.options());
     float* r_ptr = result.data_ptr<float>();
 
-    /* Per-head tree walk (parallelised over H) */
+    /* Per-query-head tree walk (parallelised over H_q) */
     #pragma omp parallel
     {
         std::vector<char> mask_a, mask_b;
 
         #pragma omp for schedule(dynamic, 1)
-        for (int64_t h = 0; h < H; ++h) {
+        for (int64_t qh = 0; qh < H_q; ++qh) {
+            const int64_t h = q2kv[static_cast<size_t>(qh)];
 
-            const float  th  = th_ptr[h];
-            const float* q_h = q_ptr + h * D;
+            const float  th  = th_ptr[qh];
+            const float* q_h = q_ptr + qh * D;
 
             /* Single level: flat scan */
             if (num_levels == 1) {
                 for (int64_t i = 0; i < N; ++i) {
                     float s = dot(k_ptr + (h * N + i) * D, q_h, D);
-                    if (s >= th) r_ptr[h * N + i] = s;
+                    if (s >= th) r_ptr[qh * N + i] = s;
                 }
                 continue;
             }
@@ -230,7 +270,7 @@ torch::Tensor fused_tree_search(
                     continue;
                 float s = dot(k_ptr + (h * N + i) * D, q_h, D);
                 if (s >= th)
-                    r_ptr[h * N + i] = s;
+                    r_ptr[qh * N + i] = s;
             }
         }
     } /* end omp parallel */
@@ -247,5 +287,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("exact_filter",       &exact_filter,
           "Batched exact dot-product filter (H,N,D) keys + (H,N) mask -> (H,N) scores");
     m.def("fused_tree_search",  &fused_tree_search,
-          "Fused tree-walk + exact filter -> (H,N) scores");
+          "Fused tree-walk + exact filter -> (H_q,N) scores",
+          py::arg("keys"),
+          py::arg("query"),
+          py::arg("thresholds"),
+          py::arg("level_centers"),
+          py::arg("level_radii"),
+          py::arg("level_c2p"),
+          py::arg("level_sizes"),
+          py::arg("q_head_to_kv") = torch::Tensor());
 }

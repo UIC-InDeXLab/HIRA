@@ -82,6 +82,15 @@ def _brute_force(keys_hnd: torch.Tensor, query_1h1d: torch.Tensor) -> torch.Tens
     return torch.einsum("hd,hnd->hn", q, keys_hnd.float())
 
 
+def _grouped_brute_force(
+    keys_kv_hnd: torch.Tensor, query_1h1d: torch.Tensor, q_head_to_kv: torch.Tensor
+) -> torch.Tensor:
+    q = query_1h1d.squeeze(0).squeeze(-2).float()
+    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    keys_for_query = keys_kv_hnd.index_select(0, q_head_to_kv.long())
+    return torch.einsum("hd,hnd->hn", q, keys_for_query.float())
+
+
 def _recall(
     pred_scores: torch.Tensor, gt_scores: torch.Tensor, threshold: torch.Tensor
 ) -> float:
@@ -205,7 +214,7 @@ def test_cpu_searcher_high_recall_vectorized_cpp_filter(h, n, d, num_levels, bf,
     "strategy",
     [
         "vectorized_cpp_filter",
-        "fused",
+        "fused_v1",
         "fused_v2",
         "fused_v3",
         "exact_torch",
@@ -245,6 +254,39 @@ def test_cpu_searcher_fused_v4_runs_for_d128():
 
     assert pred.shape == (h, n)
     assert _recall(pred, gt, th) >= 0.99
+
+
+@pytest.mark.parametrize(
+    "strategy,d",
+    [
+        ("fused_v1", 64),
+        ("fused_v2", 64),
+        ("fused_v3", 64),
+        ("fused_v4", 128),
+    ],
+)
+def test_cpu_searcher_fused_variants_support_grouped_attention(strategy, d):
+    h_kv, group_size, n = 2, 3, 192
+    h_q = h_kv * group_size
+    bf, num_levels = 8, 4
+
+    keys = _normalized_keys(h_kv, n, d, seed=101)
+    indexer = CPUIndexer(num_levels=num_levels, branching_factor=bf, max_iterations=2)
+    indexer.build(keys)
+
+    q_head_to_kv = torch.arange(h_q, dtype=torch.long) // group_size
+    searcher = CPUSearcher(search_strategy=strategy)
+
+    recalls = []
+    for i in range(4):
+        q = _random_query(h_q, d, seed=202 + i)
+        gt = _grouped_brute_force(indexer.keys, q, q_head_to_kv)
+        th = torch.quantile(gt, 0.75, dim=-1)
+        pred = searcher.search(q, th, indexer)
+        assert pred.shape == (h_q, n)
+        recalls.append(_recall(pred, gt, th))
+
+    assert (sum(recalls) / len(recalls)) >= 0.99
 
 
 def test_cpu_searcher_single_level_equals_bruteforce():

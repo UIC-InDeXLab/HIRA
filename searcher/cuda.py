@@ -16,18 +16,130 @@ class CUDASearcher(BaseSearcher):
     def __init__(self, block_c):
         super().__init__()
         self.block_c = block_c
+        self._tmp_out: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def _flatten_query(
+        query: torch.Tensor, *, dim: int, device: torch.device
+    ) -> torch.Tensor:
+        if not isinstance(query, torch.Tensor):
+            raise TypeError(f"query must be a torch.Tensor, got {type(query)}")
+        q = query.to(device=device, dtype=torch.float32).contiguous()
+        if q.ndim == 4:
+            if q.shape[0] != 1 or q.shape[2] != 1:
+                raise ValueError(f"4D query must be (1,H,1,D), got {tuple(q.shape)}")
+            q = q.squeeze(0).squeeze(-2)
+        elif q.ndim != 2:
+            raise ValueError(
+                f"query must be (H,D) or (1,H,1,D), got {tuple(query.shape)}"
+            )
+        if q.shape[-1] != dim:
+            raise ValueError(f"query dim mismatch: expected D={dim}, got {q.shape[-1]}")
+        return q.contiguous()
+
+    @staticmethod
+    def _resolve_q_head_to_kv(
+        *,
+        num_query_heads: int,
+        num_kv_heads: int,
+        device: torch.device,
+        q_head_to_kv: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if q_head_to_kv is None:
+            if num_query_heads == num_kv_heads:
+                return torch.arange(num_query_heads, device=device, dtype=torch.long)
+            if (num_query_heads % num_kv_heads) != 0:
+                raise ValueError(
+                    f"Unsupported head mapping: H_q={num_query_heads} must equal or be divisible by H_kv={num_kv_heads}"
+                )
+            group_size = num_query_heads // num_kv_heads
+            return (
+                torch.arange(num_query_heads, device=device, dtype=torch.long)
+                // group_size
+            )
+
+        m = q_head_to_kv.to(device=device, dtype=torch.long).contiguous().reshape(-1)
+        if m.numel() != num_query_heads:
+            raise ValueError(
+                f"q_head_to_kv length mismatch: expected H_q={num_query_heads}, got {m.numel()}"
+            )
+        if torch.any((m < 0) | (m >= num_kv_heads)):
+            raise ValueError(f"q_head_to_kv values must be in [0, {num_kv_heads - 1}]")
+        return m
+
+    @staticmethod
+    def _coerce_threshold(
+        threshold: torch.Tensor, *, num_query_heads: int, device: torch.device
+    ) -> torch.Tensor:
+        t = threshold.to(device=device, dtype=torch.float32).contiguous().reshape(-1)
+        if t.numel() == 1 and num_query_heads > 1:
+            t = t.expand(num_query_heads)
+        if t.numel() != num_query_heads:
+            raise ValueError(
+                f"threshold mismatch: expected scalar or H_q={num_query_heads}, got {t.numel()}"
+            )
+        return t.contiguous()
+
+    def _prepare_output_buffer(
+        self, *, num_query_heads: int, num_keys: int, indexer: CUDAIndexer
+    ) -> torch.Tensor:
+        num_kv_heads = int(indexer.children.shape[0])
+        if (
+            num_query_heads == num_kv_heads
+            and indexer.buffer is not None
+            and tuple(indexer.buffer.shape) == (num_kv_heads, num_keys)
+        ):
+            indexer.buffer.zero_()
+            return indexer.buffer
+
+        needs_new = (
+            self._tmp_out is None
+            or self._tmp_out.device != indexer.children.device
+            or self._tmp_out.dtype != indexer.children.dtype
+            or tuple(self._tmp_out.shape) != (num_query_heads, num_keys)
+        )
+        if needs_new:
+            self._tmp_out = torch.zeros(
+                (num_query_heads, num_keys),
+                device=indexer.children.device,
+                dtype=indexer.children.dtype,
+            )
+        else:
+            self._tmp_out.zero_()
+        return self._tmp_out
 
     def search(
         self,
         query,
         threshold,
         indexer: CUDAIndexer,
+        q_head_to_kv: Optional[torch.Tensor] = None,
     ):
         # normalize query
         # query = query / torch.norm(query, p=2)
         # Query is already normalized
+        if indexer.children is None:
+            raise ValueError("Indexer is not built: missing children tensor.")
+        dim = int(indexer.children.shape[2])
+        num_kv_heads = int(indexer.children.shape[0])
+        num_keys = int(indexer.children.shape[1])
 
-        indexer.buffer.zero_()
+        q = self._flatten_query(query=query, dim=dim, device=indexer.children.device)
+        num_query_heads = int(q.shape[0])
+        q_head_to_kv = self._resolve_q_head_to_kv(
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            device=indexer.children.device,
+            q_head_to_kv=q_head_to_kv,
+        )
+        t = self._coerce_threshold(
+            threshold=threshold,
+            num_query_heads=num_query_heads,
+            device=indexer.children.device,
+        )
+        out = self._prepare_output_buffer(
+            num_query_heads=num_query_heads, num_keys=num_keys, indexer=indexer
+        )
 
         depth_value = getattr(indexer.depth, "value", indexer.depth)
 
@@ -36,9 +148,10 @@ class CUDASearcher(BaseSearcher):
                 indexer.children,
                 indexer.parents,
                 indexer.parent_radii,
-                query,
-                threshold,
-                out=indexer.buffer,  # check
+                q,
+                t,
+                q_head_to_kv=q_head_to_kv,
+                out=out,
                 BLOCK_C=self.block_c,
                 branch=indexer.branching_factor,
             )
@@ -49,24 +162,30 @@ class CUDASearcher(BaseSearcher):
                 indexer.parent_radii,
                 indexer.grand_parents,
                 indexer.grand_parent_radii,
-                query,
-                threshold,
-                out=indexer.buffer,
+                q,
+                t,
+                q_head_to_kv=q_head_to_kv,
+                out=out,
                 branch=indexer.branching_factor,
                 BLOCK_C=self.block_c,
             )
-
         else:
             raise ValueError(f"Unsupported index depth: {indexer.depth}")
         return output
 
-    def synthetic_scanned_fraction(self, query, threshold, indexer: CUDAIndexer):
+    def synthetic_scanned_fraction(
+        self,
+        query,
+        threshold,
+        indexer: CUDAIndexer,
+        q_head_to_kv: Optional[torch.Tensor] = None,
+    ):
         """
         Synthetic estimate of how many child rows are scanned by the CUDA traversal.
 
         Returns a dict with:
-        - scanned_fraction_per_head: (H,) tensor in [0, 1]
-        - scanned_children_per_head: (H,) tensor (counts)
+        - scanned_fraction_per_head: (H_q,) tensor in [0, 1]
+        - scanned_children_per_head: (H_q,) tensor (counts)
         - total_children: int
         - scanned_fraction_mean: float
         """
@@ -78,41 +197,46 @@ class CUDASearcher(BaseSearcher):
             )
 
         device = indexer.children.device
-        num_heads = int(indexer.children.shape[0])
+        num_kv_heads = int(indexer.children.shape[0])
         dim = int(indexer.children.shape[2])
 
-        # Accept common query layouts (H,D), (1,H,1,D), etc., then flatten to (H,D).
-        q = query.to(device=device, dtype=torch.float32).contiguous().reshape(-1, dim)
-        if q.shape[0] != num_heads:
-            raise ValueError(
-                f"query head mismatch after reshape: expected H={num_heads}, got {q.shape[0]} from shape={tuple(query.shape)}"
-            )
-
-        # Accept scalar or per-head threshold and flatten to (H,).
-        t = threshold.to(device=device, dtype=torch.float32).contiguous().reshape(-1)
-        if t.numel() == 1 and num_heads > 1:
-            t = t.expand(num_heads)
-        if t.numel() != num_heads:
-            raise ValueError(
-                f"threshold mismatch: expected scalar or H={num_heads}, got {t.numel()} from shape={tuple(threshold.shape)}"
-            )
+        q = self._flatten_query(query=query, dim=dim, device=device)
+        num_query_heads = int(q.shape[0])
+        q_head_to_kv = self._resolve_q_head_to_kv(
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            device=device,
+            q_head_to_kv=q_head_to_kv,
+        )
+        t = self._coerce_threshold(
+            threshold=threshold,
+            num_query_heads=num_query_heads,
+            device=device,
+        )
 
         depth_value = getattr(indexer.depth, "value", indexer.depth)
         bf = int(indexer.branching_factor)
 
+        parents = indexer.parents.index_select(0, q_head_to_kv)
+        parent_radii = indexer.parent_radii.index_select(0, q_head_to_kv)
+
         if depth_value == CUDAIndexer.DEPTH.TWO_LEVELS.value:
             # Parent gate: (q·p + r) > t
-            parent_scores = torch.einsum("hmd,hd->hm", indexer.parents, q)
-            parent_pass = (parent_scores + indexer.parent_radii) > t.unsqueeze(-1)
+            parent_scores = torch.einsum("hmd,hd->hm", parents, q)
+            parent_pass = (parent_scores + parent_radii) > t.unsqueeze(-1)
             scanned_children_per_head = parent_pass.sum(dim=1).to(torch.int64) * bf
         elif depth_value == CUDAIndexer.DEPTH.THREE_LEVELS.value:
             if indexer.grand_parents is None or indexer.grand_parent_radii is None:
                 raise ValueError(
                     "Three-level search requires grand_parents and grand_parent_radii."
                 )
+            grand_parents = indexer.grand_parents.index_select(0, q_head_to_kv)
+            grand_parent_radii = indexer.grand_parent_radii.index_select(
+                0, q_head_to_kv
+            )
             # Grandparent gate (P2 -> P1 mask pass)
-            gp_scores = torch.einsum("hgd,hd->hg", indexer.grand_parents, q)
-            gp_pass = (gp_scores + indexer.grand_parent_radii) > t.unsqueeze(-1)
+            gp_scores = torch.einsum("hgd,hd->hg", grand_parents, q)
+            gp_pass = (gp_scores + grand_parent_radii) > t.unsqueeze(-1)
 
             # Expand gp mask to level-1 parents exactly as branch-grouped layout.
             gp_mask_on_p1 = (
@@ -120,10 +244,8 @@ class CUDASearcher(BaseSearcher):
             )
 
             # Parent gate (P1 -> K), masked by grandparent pass.
-            p1_scores = torch.einsum("hmd,hd->hm", indexer.parents, q)
-            p1_pass = gp_mask_on_p1 & (
-                (p1_scores + indexer.parent_radii) > t.unsqueeze(-1)
-            )
+            p1_scores = torch.einsum("hmd,hd->hm", parents, q)
+            p1_pass = gp_mask_on_p1 & ((p1_scores + parent_radii) > t.unsqueeze(-1))
             scanned_children_per_head = p1_pass.sum(dim=1).to(torch.int64) * bf
         else:
             raise ValueError(f"Unsupported index depth: {indexer.depth}")

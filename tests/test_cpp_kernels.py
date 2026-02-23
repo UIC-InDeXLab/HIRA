@@ -36,6 +36,17 @@ def _thresholded_bruteforce(
     return torch.where(scores >= threshold_h.unsqueeze(-1), scores, torch.zeros_like(scores))
 
 
+def _thresholded_bruteforce_grouped(
+    keys_kv_hnd: torch.Tensor,
+    query_hd: torch.Tensor,
+    threshold_h: torch.Tensor,
+    q_head_to_kv: torch.Tensor,
+) -> torch.Tensor:
+    keys_for_query = keys_kv_hnd.index_select(0, q_head_to_kv.long())
+    scores = torch.einsum("hnd,hd->hn", keys_for_query.float(), query_hd.float())
+    return torch.where(scores >= threshold_h.unsqueeze(-1), scores, torch.zeros_like(scores))
+
+
 def _prepare_level_data(indexer: CPUIndexer):
     centers_list = []
     radii_list = []
@@ -172,6 +183,7 @@ def test_cpp_fused_variants_match_bruteforce(variant, cpp_torch_ext):
     ).build(keys)
 
     query = _random_query_hd(h, d, seed=32)
+    q_head_to_kv = torch.arange(h, dtype=torch.long)
     gt_scores = torch.einsum("hnd,hd->hn", indexer.keys.float(), query.float())
     threshold = torch.quantile(gt_scores, 0.75, dim=-1)
     expected = _thresholded_bruteforce(indexer.keys, query, threshold)
@@ -186,6 +198,7 @@ def test_cpp_fused_variants_match_bruteforce(variant, cpp_torch_ext):
             radii_list,
             c2p_list,
             sizes_list,
+            q_head_to_kv,
         )
     elif variant == "v2":
         centers_list, radii_list, c2p_list, sizes_list = _prepare_level_data(indexer)
@@ -197,6 +210,7 @@ def test_cpp_fused_variants_match_bruteforce(variant, cpp_torch_ext):
             radii_list,
             c2p_list,
             sizes_list,
+            q_head_to_kv,
         )
     else:
         (
@@ -217,6 +231,7 @@ def test_cpp_fused_variants_match_bruteforce(variant, cpp_torch_ext):
             sizes_list,
             offsets_list,
             children_list,
+            q_head_to_kv,
         )
 
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
@@ -232,6 +247,7 @@ def test_cpp_fused_v4_matches_bruteforce(cpp_torch_ext):
     ).build(keys)
 
     query = _random_query_hd(h, d, seed=42)
+    q_head_to_kv = torch.arange(h, dtype=torch.long)
     gt_scores = torch.einsum("hnd,hd->hn", indexer.keys.float(), query.float())
     threshold = torch.quantile(gt_scores, 0.75, dim=-1)
     expected = _thresholded_bruteforce(indexer.keys, query, threshold)
@@ -254,6 +270,136 @@ def test_cpp_fused_v4_matches_bruteforce(cpp_torch_ext):
         sizes_list,
         offsets_list,
         children_list,
+        q_head_to_kv,
+    )
+
+    torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("variant", ["v1", "v2", "v3", "v4"])
+def test_cpp_fused_variants_support_grouped_attention(variant, cpp_torch_ext):
+    h_kv, group_size, n, bf, num_levels = 2, 3, 192, 8, 4
+    h_q = h_kv * group_size
+    d = 128 if variant == "v4" else 64
+
+    keys = _normalized_keys(h_kv, n, d, seed=301)
+    indexer = CPUIndexer(
+        num_levels=num_levels,
+        branching_factor=bf,
+        max_iterations=2,
+    ).build(keys)
+
+    q_head_to_kv = torch.arange(h_q, dtype=torch.long) // group_size
+    query = _random_query_hd(h_q, d, seed=302)
+    keys_for_query = indexer.keys.index_select(0, q_head_to_kv)
+    gt_scores = torch.einsum("hnd,hd->hn", keys_for_query.float(), query.float())
+    threshold = torch.quantile(gt_scores, 0.75, dim=-1)
+    expected = _thresholded_bruteforce_grouped(
+        indexer.keys, query, threshold, q_head_to_kv
+    )
+
+    if variant == "v1":
+        centers_list, radii_list, c2p_list, sizes_list = _prepare_level_data(indexer)
+        out = cpp_torch_ext.hira_torch_ext.fused_tree_search(
+            indexer.keys.float().contiguous(),
+            query,
+            threshold,
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            q_head_to_kv,
+        )
+    elif variant == "v2":
+        centers_list, radii_list, c2p_list, sizes_list = _prepare_level_data(indexer)
+        out = cpp_torch_ext.hira_torch_ext_v2.fused_tree_search_v2(
+            indexer.keys.float().contiguous(),
+            query,
+            threshold,
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            q_head_to_kv,
+        )
+    elif variant == "v3":
+        (
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            offsets_list,
+            children_list,
+        ) = _prepare_level_data_with_adjacency(indexer)
+        out = cpp_torch_ext.hira_torch_ext_v3.fused_tree_search_v3(
+            indexer.keys.float().contiguous(),
+            query,
+            threshold,
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            offsets_list,
+            children_list,
+            q_head_to_kv,
+        )
+    else:
+        (
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            offsets_list,
+            children_list,
+        ) = _prepare_level_data_with_adjacency(indexer)
+        out = cpp_torch_ext.hira_torch_ext_v4.fused_tree_search_v4(
+            indexer.keys.float().contiguous(),
+            query,
+            threshold,
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            offsets_list,
+            children_list,
+            q_head_to_kv,
+        )
+
+    torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_cpp_fused_v2_supports_explicit_query_to_kv_mapping(cpp_torch_ext):
+    h_kv, h_q, n, d, bf, num_levels = 2, 4, 192, 64, 8, 4
+    keys = _normalized_keys(h_kv, n, d, seed=311)
+    indexer = CPUIndexer(
+        num_levels=num_levels,
+        branching_factor=bf,
+        max_iterations=2,
+    ).build(keys)
+
+    # Non-standard mapping to verify explicit map is honored.
+    q_head_to_kv = torch.tensor([1, 0, 1, 0], dtype=torch.long)
+    query = _random_query_hd(h_q, d, seed=312)
+    expected_scores = torch.einsum(
+        "hnd,hd->hn",
+        indexer.keys.index_select(0, q_head_to_kv).float(),
+        query.float(),
+    )
+    threshold = torch.quantile(expected_scores, 0.8, dim=-1)
+    expected = _thresholded_bruteforce_grouped(
+        indexer.keys, query, threshold, q_head_to_kv
+    )
+
+    centers_list, radii_list, c2p_list, sizes_list = _prepare_level_data(indexer)
+    out = cpp_torch_ext.hira_torch_ext_v2.fused_tree_search_v2(
+        indexer.keys.float().contiguous(),
+        query,
+        threshold,
+        centers_list,
+        radii_list,
+        c2p_list,
+        sizes_list,
+        q_head_to_kv,
     )
 
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
