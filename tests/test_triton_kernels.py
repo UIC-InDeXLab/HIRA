@@ -1,585 +1,365 @@
-"""
-Comprehensive tests for Triton kernel implementations.
-
-Test scenarios:
-1. Two-level filter kernel correctness against brute force
-2. Two-level filter kernel with masking
-3. Three-level filter kernel v1 correctness
-4. Three-level filter kernel v2 correctness
-5. Three-level filter kernel v3 correctness
-6. Edge cases: empty results, all results, boundary thresholds
-7. Recall verification (99%+ accuracy)
-8. Different data sizes and branching factors
-9. CUDA device compatibility
-"""
+import os
+import sys
+from pathlib import Path
 
 import pytest
 import torch
-import torch.nn.functional as F
-import sys
-import os
 
-from hira.kernels.triton_wrappers import (
-    triton_two_level_filter,
+
+os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/tmp/torch_extensions")
+os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/triton_cache")
+os.environ.setdefault("MAX_JOBS", "4")
+Path(os.environ["TORCH_EXTENSIONS_DIR"]).mkdir(parents=True, exist_ok=True)
+Path(os.environ["TRITON_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+
+HIRA_ROOT = Path(__file__).resolve().parents[1]
+if str(HIRA_ROOT) not in sys.path:
+    sys.path.insert(0, str(HIRA_ROOT))
+
+from indexer.cuda import CUDAIndexer
+from hira.kernels.triton_search_wrappers import (
+    triton_three_level_filter_kernel_v1,
+    triton_three_level_filter_kernel_v2,
     triton_three_level_filter_v1,
-)
-from hira.benchmark_area.cuda_bench.generate_level import (
-    generate_three_level_structure,
-    generate_parent_child_structure,
+    triton_two_level_filter,
 )
 
 
-def brute_force_halfspace(keys: torch.Tensor, q: torch.Tensor, threshold: float):
-    """Reference implementation: find all keys with score > threshold."""
-    scores = keys @ q
-    return scores, (scores > threshold).nonzero(as_tuple=True)[0]
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for Triton kernel tests",
+)
 
 
-def create_hierarchical_data(
-    n_keys, dim, branching_factor, num_levels, device, seed=42
-):
-    if num_levels == 2:
-        output = generate_parent_child_structure(
-            num_keys=n_keys,
-            dim=dim,
-            branching_factor=branching_factor,
-            distribution="uniform",
-            device=device,
-            seed=seed,
-        )
-    elif num_levels == 3:
-        output = generate_three_level_structure(
-            num_keys=n_keys,
-            dim=dim,
-            distribution="uniform",
-            branching_factor=branching_factor,
-            device=device,
-            seed=seed,
-        )
-    else:
-        raise ValueError("Only 2 or 3 levels supported")
-
-    return output
+def _normalized_keys(h: int, n: int, d: int, seed: int) -> torch.Tensor:
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(
+        (1, h, n, d),
+        generator=g,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
-class TestTwoLevelFilterKernel:
-    """Test two-level filter kernel against brute force."""
+def _random_query(h: int, d: int, seed: int) -> torch.Tensor:
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn((1, h, 1, d), generator=g, device="cuda", dtype=torch.float32)
+    return q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
-    @pytest.mark.parametrize("n_keys", [256, 1024, 4096])
-    @pytest.mark.parametrize("branching_factor", [16, 32, 64])
-    @pytest.mark.parametrize("threshold", [-0.5, 0.0, 0.5])
-    def test_two_level_correctness(self, n_keys, branching_factor, threshold):
-        """Test that two-level kernel matches brute force results."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
 
-        device = torch.device("cuda")
-        dim = 128
+def _choose_block_c(branching_factor: int) -> int:
+    for c in (16, 8, 4, 2, 1):
+        if c <= branching_factor and branching_factor % c == 0:
+            return c
+    raise ValueError(f"No valid BLOCK_C for branching_factor={branching_factor}")
 
-        # Create hierarchical data
-        K, P, R = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=2, device=device
-        )
 
-        # Generate random query
-        q = torch.randn(dim, device=device)
-        q = q / q.norm(p=2)
+def _valid_rows(children: torch.Tensor, pad_value: float) -> torch.Tensor:
+    return ~torch.all(children == float(pad_value), dim=-1)
 
-        # Run kernel
-        out = triton_two_level_filter(
-            K,
-            P,
-            R,
+
+def _bruteforce_children_scores(children: torch.Tensor, query_1h1d: torch.Tensor):
+    q = query_1h1d.squeeze(0).squeeze(-2).float()
+    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    return torch.einsum("hd,hnd->hn", q, children.float())
+
+
+def _per_head_quantile_threshold(
+    scores: torch.Tensor, valid_mask: torch.Tensor, q: float
+) -> torch.Tensor:
+    h = scores.shape[0]
+    out = []
+    for i in range(h):
+        s = scores[i][valid_mask[i]]
+        out.append(torch.quantile(s, q))
+    return torch.stack(out, dim=0)
+
+
+def _recall(
+    pred_scores: torch.Tensor,
+    gt_scores: torch.Tensor,
+    threshold: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> float:
+    gt_mask = (gt_scores >= threshold.unsqueeze(-1)) & valid_mask
+    pred_mask = (pred_scores != 0) & valid_mask
+    denom = int(gt_mask.sum().item())
+    if denom == 0:
+        return 1.0
+    tp = int((pred_mask & gt_mask).sum().item())
+    return tp / denom
+
+
+@pytest.mark.parametrize(
+    "h,n,d,bf,seed",
+    [
+        (2, 257, 64, 8, 11),
+        (4, 513, 128, 16, 12),
+    ],
+)
+def test_triton_two_level_filter_high_recall_against_bruteforce(h, n, d, bf, seed):
+    keys = _normalized_keys(h, n, d, seed=seed)
+    assert keys.is_cuda
+    indexer = CUDAIndexer(
+        depth=CUDAIndexer.DEPTH.TWO_LEVELS,
+        max_iterations=2,
+        branching_factor=bf,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    assert indexer.parents is not None
+    assert indexer.parent_radii is not None
+    assert indexer.children.is_cuda
+    assert indexer.parents.is_cuda
+    assert indexer.parent_radii.is_cuda
+
+    q = _random_query(h, d, seed=seed + 100)
+    assert q.is_cuda
+    valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+    gt = _bruteforce_children_scores(indexer.children, q)
+    th = _per_head_quantile_threshold(gt, valid, q=0.75)
+    assert th.is_cuda
+
+    out = triton_two_level_filter(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        q,
+        th,
+        branch=bf,
+        BLOCK_C=_choose_block_c(bf),
+    )
+
+    assert out.shape == gt.shape
+    assert out.is_cuda
+    assert _recall(out, gt, th, valid) >= 0.99
+
+    for head in range(h):
+        keep = (out[head] >= th[head]) & valid[head]
+        if keep.any():
+            assert torch.all(gt[head][keep] >= (th[head] - 1e-4))
+
+
+def test_triton_two_level_filter_accepts_2d_and_4d_query_layouts():
+    h, n, d, bf = 3, 192, 64, 8
+    keys = _normalized_keys(h, n, d, seed=21)
+    assert keys.is_cuda
+    indexer = CUDAIndexer(
+        depth=CUDAIndexer.DEPTH.TWO_LEVELS,
+        max_iterations=2,
+        branching_factor=bf,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    assert indexer.parents is not None
+    assert indexer.parent_radii is not None
+    assert indexer.children.is_cuda
+    assert indexer.parents.is_cuda
+    assert indexer.parent_radii.is_cuda
+
+    q4 = _random_query(h, d, seed=22)
+    q2 = q4.squeeze(0).squeeze(-2).contiguous()
+    assert q4.is_cuda
+    assert q2.is_cuda
+    valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+    gt = _bruteforce_children_scores(indexer.children, q4)
+    th = _per_head_quantile_threshold(gt, valid, q=0.70)
+
+    out4 = triton_two_level_filter(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        q4,
+        th,
+        branch=bf,
+        BLOCK_C=_choose_block_c(bf),
+    )
+    out2 = triton_two_level_filter(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        q2,
+        th,
+        branch=bf,
+        BLOCK_C=_choose_block_c(bf),
+    )
+
+    assert out4.is_cuda
+    assert out2.is_cuda
+    torch.testing.assert_close(out2, out4, atol=1e-4, rtol=1e-4)
+
+
+def test_triton_two_level_filter_writes_to_provided_output_buffer():
+    h, n, d, bf = 2, 160, 32, 8
+    keys = _normalized_keys(h, n, d, seed=31)
+    assert keys.is_cuda
+    indexer = CUDAIndexer(
+        depth=CUDAIndexer.DEPTH.TWO_LEVELS,
+        max_iterations=2,
+        branching_factor=bf,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    assert indexer.parents is not None
+    assert indexer.parent_radii is not None
+    assert indexer.children.is_cuda
+    assert indexer.parents.is_cuda
+    assert indexer.parent_radii.is_cuda
+
+    q = _random_query(h, d, seed=32)
+    assert q.is_cuda
+    valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+    gt = _bruteforce_children_scores(indexer.children, q)
+    th = _per_head_quantile_threshold(gt, valid, q=0.80)
+
+    out_buf = torch.full_like(gt, -7.0)
+    assert out_buf.is_cuda
+    out = triton_two_level_filter(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        q,
+        th,
+        out=out_buf,
+        branch=bf,
+        BLOCK_C=_choose_block_c(bf),
+    )
+    assert out.data_ptr() == out_buf.data_ptr()
+    assert out.shape == gt.shape
+    assert out.is_cuda
+
+
+def test_triton_three_level_variants_match_each_other_and_bruteforce():
+    h, n, d, bf = 3, 769, 64, 8
+    keys = _normalized_keys(h, n, d, seed=41)
+    assert keys.is_cuda
+    indexer = CUDAIndexer(
+        depth=CUDAIndexer.DEPTH.THREE_LEVELS,
+        max_iterations=2,
+        branching_factor=bf,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    assert indexer.parents is not None
+    assert indexer.parent_radii is not None
+    assert indexer.grand_parents is not None
+    assert indexer.grand_parent_radii is not None
+    assert indexer.children.is_cuda
+    assert indexer.parents.is_cuda
+    assert indexer.parent_radii.is_cuda
+    assert indexer.grand_parents.is_cuda
+    assert indexer.grand_parent_radii.is_cuda
+
+    q = _random_query(h, d, seed=42)
+    assert q.is_cuda
+    valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+    gt = _bruteforce_children_scores(indexer.children, q)
+    th = _per_head_quantile_threshold(gt, valid, q=0.75)
+    assert th.is_cuda
+    block_c = _choose_block_c(bf)
+
+    out_wrapper = triton_three_level_filter_v1(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        indexer.grand_parents,
+        indexer.grand_parent_radii,
+        q,
+        th,
+        branch=bf,
+        BLOCK_C=block_c,
+    )
+    out_k1 = triton_three_level_filter_kernel_v1(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        indexer.grand_parents,
+        indexer.grand_parent_radii,
+        q,
+        th,
+        branch=bf,
+        BLOCK_C=block_c,
+    )
+    out_k2 = triton_three_level_filter_kernel_v2(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        indexer.grand_parents,
+        indexer.grand_parent_radii,
+        q,
+        th,
+        branch=bf,
+        BLOCK_C=block_c,
+    )
+
+    assert out_wrapper.is_cuda
+    assert out_k1.is_cuda
+    assert out_k2.is_cuda
+    assert _recall(out_wrapper, gt, th, valid) >= 0.99
+    assert _recall(out_k1, gt, th, valid) >= 0.99
+    assert _recall(out_k2, gt, th, valid) >= 0.99
+
+    torch.testing.assert_close(out_k1, out_k2, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(out_wrapper, out_k1, atol=1e-4, rtol=1e-4)
+
+
+def test_triton_two_level_filter_validates_inputs():
+    h, n, d, bf = 2, 64, 32, 8
+    keys = _normalized_keys(h, n, d, seed=51)
+    assert keys.is_cuda
+    indexer = CUDAIndexer(
+        depth=CUDAIndexer.DEPTH.TWO_LEVELS,
+        max_iterations=1,
+        branching_factor=bf,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    assert indexer.parents is not None
+    assert indexer.parent_radii is not None
+    assert indexer.children.is_cuda
+    assert indexer.parents.is_cuda
+    assert indexer.parent_radii.is_cuda
+
+    q = _random_query(h, d, seed=52)
+    th = torch.zeros((h,), device="cuda", dtype=torch.float32)
+    assert q.is_cuda
+    assert th.is_cuda
+
+    with pytest.raises(ValueError):
+        triton_two_level_filter(
+            indexer.children,
+            indexer.parents,
+            indexer.parent_radii,
             q,
-            threshold,
-            branch=branching_factor,
-            BLOCK_C=min(16, branching_factor),
+            th,
+            branch=bf,
+            BLOCK_C=3,
         )
 
-        # Brute force reference
-        bf_scores, bf_indices = brute_force_halfspace(K, q, threshold)
-
-        # Check that all brute force results are in kernel results
-        kernel_mask = out >= threshold
-        kernel_indices = kernel_mask.nonzero(as_tuple=True)[0]
-
-        # Compute recall
-        kernel_set = set(kernel_indices.cpu().numpy())
-        bf_set = set(bf_indices.cpu().numpy())
-
-        if len(bf_set) > 0:
-            recall = len(kernel_set & bf_set) / len(bf_set)
-            assert (
-                recall >= 0.99
-            ), f"Recall {recall:.3f} < 0.99 for threshold {threshold}"
-
-        # Verify scores match for retrieved keys
-        for idx in bf_indices:
-            kernel_score = out[idx].item()
-            bf_score = bf_scores[idx].item()
-            assert (
-                abs(kernel_score - bf_score) < 1e-3 or kernel_score == 0
-            ), f"Score mismatch at idx {idx}: kernel={kernel_score}, bf={bf_score}"
-
-    def test_two_level_empty_result(self):
-        """Test with threshold that should return no results."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        device = torch.device("cuda")
-        n_keys = 1024
-        branching_factor = 32
-        dim = 128
-
-        K, P, R = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=2, device=device
+    with pytest.raises(ValueError):
+        triton_two_level_filter(
+            indexer.children,
+            indexer.parents,
+            indexer.parent_radii,
+            q[:, :1, :, :],
+            th,
+            branch=bf,
+            BLOCK_C=_choose_block_c(bf),
         )
 
-        # Query orthogonal to all keys
-        q = torch.zeros(dim, device=device)
-        q[0] = 1.0
-        q = q / q.norm(p=2)
-
-        # Very high threshold
-        scores = K @ q
-        threshold = scores.max().item() + 1.0
-
-        out = triton_two_level_filter(
-            K, P, R, q, threshold, branch=branching_factor, BLOCK_C=16
+    with pytest.raises(ValueError):
+        triton_two_level_filter(
+            indexer.children,
+            indexer.parents,
+            indexer.parent_radii,
+            q,
+            torch.zeros((h + 1,), device="cuda", dtype=torch.float32),
+            branch=bf,
+            BLOCK_C=_choose_block_c(bf),
         )
-
-        # Check that few or no results returned
-        num_results = (out >= threshold).sum().item()
-        assert num_results <= n_keys * 0.05, f"Expected few results, got {num_results}"
-
-    def test_two_level_all_results(self):
-        """Test with threshold that should return all results."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        device = torch.device("cuda")
-        n_keys = 512
-        branching_factor = 16
-        dim = 128
-
-        K, P, R = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=2, device=device
-        )
-
-        q = torch.randn(dim, device=device)
-        q = F.normalize(q, p=2, dim=0)
-
-        # Very low threshold
-        scores = K @ q
-        threshold = scores.min().item() - 1.0
-
-        out = triton_two_level_filter(
-            K, P, R, q, threshold, branch=branching_factor, BLOCK_C=16
-        )
-
-        # All keys should be computed (even if score < threshold due to parent passing)
-        # Check that most keys have non-zero scores
-        non_zero = (out != 0).sum().item()
-        assert (
-            non_zero > n_keys * 0.9
-        ), f"Expected most results, got {non_zero}/{n_keys}"
-
-
-class TestThreeLevelFilterKernels:
-    """Test three-level filter kernels."""
-
-    @pytest.mark.parametrize("n_keys", [1024, 4096])
-    @pytest.mark.parametrize("branching_factor", [8, 16])
-    def test_three_level_correctness(self, n_keys, branching_factor):
-        """Test three-level kernels against brute force."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        device = torch.device("cuda")
-        dim = 128
-
-        # Create hierarchical data with 3 levels
-        K, P1, R1, P2, R2 = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=3, device=device
-        )
-
-        q = torch.randn(dim, device=device)
-        q = F.normalize(q, p=2, dim=0)
-        threshold = 0.0
-
-        # Run appropriate kernel version
-        out = triton_three_level_filter_v1(
-            K, P1, R1, P2, R2, q, threshold, branch=branching_factor
-        )
-
-        # Brute force reference
-        bf_scores, bf_indices = brute_force_halfspace(K, q, threshold)
-
-        # Check recall
-        kernel_mask = torch.isfinite(out)
-        kernel_indices = kernel_mask.nonzero(as_tuple=True)[0]
-
-        kernel_set = set(kernel_indices.cpu().numpy())
-        bf_set = set(bf_indices.cpu().numpy())
-
-        if len(bf_set) > 0:
-            recall = len(kernel_set & bf_set) / len(bf_set)
-            assert (
-                recall >= 0.99
-            ), f": Recall {recall:.3f} < 0.99 (found {len(kernel_set)}/{len(bf_set)})"
-
-    @pytest.mark.parametrize("threshold", [-0.5, -0.2, 0.0, 0.2, 0.5])
-    def test_three_level_different_thresholds(self, threshold):
-        """Test three-level kernels with various thresholds."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        device = torch.device("cuda")
-        n_keys = 2048
-        branching_factor = 8
-        dim = 128
-
-        K, P1, R1, P2, R2 = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=3, device=device
-        )
-
-        q = torch.randn(dim, device=device)
-        q = F.normalize(q, p=2, dim=0)
-
-        out = triton_three_level_filter_v1(
-            K, P1, R1, P2, R2, q, threshold, branch=branching_factor
-        )
-
-        # Brute force
-        bf_scores, bf_indices = brute_force_halfspace(K, q, threshold)
-
-        # Verify recall
-        kernel_mask = torch.isfinite(out)
-        kernel_indices = kernel_mask.nonzero(as_tuple=True)[0]
-
-        kernel_set = set(kernel_indices.cpu().numpy())
-        bf_set = set(bf_indices.cpu().numpy())
-
-        if len(bf_set) > 0:
-            recall = len(kernel_set & bf_set) / len(bf_set)
-            assert recall >= 0.99, f"Threshold {threshold}: Recall {recall:.3f} < 0.99"
-
-
-class TestKernelRecall:
-    """Test that recall is consistently high across different scenarios."""
-
-    @pytest.mark.parametrize("seed", [42, 123, 456, 789])
-    def test_two_level_recall_consistency(self, seed):
-        """Test that recall is consistent across different random seeds."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        device = torch.device("cuda")
-        n_keys = 2048
-        branching_factor = 32
-        dim = 128
-        threshold = 0.0
-
-        K, P, R = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=2, device=device, seed=seed
-        )
-
-        # Different query for each seed
-        torch.manual_seed(seed + 1000)
-        q = torch.randn(dim, device=device)
-        q = F.normalize(q, p=2, dim=0)
-
-        out = triton_two_level_filter(
-            K, P, R, q, threshold, branch=branching_factor, BLOCK_C=16
-        )
-
-        bf_scores, bf_indices = brute_force_halfspace(K, q, threshold)
-
-        kernel_mask = out >= threshold
-        kernel_indices = kernel_mask.nonzero(as_tuple=True)[0]
-
-        kernel_set = set(kernel_indices.cpu().numpy())
-        bf_set = set(bf_indices.cpu().numpy())
-
-        if len(bf_set) > 0:
-            recall = len(kernel_set & bf_set) / len(bf_set)
-            assert recall >= 0.99, f"Seed {seed}: Recall {recall:.3f} < 0.99"
-
-    @pytest.mark.parametrize("dim", [128])
-    def test_three_level_different_dimensions(self, dim):
-        """Test three-level kernel with different dimensions."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        # Adjust n_keys for different dimensions to keep test fast
-        if dim == 256:
-            n_keys = 512
-            branching_factor = 8
-        else:
-            n_keys = 1024
-            branching_factor = 8
-
-        device = torch.device("cuda")
-
-        # Note: For non-128 dimensions, need to adjust kernel if hardcoded
-        # Skip if kernel is hardcoded to 128
-        if dim != 128:
-            pytest.skip("Kernel currently hardcoded to 128 dimensions")
-
-        K, P1, R1, P2, R2 = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=3, device=device
-        )
-
-        q = torch.randn(dim, device=device)
-        q = F.normalize(q, p=2, dim=0)
-        threshold = 0.0
-
-        out = triton_three_level_filter_v1(
-            K, P1, R1, P2, R2, q, threshold, branch=branching_factor
-        )
-
-        bf_scores, bf_indices = brute_force_halfspace(K, q, threshold)
-
-        kernel_mask = torch.isfinite(out)
-        kernel_indices = kernel_mask.nonzero(as_tuple=True)[0]
-
-        kernel_set = set(kernel_indices.cpu().numpy())
-        bf_set = set(bf_indices.cpu().numpy())
-
-        if len(bf_set) > 0:
-            recall = len(kernel_set & bf_set) / len(bf_set)
-            assert recall >= 0.99, f"Dim {dim}: Recall {recall:.3f} < 0.99"
-
-
-class TestKernelEdgeCases:
-    """Test edge cases in kernel execution."""
-
-    def test_very_high_threshold(self):
-        """Test with very high threshold (should return few/no results)."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        device = torch.device("cuda")
-        n_keys = 1024
-        branching_factor = 16
-        dim = 128
-
-        K, P, R = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=2, device=device
-        )
-
-        q = torch.randn(dim, device=device)
-        q = F.normalize(q, p=2, dim=0)
-
-        # Impossibly high threshold
-        threshold = 0.999
-
-        out = triton_two_level_filter(
-            K, P, R, q, threshold, branch=branching_factor, BLOCK_C=16
-        )
-
-        bf_scores, bf_indices = brute_force_halfspace(K, q, threshold)
-
-        # Both should return few results
-        kernel_count = (out >= threshold).sum().item()
-        bf_count = len(bf_indices)
-
-        assert (
-            kernel_count <= bf_count * 1.1 + 10
-        ), f"Kernel returned {kernel_count}, expected ~{bf_count}"
-
-    def test_very_low_threshold(self):
-        """Test with very low threshold (should return many results)."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        device = torch.device("cuda")
-        n_keys = 1024
-        branching_factor = 16
-        dim = 128
-
-        K, P, R = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=2, device=device
-        )
-
-        q = torch.randn(dim, device=device)
-        q = F.normalize(q, p=2, dim=0)
-
-        # Very low threshold
-        threshold = -0.999
-
-        out = triton_two_level_filter(
-            K, P, R, q, threshold, branch=branching_factor, BLOCK_C=16
-        )
-
-        bf_scores, bf_indices = brute_force_halfspace(K, q, threshold)
-
-        # Most/all keys should pass
-        kernel_count = (out >= threshold).sum().item()
-        bf_count = len(bf_indices)
-
-        # Should have high recall
-        if bf_count > 0:
-            recall = kernel_count / bf_count
-            assert recall >= 0.99, f"Low threshold recall: {recall:.3f}"
-
-    def test_exact_boundary_threshold(self):
-        """Test with threshold exactly at a score boundary."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        device = torch.device("cuda")
-        n_keys = 512
-        branching_factor = 8
-        dim = 128
-
-        K, P, R = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=2, device=device
-        )
-
-        q = torch.randn(dim, device=device)
-        q = F.normalize(q, p=2, dim=0)
-
-        # First compute scores to find median
-        bf_scores = K @ q
-        median_score = bf_scores.median().item()
-
-        # Use median as threshold
-        out = triton_two_level_filter(
-            K, P, R, q, median_score, branch=branching_factor, BLOCK_C=8
-        )
-
-        bf_scores, bf_indices = brute_force_halfspace(K, q, median_score)
-
-        kernel_mask = out >= median_score
-        kernel_indices = kernel_mask.nonzero(as_tuple=True)[0]
-
-        kernel_set = set(kernel_indices.cpu().numpy())
-        bf_set = set(bf_indices.cpu().numpy())
-
-        if len(bf_set) > 0:
-            recall = len(kernel_set & bf_set) / len(bf_set)
-            assert recall >= 0.99, f"Boundary threshold recall: {recall:.3f}"
-
-
-class TestKernelDatatypes:
-    """Test kernels with different data types."""
-
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-    def test_two_level_dtypes(self, dtype):
-        """Test two-level kernel with different data types."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        if dtype == torch.float16 and not torch.cuda.is_available():
-            pytest.skip("FP16 requires CUDA")
-
-        device = torch.device("cuda")
-        n_keys = 1024
-        branching_factor = 16
-        dim = 128
-
-        K, P, R = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=2, device=device
-        )
-
-        # Convert to target dtype
-        K = K.to(dtype)
-        P = P.to(dtype)
-        R = R.to(dtype)
-
-        q = torch.randn(dim, device=device, dtype=dtype)
-        q = F.normalize(q, p=2, dim=0)
-        threshold = 0.0
-
-        out = triton_two_level_filter(
-            K, P, R, q, threshold, branch=branching_factor, BLOCK_C=16
-        )
-
-        # Compute reference in fp32 for comparison
-        K_fp32 = K.to(torch.float32)
-        q_fp32 = q.to(torch.float32)
-        bf_scores, bf_indices = brute_force_halfspace(K_fp32, q_fp32, threshold)
-
-        kernel_mask = out >= threshold
-        kernel_indices = kernel_mask.nonzero(as_tuple=True)[0]
-
-        kernel_set = set(kernel_indices.cpu().numpy())
-        bf_set = set(bf_indices.cpu().numpy())
-
-        if len(bf_set) > 0:
-            recall = len(kernel_set & bf_set) / len(bf_set)
-            # FP16 might have slightly lower recall due to precision
-            min_recall = 0.98 if dtype == torch.float16 else 0.99
-            assert (
-                recall >= min_recall
-            ), f"Dtype {dtype}: Recall {recall:.3f} < {min_recall}"
-
-
-class TestKernelPerformance:
-    """Basic performance sanity checks."""
-
-    def test_two_level_execution(self):
-        """Verify that kernel execution completes (basic sanity)."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        device = torch.device("cuda")
-        n_keys = 4096
-        branching_factor = 8
-        dim = 128
-
-        K, P, R = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=2, device=device
-        )
-
-        q = torch.randn(dim, device=device)
-        q = F.normalize(q, p=2, dim=0)
-        threshold = 0.0
-
-        # Just verify it runs without error
-        out = triton_two_level_filter(
-            K, P, R, q, threshold, branch=branching_factor, BLOCK_C=8
-        )
-
-        assert out.shape == (n_keys,)
-        assert out.device.type == device.type
-
-    def test_three_level_execution(self):
-        """Verify that three-level kernels execute successfully."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        device = torch.device("cuda")
-        n_keys = 4096
-        branching_factor = 4
-        dim = 128
-
-        K, P1, R1, P2, R2 = create_hierarchical_data(
-            n_keys, dim, branching_factor, num_levels=3, device=device
-        )
-
-        q = torch.randn(dim, device=device)
-        q = F.normalize(q, p=2, dim=0)
-        threshold = 0.0
-
-        # Test all versions
-        for version, func in [
-            ("v1", triton_three_level_filter_v1),
-        ]:
-            out = func(K, P1, R1, P2, R2, q, threshold, branch=branching_factor)
-            assert out.shape == (n_keys,), f"Version {version} wrong shape"
-            assert out.device.type == device.type, f"Version {version} wrong device"
-
-
-@pytest.fixture(scope="module")
-def device():
-    """Fixture to provide CUDA device if available."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    else:
-        pytest.skip("CUDA not available")
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

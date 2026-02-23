@@ -1,18 +1,11 @@
-from abc import ABC
 import torch
-from hira.index.indexer import CPUIndexer, CUDAIndexer
-from hira.kernels.numba_kernels import exact_filter_mask_numba
-from hira.kernels.triton_wrappers import (
-    triton_two_level_filter,
-    triton_three_level_filter_v1,
-)
+
+from indexer import CPUIndexer
+from .base import BaseSearcher
+from hira.kernels.numba_search_kernels import exact_filter_mask_numba
 
 
-class Searcher(ABC):
-    pass
-
-
-class CPUSearcher(Searcher):
+class CPUSearcher(BaseSearcher):
     def __init__(
         self,
         chunk_size=8 * 1024,
@@ -129,41 +122,3 @@ class CPUSearcher(Searcher):
                 f"Level {level_idx} | all: {allof} | active: {self.stats['active_keys'][level_idx]}"
             )
         print("Exact checks at final level:", self.stats["exact_checks"])
-
-
-class CUDASearcher(Searcher):
-    def __init__(self, block_c):
-        super().__init__()
-        self.block_c = block_c
-
-    def search(self, query, threshold, indexer: CUDAIndexer):
-        # normalize query
-        # query = query / torch.norm(query, p=2)
-        # Query is already normalized
-
-        indexer.buffer.zero_()
-
-        if indexer.depth == CUDAIndexer.DEPTH.TWO_LEVELS:
-            output = triton_two_level_filter(
-                indexer.children,
-                indexer.parents,
-                indexer.parent_radii,
-                query,
-                threshold,
-                out=indexer.buffer,  # check
-                BLOCK_C=self.block_c,
-                branch=indexer.branching_factor,
-            )
-        else:
-            output = triton_three_level_filter_v1(
-                indexer.children,
-                indexer.parents,
-                indexer.parent_radii,
-                indexer.grand_parents,
-                indexer.grand_parent_radii,
-                query,
-                threshold,
-                out=indexer.buffer,  # check
-                branch=indexer.branching_factor,
-            )
-        return output
