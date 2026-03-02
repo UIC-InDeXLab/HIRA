@@ -21,6 +21,8 @@ class HiraConfig:
     # threshold
     threshold_method: str = "sample_mean_topk"  # "sample_max" or "sample_mean_topk"
     sample_size: int = 1000
+    # searcher
+    chunk_size = 8 * 1024
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "HiraConfig":
@@ -36,3 +38,9 @@ class HiraConfig:
             "max_iterations": self.max_iterations,
             "branching_factor": self.branching_factor,
         }
+
+    def get_searcher_kwargs(self) -> dict:
+        if self.device_mode == DeviceMode.CUDA_ONLY:
+            return {"block_c": self.branching_factor}
+        else:
+            return {"chunk_size": self.chunk_size}

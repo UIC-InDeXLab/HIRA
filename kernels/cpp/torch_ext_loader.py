@@ -13,11 +13,12 @@ Usage::
         hira_torch_ext_v3,
         hira_torch_ext_v4,
     )
-    result = hira_torch_ext.exact_filter(keys, leaf_mask, query, thresholds)
-    result = hira_torch_ext.fused_tree_search(keys, query, thresholds, ...)
-    result = hira_torch_ext_v2.fused_tree_search_v2(keys, query, thresholds, ...)
-    result = hira_torch_ext_v3.fused_tree_search_v3(keys, query, thresholds, ...)
-    result = hira_torch_ext_v4.fused_tree_search_v4(keys, query, thresholds, ...)
+    scaling = torch.ones((H_q,), dtype=torch.float32)
+    result = hira_torch_ext.exact_filter(keys, leaf_mask, query, thresholds, scaling)
+    result = hira_torch_ext.fused_tree_search(keys, query, thresholds, ..., scaling)
+    result = hira_torch_ext_v2.fused_tree_search_v2(keys, query, thresholds, ..., scaling)
+    result = hira_torch_ext_v3.fused_tree_search_v3(keys, query, thresholds, ..., scaling)
+    result = hira_torch_ext_v4.fused_tree_search_v4(keys, query, thresholds, ..., scaling)
 """
 
 import os

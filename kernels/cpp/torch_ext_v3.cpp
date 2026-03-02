@@ -12,6 +12,7 @@
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -42,12 +43,14 @@ torch::Tensor fused_tree_search_v3(
     std::vector<int64_t> level_sizes,           // K_l
     std::vector<torch::Tensor> level_offsets,   // (H, P_l+1), empty for root
     std::vector<torch::Tensor> level_children,  // (H, K_l),   empty for root
-    torch::Tensor q_head_to_kv)
+    torch::Tensor q_head_to_kv,
+    torch::Tensor scaling)
 {
     TORCH_CHECK(keys.dim() == 3, "keys must be (H_kv, N, D)");
     TORCH_CHECK(query.dim() == 2, "query must be (H_q, D)");
     TORCH_CHECK(thresholds.dim() == 1, "thresholds must be (H_q,)");
     TORCH_CHECK(!level_sizes.empty(), "level_sizes must be non-empty");
+    TORCH_CHECK(scaling.dim() == 1, "scaling must be 1-D (H_q,)");
     TORCH_CHECK(level_offsets.size() == level_sizes.size(),
                 "level_offsets must have one entry per level");
     TORCH_CHECK(level_children.size() == level_sizes.size(),
@@ -56,6 +59,7 @@ torch::Tensor fused_tree_search_v3(
     keys = keys.contiguous().to(torch::kFloat32);
     query = query.contiguous().to(torch::kFloat32);
     thresholds = thresholds.contiguous().to(torch::kFloat32);
+    scaling = scaling.contiguous().to(torch::kFloat32);
 
     const int64_t H_kv = keys.size(0);
     const int64_t N = keys.size(1);
@@ -66,6 +70,7 @@ torch::Tensor fused_tree_search_v3(
     TORCH_CHECK(query.size(1) == D, "query dim mismatch vs keys");
     TORCH_CHECK(thresholds.size(0) == H_q,
                 "threshold shape mismatch vs query");
+    TORCH_CHECK(scaling.size(0) == H_q, "scaling shape mismatch vs query");
 
     std::vector<int64_t> q2kv(static_cast<size_t>(H_q), int64_t(0));
     if (q_head_to_kv.defined() && q_head_to_kv.numel() > 0) {
@@ -130,6 +135,13 @@ torch::Tensor fused_tree_search_v3(
     const float* k_ptr = keys.data_ptr<float>();
     const float* q_ptr = query.data_ptr<float>();
     const float* th_ptr = thresholds.data_ptr<float>();
+    const float* sc_ptr = scaling.data_ptr<float>();
+    // bool apply_scaling = false;
+    // for (int64_t qh = 0; qh < H_q; ++qh) {
+    //     TORCH_CHECK(std::isfinite(sc_ptr[qh]) && sc_ptr[qh] > 0.0f,
+    //                 "scaling values must be finite and > 0");
+    //     apply_scaling = apply_scaling || (sc_ptr[qh] != 1.0f);
+    // }
 
     auto result = torch::zeros({H_q, N}, keys.options());
     float* r_ptr = result.data_ptr<float>();
@@ -143,6 +155,7 @@ torch::Tensor fused_tree_search_v3(
         for (int64_t qh = 0; qh < H_q; ++qh) {
             const int64_t h = q2kv[static_cast<size_t>(qh)];
             const float th = th_ptr[qh];
+            const float sc = sc_ptr[qh];
             const float* q_h = q_ptr + qh * D;
 
             // Single-level corner case: flat exact scan.
@@ -150,7 +163,7 @@ torch::Tensor fused_tree_search_v3(
                 for (int64_t i = 0; i < N; ++i) {
                     const float s = dot(k_ptr + (h * N + i) * D, q_h, D);
                     if (s >= th) {
-                        r_ptr[qh * N + i] = s;
+                        r_ptr[qh * N + i] = s * sc;
                     }
                 }
                 continue;
@@ -223,7 +236,7 @@ torch::Tensor fused_tree_search_v3(
                     const int64_t i = child0_h[t];
                     const float s = dot(k_ptr + (h * N + i) * D, q_h, D);
                     if (s >= th) {
-                        r_ptr[qh * N + i] = s;
+                        r_ptr[qh * N + i] = s * sc;
                     }
                 }
             }
@@ -246,5 +259,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("level_sizes"),
           py::arg("level_offsets"),
           py::arg("level_children"),
-          py::arg("q_head_to_kv") = torch::Tensor());
+          py::arg("q_head_to_kv") = torch::Tensor(),
+          py::arg("scaling"));
 }

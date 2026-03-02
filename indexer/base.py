@@ -3,8 +3,8 @@ import torch
 
 
 class BaseIndexer(ABC):
-    def build(self, keys: torch.Tensor):
+    def build(self, keys: torch.Tensor, values: torch.Tensor):
         raise NotImplementedError
 
-    def update(self, new_keys: torch.Tensor):
+    def update(self, new_keys: torch.Tensor, values: torch.Tensor):
         raise NotImplementedError

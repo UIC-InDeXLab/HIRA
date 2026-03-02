@@ -14,6 +14,7 @@
 
 #include <torch/extension.h>
 
+#include <cmath>
 #include <vector>
 #include <cstring>
 
@@ -54,26 +55,37 @@ torch::Tensor exact_filter(
     torch::Tensor keys,
     torch::Tensor leaf_mask,
     torch::Tensor query,
-    torch::Tensor thresholds)
+    torch::Tensor thresholds,
+    torch::Tensor scaling)
 {
     TORCH_CHECK(keys.dim() == 3,       "keys must be 3-D (H, N, D)");
     TORCH_CHECK(leaf_mask.dim() == 2,  "leaf_mask must be 2-D (H, N)");
     TORCH_CHECK(query.dim() == 2,      "query must be 2-D (H, D)");
     TORCH_CHECK(thresholds.dim() == 1, "thresholds must be 1-D (H,)");
+    TORCH_CHECK(scaling.dim() == 1, "scaling must be 1-D (H,)");
 
     keys       = keys.contiguous().to(torch::kFloat32);
     leaf_mask  = leaf_mask.contiguous().to(torch::kBool);
     query      = query.contiguous().to(torch::kFloat32);
     thresholds = thresholds.contiguous().to(torch::kFloat32);
+    scaling    = scaling.contiguous().to(torch::kFloat32);
 
     const int64_t H = keys.size(0);
     const int64_t N = keys.size(1);
     const int64_t D = keys.size(2);
+    TORCH_CHECK(scaling.size(0) == H, "scaling shape mismatch");
 
     const float* k_ptr  = keys.data_ptr<float>();
     const bool*  m_ptr  = leaf_mask.data_ptr<bool>();
     const float* q_ptr  = query.data_ptr<float>();
     const float* th_ptr = thresholds.data_ptr<float>();
+    const float* sc_ptr = scaling.data_ptr<float>();
+    // bool apply_scaling = true;
+    // for (int64_t h = 0; h < H; ++h) {
+    //     TORCH_CHECK(std::isfinite(sc_ptr[h]) && sc_ptr[h] > 0.0f,
+    //                 "scaling values must be finite and > 0");
+    //     apply_scaling = apply_scaling || (sc_ptr[h] != 1.0f);
+    // }
 
     auto result = torch::zeros({H, N}, keys.options());
     float* r_ptr = result.data_ptr<float>();
@@ -91,10 +103,11 @@ torch::Tensor exact_filter(
         const float* ki = k_ptr + (h * N + i) * D;
         const float* qh = q_ptr + h * D;
         const float  th = th_ptr[h];
+        const float  sc = sc_ptr[h];
 
         float s = dot(ki, qh, D);
         if (s >= th)
-            r_ptr[flat] = s;
+            r_ptr[flat] = s * sc;
     }
 
     return result;
@@ -124,15 +137,18 @@ torch::Tensor fused_tree_search(
     std::vector<torch::Tensor> level_radii,
     std::vector<torch::Tensor> level_c2p,
     std::vector<int64_t> level_sizes,
-    torch::Tensor q_head_to_kv)
+    torch::Tensor q_head_to_kv,
+    torch::Tensor scaling)
 {
     TORCH_CHECK(keys.dim() == 3, "keys must be 3-D (H_kv, N, D)");
     TORCH_CHECK(query.dim() == 2, "query must be 2-D (H_q, D)");
     TORCH_CHECK(thresholds.dim() == 1, "thresholds must be 1-D (H_q,)");
+    TORCH_CHECK(scaling.dim() == 1, "scaling must be 1-D (H_q,)");
 
     keys       = keys.contiguous().to(torch::kFloat32);
     query      = query.contiguous().to(torch::kFloat32);
     thresholds = thresholds.contiguous().to(torch::kFloat32);
+    scaling    = scaling.contiguous().to(torch::kFloat32);
 
     const int64_t H_kv = keys.size(0);
     const int64_t N = keys.size(1);
@@ -142,6 +158,7 @@ torch::Tensor fused_tree_search(
 
     TORCH_CHECK(query.size(1) == D, "query dim mismatch vs keys");
     TORCH_CHECK(thresholds.size(0) == H_q, "threshold shape mismatch vs query");
+    TORCH_CHECK(scaling.size(0) == H_q, "scaling shape mismatch vs query");
 
     std::vector<int64_t> q2kv(static_cast<size_t>(H_q), int64_t(0));
     if (q_head_to_kv.defined() && q_head_to_kv.numel() > 0) {
@@ -174,6 +191,13 @@ torch::Tensor fused_tree_search(
     const float* k_ptr  = keys.data_ptr<float>();
     const float* q_ptr  = query.data_ptr<float>();
     const float* th_ptr = thresholds.data_ptr<float>();
+    const float* sc_ptr = scaling.data_ptr<float>();
+    // bool apply_scaling = false;
+    // for (int64_t qh = 0; qh < H_q; ++qh) {
+    //     TORCH_CHECK(std::isfinite(sc_ptr[qh]) && sc_ptr[qh] > 0.0f,
+    //                 "scaling values must be finite and > 0");
+    //     apply_scaling = apply_scaling || (sc_ptr[qh] != 1.0f);
+    // }
 
     /* Pre-extract raw pointers for each level */
     struct LevelData {
@@ -213,13 +237,14 @@ torch::Tensor fused_tree_search(
             const int64_t h = q2kv[static_cast<size_t>(qh)];
 
             const float  th  = th_ptr[qh];
+            const float  sc  = sc_ptr[qh];
             const float* q_h = q_ptr + qh * D;
 
             /* Single level: flat scan */
             if (num_levels == 1) {
                 for (int64_t i = 0; i < N; ++i) {
                     float s = dot(k_ptr + (h * N + i) * D, q_h, D);
-                    if (s >= th) r_ptr[qh * N + i] = s;
+                    if (s >= th) r_ptr[qh * N + i] = s * sc;
                 }
                 continue;
             }
@@ -270,7 +295,7 @@ torch::Tensor fused_tree_search(
                     continue;
                 float s = dot(k_ptr + (h * N + i) * D, q_h, D);
                 if (s >= th)
-                    r_ptr[qh * N + i] = s;
+                    r_ptr[qh * N + i] = s * sc;
             }
         }
     } /* end omp parallel */
@@ -285,7 +310,12 @@ torch::Tensor fused_tree_search(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "HIRA zero-copy C++/OpenMP kernels (torch::Tensor interface)";
     m.def("exact_filter",       &exact_filter,
-          "Batched exact dot-product filter (H,N,D) keys + (H,N) mask -> (H,N) scores");
+          "Batched exact dot-product filter (H,N,D) keys + (H,N) mask -> (H,N) scores",
+          py::arg("keys"),
+          py::arg("leaf_mask"),
+          py::arg("query"),
+          py::arg("thresholds"),
+          py::arg("scaling"));
     m.def("fused_tree_search",  &fused_tree_search,
           "Fused tree-walk + exact filter -> (H_q,N) scores",
           py::arg("keys"),
@@ -295,5 +325,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("level_radii"),
           py::arg("level_c2p"),
           py::arg("level_sizes"),
-          py::arg("q_head_to_kv") = torch::Tensor());
+          py::arg("q_head_to_kv") = torch::Tensor(),
+          py::arg("scaling"));
 }

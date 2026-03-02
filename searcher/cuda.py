@@ -1,97 +1,41 @@
-from .base import BaseSearcher
-from indexer import CUDAIndexer
 import torch
 from typing import Optional
+import math
 
+from .base import BaseSearcher
+from hira.indexer import CUDAIndexer
 from hira.kernels.triton_search_wrappers import (
     triton_two_level_filter,
-    triton_three_level_filter_v1,
-    triton_three_level_filter_kernel_v1,
-    triton_three_level_filter_kernel_v2,
+    triton_three_level_filter,
 )
+
+DEFAULT_OUTPUT_FILL_VALUE = 0.0  # used for searching, filtered-out values in the output
 
 
 class CUDASearcher(BaseSearcher):
 
-    def __init__(self, block_c):
+    def __init__(self, block_c, output_fill_value: float = DEFAULT_OUTPUT_FILL_VALUE):
         super().__init__()
         self.block_c = block_c
+        self.output_fill_value = float(output_fill_value)
         self._tmp_out: Optional[torch.Tensor] = None
-
-    @staticmethod
-    def _flatten_query(
-        query: torch.Tensor, *, dim: int, device: torch.device
-    ) -> torch.Tensor:
-        if not isinstance(query, torch.Tensor):
-            raise TypeError(f"query must be a torch.Tensor, got {type(query)}")
-        q = query.to(device=device, dtype=torch.float32).contiguous()
-        if q.ndim == 4:
-            if q.shape[0] != 1 or q.shape[2] != 1:
-                raise ValueError(f"4D query must be (1,H,1,D), got {tuple(q.shape)}")
-            q = q.squeeze(0).squeeze(-2)
-        elif q.ndim != 2:
-            raise ValueError(
-                f"query must be (H,D) or (1,H,1,D), got {tuple(query.shape)}"
-            )
-        if q.shape[-1] != dim:
-            raise ValueError(f"query dim mismatch: expected D={dim}, got {q.shape[-1]}")
-        return q.contiguous()
 
     @staticmethod
     def _resolve_q_head_to_kv(
         *,
         num_query_heads: int,
         num_kv_heads: int,
-        device: torch.device,
-        q_head_to_kv: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if q_head_to_kv is None:
-            if num_query_heads == num_kv_heads:
-                return torch.arange(num_query_heads, device=device, dtype=torch.long)
-            if (num_query_heads % num_kv_heads) != 0:
-                raise ValueError(
-                    f"Unsupported head mapping: H_q={num_query_heads} must equal or be divisible by H_kv={num_kv_heads}"
-                )
-            group_size = num_query_heads // num_kv_heads
-            return (
-                torch.arange(num_query_heads, device=device, dtype=torch.long)
-                // group_size
-            )
-
-        m = q_head_to_kv.to(device=device, dtype=torch.long).contiguous().reshape(-1)
-        if m.numel() != num_query_heads:
-            raise ValueError(
-                f"q_head_to_kv length mismatch: expected H_q={num_query_heads}, got {m.numel()}"
-            )
-        if torch.any((m < 0) | (m >= num_kv_heads)):
-            raise ValueError(f"q_head_to_kv values must be in [0, {num_kv_heads - 1}]")
-        return m
-
-    @staticmethod
-    def _coerce_threshold(
-        threshold: torch.Tensor, *, num_query_heads: int, device: torch.device
-    ) -> torch.Tensor:
-        t = threshold.to(device=device, dtype=torch.float32).contiguous().reshape(-1)
-        if t.numel() == 1 and num_query_heads > 1:
-            t = t.expand(num_query_heads)
-        if t.numel() != num_query_heads:
-            raise ValueError(
-                f"threshold mismatch: expected scalar or H_q={num_query_heads}, got {t.numel()}"
-            )
-        return t.contiguous()
+        if num_query_heads == num_kv_heads:
+            return torch.arange(num_query_heads, dtype=torch.long)
+        assert num_query_heads % num_kv_heads == 0
+        group_size = num_query_heads // num_kv_heads
+        return torch.arange(num_query_heads, dtype=torch.long) // group_size
 
     def _prepare_output_buffer(
         self, *, num_query_heads: int, num_keys: int, indexer: CUDAIndexer
     ) -> torch.Tensor:
-        num_kv_heads = int(indexer.children.shape[0])
-        if (
-            num_query_heads == num_kv_heads
-            and indexer.buffer is not None
-            and tuple(indexer.buffer.shape) == (num_kv_heads, num_keys)
-        ):
-            indexer.buffer.zero_()
-            return indexer.buffer
-
+        fill_value = self.output_fill_value
         needs_new = (
             self._tmp_out is None
             or self._tmp_out.device != indexer.children.device
@@ -99,13 +43,14 @@ class CUDASearcher(BaseSearcher):
             or tuple(self._tmp_out.shape) != (num_query_heads, num_keys)
         )
         if needs_new:
-            self._tmp_out = torch.zeros(
+            self._tmp_out = torch.full(
                 (num_query_heads, num_keys),
+                fill_value,
                 device=indexer.children.device,
                 dtype=indexer.children.dtype,
             )
         else:
-            self._tmp_out.zero_()
+            self._tmp_out.fill_(fill_value)
         return self._tmp_out
 
     def search(
@@ -114,29 +59,51 @@ class CUDASearcher(BaseSearcher):
         threshold,
         indexer: CUDAIndexer,
         q_head_to_kv: Optional[torch.Tensor] = None,
+        scaling: Optional[torch.Tensor] = None,
     ):
-        # normalize query
-        # query = query / torch.norm(query, p=2)
-        # Query is already normalized
+        """GPU tree-pruned inner-product search using Triton kernels.
+
+        High-level behavior:
+        - Parent (and grandparent for 3-level) traversal uses
+          ``dot(q, center) + radius`` against ``threshold`` to decide which
+          branches are scanned.
+        - Child scores are emitted for surviving branches and scaled by
+          ``scaling``.
+        - Output has shape ``(H_q, N)`` and is initialized with
+          ``output_fill_value`` in non-scanned/rejected positions.
+
+        ``q`` is expected to be L2-normalized for the tree bound semantics.
+
+        Args:
+            query:     ``(1, H, 1, D)`` query tensor.
+            threshold: ``(H,)`` per-head threshold tensor.
+            scaling:   Optional ``(H,)`` per-head scaling tensor for returned scores.
+            indexer:   Built :class:`CPUIndexer` (all tensors ``(H, …)``).
+        """
         if indexer.children is None:
             raise ValueError("Indexer is not built: missing children tensor.")
-        dim = int(indexer.children.shape[2])
         num_kv_heads = int(indexer.children.shape[0])
         num_keys = int(indexer.children.shape[1])
 
-        q = self._flatten_query(query=query, dim=dim, device=indexer.children.device)
-        num_query_heads = int(q.shape[0])
-        q_head_to_kv = self._resolve_q_head_to_kv(
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            device=indexer.children.device,
-            q_head_to_kv=q_head_to_kv,
-        )
-        t = self._coerce_threshold(
-            threshold=threshold,
-            num_query_heads=num_query_heads,
-            device=indexer.children.device,
-        )
+        query = query.squeeze(0).squeeze(-2).contiguous()
+        num_query_heads = int(query.shape[0])
+
+        assert threshold.shape == (
+            query.shape[0],
+        ), "threshold shape must match number of heads in query"
+
+        if scaling is None:
+            scaling = torch.ones(
+                (query.shape[0],), device=query.device, dtype=torch.float32
+            )
+        assert scaling.shape == threshold.shape
+
+        if q_head_to_kv is None:
+            q_head_to_kv = self._resolve_q_head_to_kv(
+                num_query_heads=num_query_heads,
+                num_kv_heads=num_kv_heads,
+            )
+
         out = self._prepare_output_buffer(
             num_query_heads=num_query_heads, num_keys=num_keys, indexer=indexer
         )
@@ -148,26 +115,28 @@ class CUDASearcher(BaseSearcher):
                 indexer.children,
                 indexer.parents,
                 indexer.parent_radii,
-                q,
-                t,
+                query,
+                threshold,
                 q_head_to_kv=q_head_to_kv,
                 out=out,
                 BLOCK_C=self.block_c,
                 branch=indexer.branching_factor,
+                scaling=scaling,
             )
         elif depth_value == CUDAIndexer.DEPTH.THREE_LEVELS.value:
-            output = triton_three_level_filter_kernel_v1(
+            output = triton_three_level_filter(
                 indexer.children,
                 indexer.parents,
                 indexer.parent_radii,
                 indexer.grand_parents,
                 indexer.grand_parent_radii,
-                q,
-                t,
+                query,
+                threshold,
                 q_head_to_kv=q_head_to_kv,
                 out=out,
                 branch=indexer.branching_factor,
                 BLOCK_C=self.block_c,
+                scaling=scaling,
             )
         else:
             raise ValueError(f"Unsupported index depth: {indexer.depth}")
@@ -179,6 +148,7 @@ class CUDASearcher(BaseSearcher):
         threshold,
         indexer: CUDAIndexer,
         q_head_to_kv: Optional[torch.Tensor] = None,
+        scaling: Optional[torch.Tensor] = None,
     ):
         """
         Synthetic estimate of how many child rows are scanned by the CUDA traversal.
@@ -202,6 +172,11 @@ class CUDASearcher(BaseSearcher):
 
         q = self._flatten_query(query=query, dim=dim, device=device)
         num_query_heads = int(q.shape[0])
+        scaling = self._coerce_scaling(
+            scaling,
+            num_query_heads=num_query_heads,
+            device=device,
+        )
         q_head_to_kv = self._resolve_q_head_to_kv(
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,

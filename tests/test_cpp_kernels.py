@@ -33,7 +33,23 @@ def _thresholded_bruteforce(
     keys_hnd: torch.Tensor, query_hd: torch.Tensor, threshold_h: torch.Tensor
 ) -> torch.Tensor:
     scores = torch.einsum("hnd,hd->hn", keys_hnd.float(), query_hd.float())
-    return torch.where(scores >= threshold_h.unsqueeze(-1), scores, torch.zeros_like(scores))
+    return torch.where(
+        scores >= threshold_h.unsqueeze(-1), scores, torch.zeros_like(scores)
+    )
+
+
+def _thresholded_bruteforce_scaled(
+    keys_hnd: torch.Tensor,
+    query_hd: torch.Tensor,
+    threshold_h: torch.Tensor,
+    scaling_h: torch.Tensor,
+) -> torch.Tensor:
+    scores = torch.einsum("hnd,hd->hn", keys_hnd.float(), query_hd.float())
+    return torch.where(
+        scores >= threshold_h.unsqueeze(-1),
+        scores * scaling_h.unsqueeze(-1),
+        torch.zeros_like(scores),
+    )
 
 
 def _thresholded_bruteforce_grouped(
@@ -44,7 +60,9 @@ def _thresholded_bruteforce_grouped(
 ) -> torch.Tensor:
     keys_for_query = keys_kv_hnd.index_select(0, q_head_to_kv.long())
     scores = torch.einsum("hnd,hd->hn", keys_for_query.float(), query_hd.float())
-    return torch.where(scores >= threshold_h.unsqueeze(-1), scores, torch.zeros_like(scores))
+    return torch.where(
+        scores >= threshold_h.unsqueeze(-1), scores, torch.zeros_like(scores)
+    )
 
 
 def _prepare_level_data(indexer: CPUIndexer):
@@ -136,6 +154,7 @@ def test_cpp_numpy_exact_filter_matches_reference(cpp_numpy_kernel):
         leaf_mask.numpy(),
         query.numpy(),
         threshold.numpy(),
+        torch.ones((h,), dtype=torch.float32).numpy(),
     )
     out = torch.from_numpy(out_np)
 
@@ -158,7 +177,10 @@ def test_cpp_torch_exact_filter_matches_reference(cpp_torch_ext):
     all_scores = torch.einsum("hnd,hd->hn", keys, query)
     threshold = torch.quantile(all_scores, 0.75, dim=-1)
 
-    out = cpp_torch_ext.hira_torch_ext.exact_filter(keys, leaf_mask, query, threshold)
+    scaling = torch.ones((h,), dtype=torch.float32)
+    out = cpp_torch_ext.hira_torch_ext.exact_filter(
+        keys, leaf_mask, query, threshold, scaling
+    )
 
     expected_scores = torch.einsum("hnd,hd->hn", keys, query)
     expected = torch.where(
@@ -167,6 +189,38 @@ def test_cpp_torch_exact_filter_matches_reference(cpp_torch_ext):
         torch.zeros_like(expected_scores),
     )
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_cpp_exact_filters_support_scaling(cpp_numpy_kernel, cpp_torch_ext):
+    h, n, d = 2, 96, 64
+    scaling = torch.tensor([0.7, 0.9], dtype=torch.float32)
+    g = torch.Generator().manual_seed(91)
+    keys = torch.randn((h, n, d), generator=g, dtype=torch.float32)
+    keys = keys / keys.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    query = _random_query_hd(h, d, seed=92)
+    leaf_mask = torch.rand((h, n), generator=g) > 0.35
+    raw = torch.einsum("hnd,hd->hn", keys, query)
+    threshold = torch.quantile(raw, 0.75, dim=-1)
+
+    expected = torch.where(
+        leaf_mask & (raw >= threshold.unsqueeze(-1)),
+        raw * scaling.unsqueeze(-1),
+        torch.zeros_like(raw),
+    )
+
+    out_np = cpp_numpy_kernel.exact_filter_mask_batched(
+        keys.numpy(),
+        leaf_mask.numpy(),
+        query.numpy(),
+        threshold.numpy(),
+        scaling.numpy(),
+    )
+    out_torch = cpp_torch_ext.hira_torch_ext.exact_filter(
+        keys, leaf_mask, query, threshold, scaling
+    )
+
+    torch.testing.assert_close(torch.from_numpy(out_np), expected, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out_torch, expected, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -184,6 +238,7 @@ def test_cpp_fused_variants_match_bruteforce(variant, cpp_torch_ext):
 
     query = _random_query_hd(h, d, seed=32)
     q_head_to_kv = torch.arange(h, dtype=torch.long)
+    scaling = torch.ones((h,), dtype=torch.float32)
     gt_scores = torch.einsum("hnd,hd->hn", indexer.keys.float(), query.float())
     threshold = torch.quantile(gt_scores, 0.75, dim=-1)
     expected = _thresholded_bruteforce(indexer.keys, query, threshold)
@@ -199,6 +254,7 @@ def test_cpp_fused_variants_match_bruteforce(variant, cpp_torch_ext):
             c2p_list,
             sizes_list,
             q_head_to_kv,
+            scaling,
         )
     elif variant == "v2":
         centers_list, radii_list, c2p_list, sizes_list = _prepare_level_data(indexer)
@@ -211,6 +267,7 @@ def test_cpp_fused_variants_match_bruteforce(variant, cpp_torch_ext):
             c2p_list,
             sizes_list,
             q_head_to_kv,
+            scaling,
         )
     else:
         (
@@ -232,6 +289,100 @@ def test_cpp_fused_variants_match_bruteforce(variant, cpp_torch_ext):
             offsets_list,
             children_list,
             q_head_to_kv,
+            scaling,
+        )
+
+    torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("variant", ["v1", "v2", "v3", "v4"])
+def test_cpp_fused_variants_support_scaling(variant, cpp_torch_ext):
+    h, n, num_levels, bf = 2, 192, 4, 8
+    d = 128 if variant == "v4" else 64
+    scaling = torch.tensor([0.65, 0.8], dtype=torch.float32)
+
+    keys = _normalized_keys(h, n, d, seed=51)
+    indexer = CPUIndexer(
+        num_levels=num_levels,
+        branching_factor=bf,
+        max_iterations=2,
+    ).build(keys)
+
+    query = _random_query_hd(h, d, seed=52)
+    q_head_to_kv = torch.arange(h, dtype=torch.long)
+    raw = torch.einsum("hnd,hd->hn", indexer.keys.float(), query.float())
+    threshold = torch.quantile(raw, 0.8, dim=-1)
+    expected = _thresholded_bruteforce_scaled(indexer.keys, query, threshold, scaling)
+
+    if variant == "v1":
+        centers_list, radii_list, c2p_list, sizes_list = _prepare_level_data(indexer)
+        out = cpp_torch_ext.hira_torch_ext.fused_tree_search(
+            indexer.keys.float().contiguous(),
+            query,
+            threshold,
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            q_head_to_kv,
+            scaling,
+        )
+    elif variant == "v2":
+        centers_list, radii_list, c2p_list, sizes_list = _prepare_level_data(indexer)
+        out = cpp_torch_ext.hira_torch_ext_v2.fused_tree_search_v2(
+            indexer.keys.float().contiguous(),
+            query,
+            threshold,
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            q_head_to_kv,
+            scaling,
+        )
+    elif variant == "v3":
+        (
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            offsets_list,
+            children_list,
+        ) = _prepare_level_data_with_adjacency(indexer)
+        out = cpp_torch_ext.hira_torch_ext_v3.fused_tree_search_v3(
+            indexer.keys.float().contiguous(),
+            query,
+            threshold,
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            offsets_list,
+            children_list,
+            q_head_to_kv,
+            scaling,
+        )
+    else:
+        (
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            offsets_list,
+            children_list,
+        ) = _prepare_level_data_with_adjacency(indexer)
+        out = cpp_torch_ext.hira_torch_ext_v4.fused_tree_search_v4(
+            indexer.keys.float().contiguous(),
+            query,
+            threshold,
+            centers_list,
+            radii_list,
+            c2p_list,
+            sizes_list,
+            offsets_list,
+            children_list,
+            q_head_to_kv,
+            scaling,
         )
 
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
@@ -248,6 +399,7 @@ def test_cpp_fused_v4_matches_bruteforce(cpp_torch_ext):
 
     query = _random_query_hd(h, d, seed=42)
     q_head_to_kv = torch.arange(h, dtype=torch.long)
+    scaling = torch.ones((h,), dtype=torch.float32)
     gt_scores = torch.einsum("hnd,hd->hn", indexer.keys.float(), query.float())
     threshold = torch.quantile(gt_scores, 0.75, dim=-1)
     expected = _thresholded_bruteforce(indexer.keys, query, threshold)
@@ -271,6 +423,7 @@ def test_cpp_fused_v4_matches_bruteforce(cpp_torch_ext):
         offsets_list,
         children_list,
         q_head_to_kv,
+        scaling,
     )
 
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
@@ -294,6 +447,7 @@ def test_cpp_fused_variants_support_grouped_attention(variant, cpp_torch_ext):
     keys_for_query = indexer.keys.index_select(0, q_head_to_kv)
     gt_scores = torch.einsum("hnd,hd->hn", keys_for_query.float(), query.float())
     threshold = torch.quantile(gt_scores, 0.75, dim=-1)
+    scaling = torch.ones((h_q,), dtype=torch.float32)
     expected = _thresholded_bruteforce_grouped(
         indexer.keys, query, threshold, q_head_to_kv
     )
@@ -309,6 +463,7 @@ def test_cpp_fused_variants_support_grouped_attention(variant, cpp_torch_ext):
             c2p_list,
             sizes_list,
             q_head_to_kv,
+            scaling,
         )
     elif variant == "v2":
         centers_list, radii_list, c2p_list, sizes_list = _prepare_level_data(indexer)
@@ -321,6 +476,7 @@ def test_cpp_fused_variants_support_grouped_attention(variant, cpp_torch_ext):
             c2p_list,
             sizes_list,
             q_head_to_kv,
+            scaling,
         )
     elif variant == "v3":
         (
@@ -342,6 +498,7 @@ def test_cpp_fused_variants_support_grouped_attention(variant, cpp_torch_ext):
             offsets_list,
             children_list,
             q_head_to_kv,
+            scaling,
         )
     else:
         (
@@ -363,6 +520,7 @@ def test_cpp_fused_variants_support_grouped_attention(variant, cpp_torch_ext):
             offsets_list,
             children_list,
             q_head_to_kv,
+            scaling,
         )
 
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
@@ -386,6 +544,7 @@ def test_cpp_fused_v2_supports_explicit_query_to_kv_mapping(cpp_torch_ext):
         query.float(),
     )
     threshold = torch.quantile(expected_scores, 0.8, dim=-1)
+    scaling = torch.ones((h_q,), dtype=torch.float32)
     expected = _thresholded_bruteforce_grouped(
         indexer.keys, query, threshold, q_head_to_kv
     )
@@ -400,6 +559,7 @@ def test_cpp_fused_v2_supports_explicit_query_to_kv_mapping(cpp_torch_ext):
         c2p_list,
         sizes_list,
         q_head_to_kv,
+        scaling,
     )
 
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)

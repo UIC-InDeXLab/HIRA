@@ -2,9 +2,7 @@ import torch
 
 from hira.kernels.triton_search_kernels import (
     two_level_filter_kernel_batched,
-    two_level_filter_kernel_masked_batched,
     three_level_filter_kernel_v1_batched,
-    three_level_filter_kernel_v2_batched,
 )
 
 
@@ -28,9 +26,7 @@ def _coerce_query(q: torch.Tensor, *, d: int, device: torch.device):
     return q
 
 
-def _coerce_q_head_to_kv(
-    q_head_to_kv, *, H_q: int, H_kv: int, device: torch.device
-):
+def _coerce_q_head_to_kv(q_head_to_kv, *, H_q: int, H_kv: int, device: torch.device):
     if q_head_to_kv is None:
         if H_q == H_kv:
             return torch.arange(H_q, device=device, dtype=torch.long).contiguous()
@@ -74,6 +70,23 @@ def _coerce_threshold(t, *, H: int, device: torch.device):
     return t.contiguous()
 
 
+def _coerce_scaling(
+    scaling: torch.Tensor | None, *, H: int, device: torch.device
+) -> torch.Tensor:
+    if scaling is None:
+        return torch.ones((H,), device=device, dtype=torch.float32)
+    if not torch.is_tensor(scaling):
+        raise TypeError(
+            f"scaling must be a torch.Tensor with shape (H,), got {type(scaling)}"
+        )
+    s = scaling.to(device=device, dtype=torch.float32).contiguous().reshape(-1)
+    if s.numel() != H:
+        raise ValueError(f"scaling must have length H={H}, got {s.numel()}")
+    if not bool(torch.isfinite(s).all().item()):
+        raise ValueError("scaling values must be finite")
+    return s.contiguous()
+
+
 def _coerce_out(out, *, H: int, n: int, device: torch.device, dtype: torch.dtype):
     if out is None:
         return torch.zeros((H, n), device=device, dtype=dtype)
@@ -109,6 +122,7 @@ def triton_two_level_filter(
     n_warps=4,
     out=None,
     q_head_to_kv=None,
+    scaling: torch.Tensor | None = None,
 ):
     """
     Multi-head:
@@ -156,6 +170,7 @@ def triton_two_level_filter(
         q_head_to_kv, H_q=H_q, H_kv=H_kv, device=K.device
     )
     t = _coerce_threshold(t, H=H_q, device=K.device)
+    scaling = _coerce_scaling(scaling, H=H_q, device=K.device)
 
     if q.stride(-1) != 1:
         raise ValueError(
@@ -184,162 +199,8 @@ def triton_two_level_filter(
         out_h_stride=out.stride(0),
         out_row_stride=out.stride(1),
         t_h_stride=t.stride(0),
-        q2kv_h_stride=q_head_to_kv.stride(0),
-        n_cols=d,
-        BLOCK_C=BLOCK_C,
-        branching_factor=branch,
-        num_warps=n_warps,
-    )
-
-    return out
-
-
-def triton_three_level_filter_v1(
-    K,
-    P1,
-    R1,
-    P2,
-    R2,
-    q,
-    t,
-    *,
-    branch,
-    BLOCK_C=None,
-    n_warps=4,
-    out=None,
-    q_head_to_kv=None,
-):
-    """
-    Multi-head.
-    Uses two batched masked two-level passes:
-    1) P2 -> P1
-    2) P1 -> K
-    """
-    if BLOCK_C is None:
-        BLOCK_C = branch
-
-    if K.ndim != 3:
-        raise ValueError(f"K must be (H_kv,n,d), got {tuple(K.shape)}")
-    if P1.ndim != 3:
-        raise ValueError(f"P1 must be (H_kv,n_p1,d), got {tuple(P1.shape)}")
-    if R1.ndim != 2:
-        raise ValueError(f"R1 must be (H_kv,n_p1), got {tuple(R1.shape)}")
-    if P2.ndim != 3:
-        raise ValueError(f"P2 must be (H_kv,n_p2,d), got {tuple(P2.shape)}")
-    if R2.ndim != 2:
-        raise ValueError(f"R2 must be (H_kv,n_p2), got {tuple(R2.shape)}")
-
-    if not (K.is_cuda and P1.is_cuda and R1.is_cuda and P2.is_cuda and R2.is_cuda):
-        raise ValueError("K, P1, R1, P2, R2 must be CUDA tensors")
-
-    H_kv, N_K, d = K.shape
-    if N_K % branch != 0:
-        raise ValueError(
-            f"N_K must be divisible by branch; got N_K={N_K}, branch={branch}"
-        )
-    N_P1 = N_K // branch
-    if N_P1 % branch != 0:
-        raise ValueError(
-            f"N_P1 must be divisible by branch; got N_P1={N_P1}, branch={branch}"
-        )
-    N_P2 = N_P1 // branch
-
-    if P1.shape != (H_kv, N_P1, d):
-        raise ValueError(
-            f"P1 shape mismatch: expected {(H_kv, N_P1, d)}, got {tuple(P1.shape)}"
-        )
-    if R1.shape != (H_kv, N_P1):
-        raise ValueError(
-            f"R1 shape mismatch: expected {(H_kv, N_P1)}, got {tuple(R1.shape)}"
-        )
-    if P2.shape != (H_kv, N_P2, d):
-        raise ValueError(
-            f"P2 shape mismatch: expected {(H_kv, N_P2, d)}, got {tuple(P2.shape)}"
-        )
-    if R2.shape != (H_kv, N_P2):
-        raise ValueError(
-            f"R2 shape mismatch: expected {(H_kv, N_P2)}, got {tuple(R2.shape)}"
-        )
-    if BLOCK_C > branch or (branch % BLOCK_C) != 0:
-        raise ValueError(
-            f"BLOCK_C must divide branch and be <= branch; got {BLOCK_C}, {branch}"
-        )
-
-    _check_layout_3d_last_contiguous(K, "K")
-    _check_layout_3d_last_contiguous(P1, "P1")
-    _check_layout_3d_last_contiguous(P2, "P2")
-
-    q = _coerce_query(q, d=d, device=K.device)
-    H_q = q.shape[0]
-    q_head_to_kv = _coerce_q_head_to_kv(
-        q_head_to_kv, H_q=H_q, H_kv=H_kv, device=K.device
-    )
-    t = _coerce_threshold(t, H=H_q, device=K.device)
-    if q.stride(-1) != 1:
-        raise ValueError(
-            f"q must be contiguous in the last dim; got stride={q.stride()}"
-        )
-
-    out = _coerce_out(out, H=H_q, n=N_K, device=K.device, dtype=K.dtype)
-
-    out_p1 = torch.full((H_q, N_P1), float("-inf"), device=K.device, dtype=K.dtype)
-    parent_mask_p2 = torch.ones((H_q, N_P2), device=K.device, dtype=torch.uint8)
-
-    grid1 = (N_P2, H_q)
-    two_level_filter_kernel_masked_batched[grid1](
-        K_ptr=P1,
-        P_ptr=P2,
-        R_ptr=R2,
-        q_ptr=q,
-        q_head_to_kv_ptr=q_head_to_kv,
-        out_ptr=out_p1,
-        parent_mask_ptr=parent_mask_p2,
-        t_ptr=t,
-        K_h_stride=P1.stride(0),
-        K_row_stride=P1.stride(1),
-        P_h_stride=P2.stride(0),
-        P_row_stride=P2.stride(1),
-        R_h_stride=R2.stride(0),
-        R_row_stride=R2.stride(1),
-        q_h_stride=q.stride(0),
-        q_d_stride=q.stride(1),
-        out_h_stride=out_p1.stride(0),
-        out_row_stride=out_p1.stride(1),
-        pm_h_stride=parent_mask_p2.stride(0),
-        pm_row_stride=parent_mask_p2.stride(1),
-        t_h_stride=t.stride(0),
-        q2kv_h_stride=q_head_to_kv.stride(0),
-        n_cols=d,
-        BLOCK_C=BLOCK_C,
-        branching_factor=branch,
-        num_warps=n_warps,
-    )
-
-    parent_mask_p1 = torch.isfinite(out_p1).to(torch.uint8)
-
-    grid2 = (N_P1, H_q)
-    two_level_filter_kernel_masked_batched[grid2](
-        K_ptr=K,
-        P_ptr=P1,
-        R_ptr=R1,
-        q_ptr=q,
-        q_head_to_kv_ptr=q_head_to_kv,
-        out_ptr=out,
-        parent_mask_ptr=parent_mask_p1,
-        t_ptr=t,
-        K_h_stride=K.stride(0),
-        K_row_stride=K.stride(1),
-        P_h_stride=P1.stride(0),
-        P_row_stride=P1.stride(1),
-        R_h_stride=R1.stride(0),
-        R_row_stride=R1.stride(1),
-        q_h_stride=q.stride(0),
-        q_d_stride=q.stride(1),
-        out_h_stride=out.stride(0),
-        out_row_stride=out.stride(1),
-        pm_h_stride=parent_mask_p1.stride(0),
-        pm_row_stride=parent_mask_p1.stride(1),
-        t_h_stride=t.stride(0),
+        scaling_ptr=scaling,
+        scaling_h_stride=scaling.stride(0),
         q2kv_h_stride=q_head_to_kv.stride(0),
         n_cols=d,
         BLOCK_C=BLOCK_C,
@@ -351,7 +212,7 @@ def triton_three_level_filter_v1(
 
 
 def _prepare_three_level_inputs(
-    K, P1, R1, P2, R2, q, t, *, branch, BLOCK_C, out, q_head_to_kv
+    K, P1, R1, P2, R2, q, t, *, branch, BLOCK_C, out, q_head_to_kv, scaling
 ):
     if BLOCK_C is None:
         BLOCK_C = branch
@@ -413,16 +274,17 @@ def _prepare_three_level_inputs(
         q_head_to_kv, H_q=H_q, H_kv=H_kv, device=K.device
     )
     t = _coerce_threshold(t, H=H_q, device=K.device)
+    scaling = _coerce_scaling(scaling, H=H_q, device=K.device)
     if q.stride(-1) != 1:
         raise ValueError(
             f"q must be contiguous in the last dim; got stride={q.stride()}"
         )
 
     out = _coerce_out(out, H=H_q, n=N_K, device=K.device, dtype=K.dtype)
-    return H_q, N_P1, N_P2, d, q, t, out, BLOCK_C, q_head_to_kv
+    return H_q, N_P1, N_P2, d, q, t, out, BLOCK_C, q_head_to_kv, scaling
 
 
-def triton_three_level_filter_kernel_v1(
+def triton_three_level_filter(
     K,
     P1,
     R1,
@@ -436,23 +298,27 @@ def triton_three_level_filter_kernel_v1(
     n_warps=4,
     out=None,
     q_head_to_kv=None,
+    scaling: torch.Tensor | None = None,
 ):
     """
     One-pass three-level traversal.
     Program granularity: one program per (query-head, P2 node).
     """
-    H_q, _N_P1, N_P2, d, q, t, out, BLOCK_C, q_head_to_kv = _prepare_three_level_inputs(
-        K,
-        P1,
-        R1,
-        P2,
-        R2,
-        q,
-        t,
-        branch=branch,
-        BLOCK_C=BLOCK_C,
-        out=out,
-        q_head_to_kv=q_head_to_kv,
+    H_q, _N_P1, N_P2, d, q, t, out, BLOCK_C, q_head_to_kv, scaling = (
+        _prepare_three_level_inputs(
+            K,
+            P1,
+            R1,
+            P2,
+            R2,
+            q,
+            t,
+            branch=branch,
+            BLOCK_C=BLOCK_C,
+            out=out,
+            q_head_to_kv=q_head_to_kv,
+            scaling=scaling,
+        )
     )
 
     grid = (N_P2, H_q)
@@ -481,74 +347,8 @@ def triton_three_level_filter_kernel_v1(
         out_h_stride=out.stride(0),
         out_row_stride=out.stride(1),
         t_h_stride=t.stride(0),
-        q2kv_h_stride=q_head_to_kv.stride(0),
-        n_cols=d,
-        branch=branch,
-        BLOCK_C=BLOCK_C,
-        num_warps=n_warps,
-    )
-    return out
-
-
-def triton_three_level_filter_kernel_v2(
-    K,
-    P1,
-    R1,
-    P2,
-    R2,
-    q,
-    t,
-    *,
-    branch,
-    BLOCK_C=None,
-    n_warps=4,
-    out=None,
-    q_head_to_kv=None,
-):
-    """
-    One-pass three-level traversal.
-    Program granularity: one program per (query-head, P1 node).
-    """
-    H_q, N_P1, _N_P2, d, q, t, out, BLOCK_C, q_head_to_kv = _prepare_three_level_inputs(
-        K,
-        P1,
-        R1,
-        P2,
-        R2,
-        q,
-        t,
-        branch=branch,
-        BLOCK_C=BLOCK_C,
-        out=out,
-        q_head_to_kv=q_head_to_kv,
-    )
-
-    grid = (N_P1, H_q)
-    three_level_filter_kernel_v2_batched[grid](
-        K_ptr=K,
-        P1_ptr=P1,
-        R1_ptr=R1,
-        P2_ptr=P2,
-        R2_ptr=R2,
-        q_ptr=q,
-        q_head_to_kv_ptr=q_head_to_kv,
-        out_ptr=out,
-        t_ptr=t,
-        K_h_stride=K.stride(0),
-        K_row_stride=K.stride(1),
-        P1_h_stride=P1.stride(0),
-        P1_row_stride=P1.stride(1),
-        R1_h_stride=R1.stride(0),
-        R1_row_stride=R1.stride(1),
-        P2_h_stride=P2.stride(0),
-        P2_row_stride=P2.stride(1),
-        R2_h_stride=R2.stride(0),
-        R2_row_stride=R2.stride(1),
-        q_h_stride=q.stride(0),
-        q_d_stride=q.stride(1),
-        out_h_stride=out.stride(0),
-        out_row_stride=out.stride(1),
-        t_h_stride=t.stride(0),
+        scaling_ptr=scaling,
+        scaling_h_stride=scaling.stride(0),
         q2kv_h_stride=q_head_to_kv.stride(0),
         n_cols=d,
         branch=branch,

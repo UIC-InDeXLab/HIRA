@@ -10,6 +10,8 @@ from hira.kernels.triton_update_kernels import (
     nearest_l2_triton_batched,
 )
 
+DEFAULT_PAD_VALUE = 0.0  # used building index for aligning index to (parent * BF)
+
 
 class CUDAIndexer(BaseIndexer):
 
@@ -20,13 +22,17 @@ class CUDAIndexer(BaseIndexer):
 
     def __init__(
         self,
-        num_levels: DEPTH,
+        num_levels: DEPTH | int,
         max_iterations: int,
         branching_factor: int,
         verbose: bool = False,
-        pad_value: float = 0.0,
+        pad_value: float = DEFAULT_PAD_VALUE,
     ):
-        self.depth = num_levels
+        self.depth = (
+            num_levels
+            if type(num_levels) == CUDAIndexer.DEPTH
+            else CUDAIndexer.DEPTH(num_levels)
+        )
         self.max_iterations = max_iterations
         self.branching_factor = branching_factor
         self.verbose = verbose
@@ -35,12 +41,11 @@ class CUDAIndexer(BaseIndexer):
         # to build
         self.dim: int = 0
         self.children: Optional[torch.Tensor] = None  # padded keys
+        self.values: Optional[torch.Tensor] = None  # (1,H,N,V), aligned with children
         self.parents: Optional[torch.Tensor] = None  # level 1
         self.parent_radii: Optional[torch.Tensor] = None  # level 1
         self.grand_parents: Optional[torch.Tensor] = None  # level 2
         self.grand_parent_radii: Optional[torch.Tensor] = None  # level 2
-        # buffer
-        self.buffer: Optional[torch.Tensor] = None
 
         # ====== UPDATE_V2 CACHE ======
         # Per-parent count of filled children slots (assumes contiguous fill from slot 0).
@@ -49,38 +54,53 @@ class CUDAIndexer(BaseIndexer):
         self._parent_valid: Optional[torch.Tensor] = None  # (num_parents,) bool CUDA
 
     @torch.no_grad()
-    def build(self, keys: torch.Tensor):
+    def build(self, keys: torch.Tensor, values: Optional[torch.Tensor] = None):
         # keys: (1, H, L, D)
-
+        # values: optional (1, H, L, D) aligned with keys
         # make sure keys are on GPU
-        keys = keys.to("cuda").squeeze(0)  # (H, L, D)
-        self.num_heads, _, self.dim = keys.shape
+        keys = keys.to("cuda").squeeze(0).contiguous()  # (H, L, D)
+        self.num_heads, num_keys, self.dim = keys.shape
+
+        if values is not None:
+            values = values.squeeze(0).to("cuda").contiguous()
+            assert values.shape == keys.shape, "values must have the same shape as keys"
 
         if self.depth == CUDAIndexer.DEPTH.TWO_LEVELS:
             (
                 self.parents,
                 self.children,
-            ) = self._build_parents_children_from_keys(keys, self.branching_factor)
+                values_layout,
+            ) = self._build_parents_children_from_keys(
+                keys,
+                self.branching_factor,
+                values=values,
+            )
+            self.values = (
+                None
+                if values_layout is None
+                else values_layout.unsqueeze(0).contiguous()
+            )
             self.parent_radii = self._compute_parent_radii_from_layout()
         elif self.depth == CUDAIndexer.DEPTH.THREE_LEVELS:
             (
                 self.grand_parents,
                 self.parents,
                 self.children,
+                values_layout,
             ) = self._build_grandparents_parents_children_from_keys(
-                keys, self.branching_factor
+                keys,
+                self.branching_factor,
+                values=values,
+            )
+            self.values = (
+                None
+                if values_layout is None
+                else values_layout.unsqueeze(0).contiguous()
             )
             self.parent_radii = self._compute_parent_radii_from_layout()
             self.grand_parent_radii = self._compute_grandparent_radii_from_layout()
         else:
             raise ValueError(f"Unsupported depth {self.depth}")
-
-        # buffer for storing the scores
-        self.buffer = torch.zeros(
-            (self.children.shape[0], self.children.shape[1]),
-            device="cuda",
-            dtype=torch.float32,
-        )
 
         # Initialize update_v2 cache state.
         self._init_update_state()
@@ -319,9 +339,10 @@ class CUDAIndexer(BaseIndexer):
         self,
         keys: torch.Tensor,  # (H, n, d)
         bf: int,
+        values: Optional[torch.Tensor] = None,  # (H, n, v)
         *,
         seed: int = 1234,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Build one level from raw keys using ONLY _build_faiss_kmeans_bf_level.
 
@@ -348,6 +369,15 @@ class CUDAIndexer(BaseIndexer):
 
         device = x.device
         H, n, d = x.shape
+        if values is not None:
+            assert values.ndim == 3
+            assert (
+                values.shape[0] == H and values.shape[1] == n
+            ), "values must be (H,n,v)"
+            values = values.contiguous()
+            vdim = int(values.shape[-1])
+        else:
+            vdim = 0
 
         # Build one level (batched over heads)
         parents, selected = self._build_random_bf_level_batched(x, bf, seed=seed)
@@ -363,6 +393,11 @@ class CUDAIndexer(BaseIndexer):
             float(self.pad_value),
             device=device,
             dtype=torch.float32,
+        )
+        children_values = (
+            torch.zeros((H, m * bf, vdim), device=device, dtype=values.dtype)
+            if values is not None
+            else None
         )
 
         sel_flat = selected.reshape(H, m * bf)  # (H, m*bf)
@@ -380,17 +415,24 @@ class CUDAIndexer(BaseIndexer):
 
             # Write only valid slots; keep pad_value in invalid slots
             children[valid] = gathered[valid]
+            if children_values is not None:
+                gathered_values = values.gather(
+                    1,
+                    safe_idx.unsqueeze(-1).expand(-1, -1, vdim),
+                )
+                children_values[valid] = gathered_values[valid]
 
         assert parents.is_cuda and children.is_cuda
-        return parents, children
+        return parents, children, children_values
 
     def _build_grandparents_parents_children_from_keys(
         self,
         keys: torch.Tensor,  # (H,n,d) CUDA float/half ok
         bf: int,
+        values: Optional[torch.Tensor] = None,  # (H,n,v)
         *,
         seed: int = 1234,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Batched (over heads) two-level build.
 
@@ -403,15 +445,17 @@ class CUDAIndexer(BaseIndexer):
         - parents_reordered[h, i*bf:(i+1)*bf] are the parents of grand_parent[h, i] (padding possible)
         - children_reordered[h, p*bf:(p+1)*bf] are children of parent p in parents_reordered[h]
         """
-        if keys.ndim != 3:
-            raise ValueError(f"keys must be (H,n,d), got {tuple(keys.shape)}")
-        if not keys.is_cuda:
-            raise ValueError("keys must be on CUDA")
-        if bf <= 0:
-            raise ValueError("bf must be positive")
+        assert keys.ndim == 3
+        assert keys.is_cuda
+        assert bf >= 1
 
         # --- first level: keys -> parents, children ---
-        parents, children = self._build_parents_children_from_keys(keys, bf, seed=seed)
+        parents, children, children_values = self._build_parents_children_from_keys(
+            keys,
+            bf,
+            values=values,
+            seed=seed,
+        )
         # parents:  (H, m, d)
         # children: (H, m*bf, d)
         device = parents.device
@@ -470,20 +514,40 @@ class CUDAIndexer(BaseIndexer):
             children_reordered_blocks[valid] = gathered_blocks[valid]
 
         children_reordered = children_reordered_blocks.view(H, g * bf * bf, d)
+        children_values_reordered = None
+        if children_values is not None:
+            vdim = int(children_values.shape[-1])
+            child_value_blocks = children_values.view(H, m, bf, vdim)
+            children_values_reordered_blocks = torch.zeros(
+                (H, g * bf, bf, vdim),
+                device=device,
+                dtype=children_values.dtype,
+            )
+            if valid.any():
+                safe_idx = sel_flat.clamp_min(0)  # (H, g*bf)
+                gathered_value_blocks = child_value_blocks.gather(
+                    1,
+                    safe_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, bf, vdim),
+                )  # (H, g*bf, bf, vdim)
+                children_values_reordered_blocks[valid] = gathered_value_blocks[valid]
+            children_values_reordered = children_values_reordered_blocks.view(
+                H, g * bf * bf, vdim
+            )
 
         assert gp.is_cuda and parents_reordered.is_cuda and children_reordered.is_cuda
-        return gp, parents_reordered, children_reordered
+        return gp, parents_reordered, children_reordered, children_values_reordered
 
     # ------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def update(self, new_keys: torch.Tensor):
+    def update(self, new_keys: torch.Tensor, new_values: Optional[torch.Tensor] = None):
         """Incremental update of the index with new key vectors.
 
         Args:
             new_keys: (1, H, M, D) new key vectors per head.
+            new_values: optional (1, H, M, V) value vectors per head.
 
         Algorithm:
             1. Find nearest parent for each new key; fill if the parent
@@ -496,15 +560,17 @@ class CUDAIndexer(BaseIndexer):
                grandparent blocks for any overflow.
             4. Update all radii and refresh internal state.
         """
-        if new_keys.numel() == 0:
-            return self
-        if self.parents is None or self.children is None:
-            raise RuntimeError("update() called before build()")
+        assert new_values is None or new_keys.shape == new_values.shape
+        assert new_keys.ndim == 4
 
         new_keys = new_keys.squeeze(0).contiguous()
-        assert new_keys.ndim == 3
-
         H, M, D = new_keys.shape
+        assert D == self.dim
+
+        has_values = self.values is not None
+        if has_values:
+            new_values = new_values.squeeze(0).contiguous()
+
         bf = int(self.branching_factor)
         device = new_keys.device
 
@@ -518,13 +584,20 @@ class CUDAIndexer(BaseIndexer):
         )
         nearest_parent = nearest_parent.to(torch.int32)
 
-        placed_mask, _placed_flat = fill_existing_children_atomic_batched(
+        placed_mask, placed_flat = fill_existing_children_atomic_batched(
             x=new_keys,
             parent_idx=nearest_parent,
             child_counts=self._child_counts,
             children=self.children,
             bf=bf,
         )
+        if has_values and placed_mask.any():
+            h_idx = torch.arange(H, device=device, dtype=torch.long)[:, None].expand(
+                H, M
+            )
+            placed_rows = placed_flat[placed_mask].to(torch.long)
+            values_3d = self.values.squeeze(0)
+            values_3d[h_idx[placed_mask], placed_rows] = new_values[placed_mask]
 
         # Update parent radii for placed keys (atomic max).
         if placed_mask.any() and self.parent_radii.dtype == torch.float32:
@@ -549,15 +622,20 @@ class CUDAIndexer(BaseIndexer):
             self._refresh_after_update()
             return self
 
-        new_parents, new_children_flat, new_parent_radii = (
-            self._build_level_from_orphans(
-                all_items=new_keys,
-                overflow_mask=overflow_mask,
-                orphan_counts=orphan_counts,
-            )
+        (
+            new_parents,
+            new_children_flat,
+            new_parent_radii,
+            new_children_values_flat,
+        ) = self._build_level_from_orphans(
+            all_items=new_keys,
+            all_item_values=new_values,
+            overflow_mask=overflow_mask,
+            orphan_counts=orphan_counts,
         )
         # new_parents:       (H, K_max, D)
         # new_children_flat: (H, K_max * bf, D)
+        # new_children_values_flat: (H, K_max * bf, V) or None
         # new_parent_radii:  (H, K_max)
 
         # ==============================================================
@@ -571,6 +649,10 @@ class CUDAIndexer(BaseIndexer):
             self.children = torch.cat(
                 [self.children, new_children_flat], dim=1
             ).contiguous()
+            if has_values:
+                self.values = torch.cat(
+                    [self.values, new_children_values_flat.unsqueeze(0)], dim=-2
+                ).contiguous()
             self._refresh_after_update()
             return self
 
@@ -596,6 +678,7 @@ class CUDAIndexer(BaseIndexer):
                 new_parents,
                 new_parent_radii,
                 new_children_flat,
+                new_children_values_flat,
                 new_parent_valid,
                 parent_placed_mask,
             )
@@ -609,6 +692,7 @@ class CUDAIndexer(BaseIndexer):
                 new_parents,
                 new_parent_radii,
                 new_children_flat,
+                new_children_values_flat,
                 parent_overflow_mask,
                 parent_orphan_counts,
             )
@@ -623,6 +707,7 @@ class CUDAIndexer(BaseIndexer):
     def _build_level_from_orphans(
         self,
         all_items: torch.Tensor,  # (H, M, D)
+        all_item_values: Optional[torch.Tensor],  # (H, M, V)
         overflow_mask: torch.Tensor,  # (H, M) bool
         orphan_counts: torch.Tensor,  # (H,)
     ):
@@ -631,12 +716,15 @@ class CUDAIndexer(BaseIndexer):
         Returns (all padded to max K across heads):
             new_parents       : (H, K_max, D)
             new_children_flat : (H, K_max * bf, D)
+            new_children_values_flat : (H, K_max * bf, V) or None
             new_parent_radii  : (H, K_max)
         """
         H, M, D = all_items.shape
         bf = int(self.branching_factor)
         device = all_items.device
         pad = float(self.pad_value)
+        has_values = all_item_values is not None
+        vdim = int(all_item_values.shape[-1]) if has_values else 0
 
         # Ceiling division so K_h * bf >= O_h -- every orphan key gets a slot.
         K_per_head = torch.where(
@@ -650,6 +738,15 @@ class CUDAIndexer(BaseIndexer):
         new_children_flat = torch.full(
             (H, K_max * bf, D), pad, device=device, dtype=torch.float32
         )
+        new_children_values_flat = (
+            torch.zeros(
+                (H, K_max * bf, vdim),
+                device=device,
+                dtype=all_item_values.dtype,
+            )
+            if has_values
+            else None
+        )
         new_parent_radii = torch.zeros((H, K_max), device=device, dtype=torch.float32)
 
         for h in range(H):
@@ -659,16 +756,34 @@ class CUDAIndexer(BaseIndexer):
             K_h = K_per_head[h].item()
 
             orphans_h = all_items[h][overflow_mask[h]]  # (O_h, D)
+            orphan_values_h = (
+                all_item_values[h][overflow_mask[h]] if has_values else None
+            )
 
-            parents_h, children_h, radii_h = self._build_one_level_from_points(
-                orphans_h, K_h, bf, pad, device, D
+            parents_h, children_h, radii_h, children_values_h = (
+                self._build_one_level_from_points(
+                    orphans_h,
+                    K_h,
+                    bf,
+                    pad,
+                    device,
+                    D,
+                    point_values=orphan_values_h,
+                )
             )
 
             new_parents[h, :K_h] = parents_h
             new_children_flat[h, : K_h * bf] = children_h
+            if has_values:
+                new_children_values_flat[h, : K_h * bf] = children_values_h
             new_parent_radii[h, :K_h] = radii_h
 
-        return new_parents, new_children_flat, new_parent_radii
+        return (
+            new_parents,
+            new_children_flat,
+            new_parent_radii,
+            new_children_values_flat,
+        )
 
     @staticmethod
     def _build_one_level_from_points(
@@ -678,6 +793,7 @@ class CUDAIndexer(BaseIndexer):
         pad: float,
         device: torch.device,
         D: int,
+        point_values: Optional[torch.Tensor] = None,  # (N, V)
     ):
         """Build K parents and K*bf children from N points (single head).
 
@@ -685,8 +801,19 @@ class CUDAIndexer(BaseIndexer):
             parents  : (K, D)
             children : (K*bf, D), padded with *pad*
             radii    : (K,) float32
+            children_values : (K*bf, V) or None
         """
         N = points.shape[0]
+        has_values = point_values is not None
+        if has_values:
+            if point_values.ndim != 2 or point_values.shape[0] != N:
+                raise ValueError(
+                    f"point_values must be (N,V), got {tuple(point_values.shape)}"
+                )
+            point_values = point_values.contiguous()
+            V = int(point_values.shape[1])
+        else:
+            V = 0
 
         # Random parent selection
         perm = torch.randperm(N, device=device)
@@ -709,6 +836,7 @@ class CUDAIndexer(BaseIndexer):
 
         idx_sorted = assign[order]
         pts_sorted = points[order]
+        vals_sorted = point_values[order] if has_values else None
 
         counts = torch.bincount(idx_sorted, minlength=K).to(torch.int64)
         offsets = torch.zeros(K + 1, device=device, dtype=torch.int64)
@@ -720,10 +848,17 @@ class CUDAIndexer(BaseIndexer):
 
         placed = local_rank < bf
         children = torch.full((K * bf, D), pad, device=device, dtype=torch.float32)
+        children_values = (
+            torch.zeros((K * bf, V), device=device, dtype=point_values.dtype)
+            if has_values
+            else None
+        )
 
         if placed.any():
             dst_idx = idx_sorted[placed] * bf + local_rank[placed]
             children.index_copy_(0, dst_idx, pts_sorted[placed])
+            if has_values:
+                children_values.index_copy_(0, dst_idx, vals_sorted[placed])
 
         # Leftovers (overflow beyond bf per centroid) go into any remaining
         # free slots.  With ceiling-division K, K*bf >= N guarantees
@@ -736,6 +871,8 @@ class CUDAIndexer(BaseIndexer):
             n_fill = min(free.numel(), leftovers.shape[0])
             if n_fill > 0:
                 children[free[:n_fill]] = leftovers[:n_fill]
+                if has_values:
+                    children_values[free[:n_fill]] = vals_sorted[~placed][:n_fill]
 
         # Compute parent radii
         c_view = children.view(K, bf, D)
@@ -749,13 +886,14 @@ class CUDAIndexer(BaseIndexer):
         radii = torch.max(dists_r, dim=1).values
         radii = torch.where(torch.isfinite(radii), radii, torch.zeros_like(radii))
 
-        return parents, children, radii
+        return parents, children, radii, children_values
 
     def _place_parents_into_gp_blocks(
         self,
         new_parents: torch.Tensor,  # (H, K, D)
         new_parent_radii: torch.Tensor,  # (H, K)
         new_children_flat: torch.Tensor,  # (H, K*bf, D)
+        new_children_values_flat: Optional[torch.Tensor],  # (H, K*bf, V)
         new_parent_valid: torch.Tensor,  # (H, K) bool
         parent_placed_mask: torch.Tensor,  # (H, K) bool - updated in-place
     ):
@@ -768,6 +906,13 @@ class CUDAIndexer(BaseIndexer):
         device = self.parents.device
         H, G_old, D = self.grand_parents.shape
         K = new_parents.shape[1]
+        if (self.values is None) != (new_children_values_flat is None):
+            raise ValueError(
+                "Value tensors must be present for both source and destination"
+            )
+        has_values = new_children_values_flat is not None
+        V = int(new_children_values_flat.shape[-1]) if has_values else 0
+        dst_values = self.values.squeeze(0) if has_values else None
 
         # Find nearest GP for each new parent.
         nearest_gp, _ = nearest_l2_triton_batched(
@@ -827,6 +972,10 @@ class CUDAIndexer(BaseIndexer):
             src_c = new_children_flat[h].view(K, bf, D)
             dst_c = self.children[h].view(P_old, bf, D)
             dst_c[dst_p] = src_c[placed_k]
+            if has_values:
+                src_v = new_children_values_flat[h].view(K, bf, V)
+                dst_v = dst_values[h].view(P_old, bf, V)
+                dst_v[dst_p] = src_v[placed_k]
 
             parent_placed_mask[h, placed_k] = True
 
@@ -850,6 +999,7 @@ class CUDAIndexer(BaseIndexer):
         new_parents: torch.Tensor,  # (H, K, D)
         new_parent_radii: torch.Tensor,  # (H, K)
         new_children_flat: torch.Tensor,  # (H, K*bf, D)
+        new_children_values_flat: Optional[torch.Tensor],  # (H, K*bf, V)
         parent_overflow_mask: torch.Tensor,  # (H, K) bool
         parent_orphan_counts: torch.Tensor,  # (H,)
     ):
@@ -860,6 +1010,12 @@ class CUDAIndexer(BaseIndexer):
         H = new_parents.shape[0]
         D = new_parents.shape[2]
         K = new_parents.shape[1]
+        if (self.values is None) != (new_children_values_flat is None):
+            raise ValueError(
+                "Value tensors must be present for both source and destination"
+            )
+        has_values = new_children_values_flat is not None
+        V = int(new_children_values_flat.shape[-1]) if has_values else 0
 
         # Ceiling division so K_gp * bf >= n_orphan_parents -- none dropped.
         K_gp_per_head = torch.where(
@@ -882,6 +1038,15 @@ class CUDAIndexer(BaseIndexer):
             device=device,
             dtype=torch.float32,
         )
+        new_children_values_block = (
+            torch.zeros(
+                (H, K_gp_max * bf * bf, V),
+                device=device,
+                dtype=new_children_values_flat.dtype,
+            )
+            if has_values
+            else None
+        )
         new_gp_radii = torch.zeros((H, K_gp_max), device=device, dtype=torch.float32)
 
         for h in range(H):
@@ -896,6 +1061,11 @@ class CUDAIndexer(BaseIndexer):
             orphan_children_h = new_children_flat[h].view(K, bf, D)[
                 orphan_mask_h
             ]  # (n_orphan, bf, D)
+            orphan_children_values_h = (
+                new_children_values_flat[h].view(K, bf, V)[orphan_mask_h]
+                if has_values
+                else None
+            )  # (n_orphan, bf, V)
 
             # Random GP selection from orphan parents
             perm = torch.randperm(n_orphan, device=device)
@@ -923,6 +1093,9 @@ class CUDAIndexer(BaseIndexer):
             parents_sorted = orphan_parents_h[order]
             radii_sorted = orphan_radii_h[order]
             children_sorted = orphan_children_h[order]  # (n_orphan, bf, D)
+            children_values_sorted = (
+                orphan_children_values_h[order] if has_values else None
+            )  # (n_orphan, bf, V)
 
             counts = torch.bincount(gp_sorted, minlength=K_gp).to(torch.int64)
             offsets = torch.zeros(K_gp + 1, device=device, dtype=torch.int64)
@@ -944,12 +1117,23 @@ class CUDAIndexer(BaseIndexer):
                 dtype=torch.float32,
             )
             children_blk_view = children_blk.view(K_gp * bf, bf, D)
+            children_values_blk = (
+                torch.zeros(
+                    (K_gp * bf, bf, V),
+                    device=device,
+                    dtype=children_values_sorted.dtype,
+                )
+                if has_values
+                else None
+            )
 
             if placed_gp.any():
                 dst_p = gp_sorted[placed_gp] * bf + local_rank[placed_gp]
                 parents_blk[dst_p] = parents_sorted[placed_gp]
                 radii_blk[dst_p] = radii_sorted[placed_gp]
                 children_blk_view[dst_p] = children_sorted[placed_gp]
+                if has_values:
+                    children_values_blk[dst_p] = children_values_sorted[placed_gp]
 
             # Leftovers: orphan parents that overflowed their assigned GP.
             # With ceiling-division K_gp, free slots >= leftovers always.
@@ -957,6 +1141,7 @@ class CUDAIndexer(BaseIndexer):
                 left_p = parents_sorted[~placed_gp]
                 left_r = radii_sorted[~placed_gp]
                 left_c = children_sorted[~placed_gp]
+                left_v = children_values_sorted[~placed_gp] if has_values else None
 
                 empty = torch.all(parents_blk == pad, dim=-1)
                 free = torch.nonzero(empty, as_tuple=False).view(-1)
@@ -965,6 +1150,8 @@ class CUDAIndexer(BaseIndexer):
                     parents_blk[free[:n_fill]] = left_p[:n_fill]
                     radii_blk[free[:n_fill]] = left_r[:n_fill]
                     children_blk_view[free[:n_fill]] = left_c[:n_fill]
+                    if has_values:
+                        children_values_blk[free[:n_fill]] = left_v[:n_fill]
 
             # GP radii
             gp_f = gps_h.float()
@@ -986,6 +1173,10 @@ class CUDAIndexer(BaseIndexer):
             new_parents_block[h, : K_gp * bf] = parents_blk
             new_pr_block[h, : K_gp * bf] = radii_blk
             new_children_block[h, : K_gp * bf * bf] = children_blk
+            if has_values:
+                new_children_values_block[h, : K_gp * bf * bf] = (
+                    children_values_blk.view(K_gp * bf * bf, V)
+                )
 
         # Append
         self.grand_parents = torch.cat(
@@ -1001,6 +1192,10 @@ class CUDAIndexer(BaseIndexer):
         self.children = torch.cat(
             [self.children, new_children_block], dim=1
         ).contiguous()
+        if has_values:
+            self.values = torch.cat(
+                [self.values, new_children_values_block.unsqueeze(0)], dim=-2
+            ).contiguous()
 
     def _update_gp_radii_for_placed_children(
         self,
@@ -1036,12 +1231,7 @@ class CUDAIndexer(BaseIndexer):
         ).to(self.grand_parent_radii.dtype)
 
     def _refresh_after_update(self):
-        """Refresh buffer and cached state after an update."""
-        self.buffer = torch.zeros(
-            (self.children.shape[0], self.children.shape[1]),
-            device="cuda",
-            dtype=torch.float32,
-        )
+        """Cached state after an update."""
         self._init_update_state()
 
     # ------------------------------------------------------------------

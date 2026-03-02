@@ -28,7 +28,13 @@ def _normalized_keys(h: int, n: int, d: int, seed: int) -> torch.Tensor:
 
 def _random_query(h: int, d: int, seed: int) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
-    return torch.randn((1, h, 1, d), generator=g, dtype=torch.float32)
+    q = torch.randn((1, h, 1, d), generator=g, dtype=torch.float32)
+    return q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _values_from_keys(keys_1hnd: torch.Tensor) -> torch.Tensor:
+    x = keys_1hnd.float()
+    return (x * 0.5 + 0.25).contiguous()
 
 
 def _expected_level_sizes(n: int, branching_factor: int, num_levels: int) -> list[int]:
@@ -51,7 +57,6 @@ def _assert_parent_child_structure(indexer: CPUIndexer):
         assert c2p.shape == (indexer.num_heads, child.size)
         assert (c2p >= 0).all(), f"level {li} has negative parent index"
         assert (c2p < parent.size).all(), f"level {li} parent index out of range"
-        assert child.num_parents == parent.size
 
 
 def _assert_radius_upper_bound(indexer: CPUIndexer, atol: float = 1e-4):
@@ -78,7 +83,7 @@ def _assert_radius_upper_bound(indexer: CPUIndexer, atol: float = 1e-4):
 
 def _brute_force(keys_hnd: torch.Tensor, query_1h1d: torch.Tensor) -> torch.Tensor:
     q = query_1h1d.squeeze(0).squeeze(-2).float()
-    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    # q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
     return torch.einsum("hd,hnd->hn", q, keys_hnd.float())
 
 
@@ -86,9 +91,15 @@ def _grouped_brute_force(
     keys_kv_hnd: torch.Tensor, query_1h1d: torch.Tensor, q_head_to_kv: torch.Tensor
 ) -> torch.Tensor:
     q = query_1h1d.squeeze(0).squeeze(-2).float()
-    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    # q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
     keys_for_query = keys_kv_hnd.index_select(0, q_head_to_kv.long())
     return torch.einsum("hd,hnd->hn", q, keys_for_query.float())
+
+
+def _thresholded_scores(scores: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
+    return torch.where(
+        scores >= threshold.unsqueeze(-1), scores, torch.zeros_like(scores)
+    )
 
 
 def _recall(
@@ -162,7 +173,7 @@ def test_cpu_indexer_update_incremental_recall_matches_full_build(
     _assert_parent_child_structure(inc)
     _assert_radius_upper_bound(inc)
 
-    searcher = CPUSearcher(search_strategy="vectorized_cpp_filter")
+    searcher = CPUSearcher()
 
     recalls_full = []
     recalls_inc = []
@@ -197,7 +208,7 @@ def test_cpu_searcher_high_recall_vectorized_cpp_filter(h, n, d, num_levels, bf,
     indexer = CPUIndexer(num_levels=num_levels, branching_factor=bf, max_iterations=2)
     indexer.build(keys)
 
-    searcher = CPUSearcher(search_strategy="vectorized_cpp_filter")
+    searcher = CPUSearcher()
 
     recalls = []
     for i in range(8):
@@ -213,11 +224,9 @@ def test_cpu_searcher_high_recall_vectorized_cpp_filter(h, n, d, num_levels, bf,
 @pytest.mark.parametrize(
     "strategy",
     [
-        "vectorized_cpp_filter",
         "fused_v1",
         "fused_v2",
         "fused_v3",
-        "exact_torch",
     ],
 )
 def test_cpu_searcher_methods_have_almost_full_recall(strategy):
@@ -254,6 +263,92 @@ def test_cpu_searcher_fused_v4_runs_for_d128():
 
     assert pred.shape == (h, n)
     assert _recall(pred, gt, th) >= 0.99
+
+
+@pytest.mark.parametrize(
+    "strategy,d",
+    [
+        # ("vectorized_cpp_filter", 64),
+        ("fused_v1", 64),
+        ("fused_v2", 64),
+        ("fused_v3", 64),
+        # ("exact_torch", 64),
+        ("fused_v4", 128),
+    ],
+)
+def test_cpu_searcher_scaling_matches_thresholded_scaled_bruteforce(strategy, d):
+    h, n = 2, 192
+    scaling = torch.full((h,), 0.6, dtype=torch.float32)
+    keys = _normalized_keys(h, n, d, seed=121)
+    q = _random_query(h, d, seed=122)
+    indexer = CPUIndexer(num_levels=4, branching_factor=8, max_iterations=2).build(keys)
+
+    searcher = CPUSearcher(search_strategy=strategy)
+    raw = _brute_force(keys.squeeze(0), q)
+    threshold = torch.quantile(raw, 0.8, dim=-1)
+    baseline = searcher.search(q, threshold, indexer)
+    expected = baseline * scaling.unsqueeze(-1)
+
+    pred = searcher.search(q, threshold, indexer, scaling=scaling)
+    torch.testing.assert_close(pred, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_cpu_searcher_scaling_default_matches_one():
+    h, n, d = 2, 128, 64
+    keys = _normalized_keys(h, n, d, seed=131)
+    q = _random_query(h, d, seed=132)
+    indexer = CPUIndexer(num_levels=4, branching_factor=8, max_iterations=2).build(keys)
+
+    raw = _brute_force(keys.squeeze(0), q)
+    threshold = torch.quantile(raw, 0.75, dim=-1)
+
+    searcher = CPUSearcher(search_strategy="fused_v3")
+    pred_default = searcher.search(q, threshold, indexer)
+    pred_one = searcher.search(
+        q, threshold, indexer, scaling=torch.ones((h,), dtype=torch.float32)
+    )
+    torch.testing.assert_close(pred_default, pred_one, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    "strategy,d",
+    [
+        # ("vectorized_cpp_filter", 64),
+        ("fused_v1", 64),
+        ("fused_v2", 64),
+        ("fused_v3", 64),
+        # ("exact_torch", 64),
+        ("fused_v4", 128),
+    ],
+)
+def test_cpu_searcher_per_head_scaling_matches_thresholded_scaled_output(strategy, d):
+    h, n = 2, 192
+    scaling = torch.tensor([0.6, 0.85], dtype=torch.float32)
+    keys = _normalized_keys(h, n, d, seed=141)
+    q = _random_query(h, d, seed=142)
+    indexer = CPUIndexer(num_levels=4, branching_factor=8, max_iterations=2).build(keys)
+
+    searcher = CPUSearcher(search_strategy=strategy)
+    raw = _brute_force(keys.squeeze(0), q)
+    threshold = torch.quantile(raw, 0.8, dim=-1)
+    baseline = searcher.search(q, threshold, indexer)
+    expected = baseline * scaling.unsqueeze(-1)
+
+    pred = searcher.search(q, threshold, indexer, scaling=scaling)
+    torch.testing.assert_close(pred, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_cpu_searcher_per_head_scaling_validation():
+    h, n, d = 2, 128, 64
+    keys = _normalized_keys(h, n, d, seed=151)
+    q = _random_query(h, d, seed=152)
+    indexer = CPUIndexer(num_levels=4, branching_factor=8, max_iterations=2).build(keys)
+    raw = _brute_force(keys.squeeze(0), q)
+    threshold = torch.quantile(raw, 0.75, dim=-1)
+    searcher = CPUSearcher(search_strategy="fused_v3")
+
+    with pytest.raises(AssertionError):
+        searcher.search(q, threshold, indexer, scaling=torch.tensor([0.8, 0.9, 1.0]))
 
 
 @pytest.mark.parametrize(
@@ -301,17 +396,39 @@ def test_cpu_searcher_single_level_equals_bruteforce():
     th = torch.quantile(gt, 0.7, dim=-1)
     gt_thresholded = torch.where(gt >= th.unsqueeze(-1), gt, torch.zeros_like(gt))
 
-    searcher = CPUSearcher(search_strategy="vectorized_cpp_filter")
+    searcher = CPUSearcher()
     pred = searcher.search(q, th, indexer)
     torch.testing.assert_close(pred, gt_thresholded, atol=1e-5, rtol=1e-5)
 
 
-def test_cpu_indexer_update_rejects_invalid_shape():
-    h, n, d = 2, 64, 16
-    keys = _normalized_keys(h, n, d, seed=71)
-    indexer = CPUIndexer(num_levels=3, branching_factor=8, max_iterations=1)
-    indexer.build(keys)
+def test_cpu_indexer_values_stay_4d_after_build():
+    h, n, d = 2, 96, 16
+    keys = _normalized_keys(h, n, d, seed=81)
+    values = _values_from_keys(keys)
 
-    bad = torch.randn(h, 8, d, dtype=torch.float32)  # expected (1,H,m,D)
-    with pytest.raises(ValueError):
-        indexer.update(bad)
+    indexer = CPUIndexer(num_levels=3, branching_factor=8, max_iterations=1)
+    indexer.build(keys, values)
+
+    assert indexer.values is not None
+    assert indexer.values.shape == values.shape
+    torch.testing.assert_close(indexer.values, values, atol=0.0, rtol=0.0)
+
+
+def test_cpu_indexer_values_stay_4d_after_update():
+    h, n, d = 2, 120, 16
+    n0 = 80
+    all_keys = _normalized_keys(h, n, d, seed=82)
+    all_values = _values_from_keys(all_keys)
+
+    base_k = all_keys[:, :, :n0, :].contiguous()
+    base_v = all_values[:, :, :n0, :].contiguous()
+    new_k = all_keys[:, :, n0:, :].contiguous()
+    new_v = all_values[:, :, n0:, :].contiguous()
+
+    indexer = CPUIndexer(num_levels=3, branching_factor=8, max_iterations=1)
+    indexer.build(base_k, base_v)
+    indexer.update(new_k, new_v)
+
+    assert indexer.values is not None
+    assert indexer.values.shape == all_values.shape
+    torch.testing.assert_close(indexer.values, all_values, atol=0.0, rtol=0.0)

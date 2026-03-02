@@ -2,5 +2,5 @@ from abc import ABC
 
 
 class BaseSearcher(ABC):
-    def search(self, query, threshold, indexer):
+    def search(self, query, threshold, indexer, scaling=None):
         raise NotImplementedError

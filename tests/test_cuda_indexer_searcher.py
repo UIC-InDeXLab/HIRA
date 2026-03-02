@@ -43,6 +43,11 @@ def _random_query(h: int, d: int, seed: int) -> torch.Tensor:
     return q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
+def _values_from_keys(keys_1hnd: torch.Tensor) -> torch.Tensor:
+    x = keys_1hnd.float()
+    return (x * 0.5 + 0.25).contiguous()
+
+
 def _choose_block_c(branching_factor: int) -> int:
     for c in (16, 8, 4, 2, 1):
         if c <= branching_factor and branching_factor % c == 0:
@@ -52,6 +57,28 @@ def _choose_block_c(branching_factor: int) -> int:
 
 def _valid_rows(children: torch.Tensor, pad_value: float) -> torch.Tensor:
     return ~torch.all(children == float(pad_value), dim=-1)
+
+
+def _assert_values_follow_children(indexer: CUDAIndexer) -> None:
+    assert indexer.children is not None
+    assert indexer.values is not None
+
+    expected_values = _values_from_keys(indexer.children.unsqueeze(0))
+    valid_rows = _valid_rows(indexer.children, indexer.pad_value)
+    valid_mask = valid_rows.unsqueeze(0).unsqueeze(-1).expand_as(indexer.values)
+
+    torch.testing.assert_close(
+        indexer.values[valid_mask], expected_values[valid_mask], atol=1e-6, rtol=0.0
+    )
+
+    invalid_mask = ~valid_mask
+    if invalid_mask.any():
+        torch.testing.assert_close(
+            indexer.values[invalid_mask],
+            torch.zeros_like(indexer.values[invalid_mask]),
+            atol=0.0,
+            rtol=0.0,
+        )
 
 
 def _brute_force_children_scores(children: torch.Tensor, query_1h1d: torch.Tensor):
@@ -132,9 +159,6 @@ def test_cuda_indexer_build_structure_and_relationships(h, n, d, depth, bf, seed
     assert indexer.children.shape == (h, children_n, d)
     assert indexer.parents.shape == (h, expected_parent_n, d)
     assert indexer.parent_radii.shape == (h, expected_parent_n)
-    assert indexer.buffer is not None
-    assert indexer.buffer.is_cuda
-    assert indexer.buffer.shape == (h, children_n)
 
     valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
     assert int(valid.sum().item()) == h * n
@@ -291,7 +315,8 @@ def test_cuda_searcher_query_layouts_match():
     th = _per_head_quantile_threshold(gt, valid, q=0.7)
 
     searcher = CUDASearcher(block_c=_choose_block_c(bf))
-    out_4d = searcher.search(q, th, indexer)
+    # CUDASearcher may reuse an internal output buffer across calls.
+    out_4d = searcher.search(q, th, indexer).clone()
     out_2d = searcher.search(q.squeeze(0).squeeze(-2).contiguous(), th, indexer)
     assert out_4d.is_cuda
     assert out_2d.is_cuda
@@ -321,6 +346,119 @@ def test_cuda_searcher_low_threshold_matches_bruteforce_on_valid_rows():
     assert pred.is_cuda
 
     expected = torch.where(valid, gt, torch.zeros_like(gt))
+    torch.testing.assert_close(
+        torch.where(valid, pred, torch.zeros_like(pred)),
+        expected,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.parametrize(
+    "depth,n,d,bf,seed",
+    [
+        (CUDAIndexer.DEPTH.TWO_LEVELS, 257, 32, 8, 53),
+        (CUDAIndexer.DEPTH.THREE_LEVELS, 513, 64, 8, 54),
+    ],
+)
+def test_cuda_searcher_scaling_low_threshold_scales_scores(depth, n, d, bf, seed):
+    h = 2
+    scaling = torch.full((h,), 0.65, device="cuda", dtype=torch.float32)
+    keys = _normalized_keys(h, n, d, seed=seed)
+    indexer = CUDAIndexer(
+        num_levels=depth,
+        branching_factor=bf,
+        max_iterations=2,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+    q = _random_query(h, d, seed=seed + 1)
+    gt = _brute_force_children_scores(indexer.children, q)
+    threshold = torch.full((h,), -2.0, device="cuda", dtype=torch.float32)
+
+    searcher = CUDASearcher(block_c=_choose_block_c(bf))
+    pred = searcher.search(q, threshold, indexer, scaling=scaling)
+
+    expected = torch.where(valid, gt * scaling.unsqueeze(-1), torch.zeros_like(gt))
+    torch.testing.assert_close(
+        torch.where(valid, pred, torch.zeros_like(pred)),
+        expected,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.parametrize(
+    "depth,n,d,bf,seed",
+    [
+        (CUDAIndexer.DEPTH.TWO_LEVELS, 257, 32, 8, 57),
+        (CUDAIndexer.DEPTH.THREE_LEVELS, 513, 64, 8, 58),
+    ],
+)
+def test_cuda_searcher_scaling_does_not_change_thresholding(depth, n, d, bf, seed):
+    h = 2
+    scaling = torch.full((h,), 0.65, device="cuda", dtype=torch.float32)
+    keys = _normalized_keys(h, n, d, seed=seed)
+    indexer = CUDAIndexer(
+        num_levels=depth,
+        branching_factor=bf,
+        max_iterations=2,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+    q = _random_query(h, d, seed=seed + 1)
+    gt = _brute_force_children_scores(indexer.children, q)
+    threshold = _per_head_quantile_threshold(gt, valid, q=0.75)
+
+    searcher = CUDASearcher(block_c=_choose_block_c(bf))
+    # CUDASearcher may reuse an internal output buffer across calls.
+    baseline = searcher.search(q, threshold, indexer).clone()
+    pred = searcher.search(q, threshold, indexer, scaling=scaling)
+
+    baseline_mask = (baseline != 0) & valid
+    pred_mask = (pred != 0) & valid
+    assert torch.equal(pred_mask, baseline_mask)
+    expected_scaled = baseline * scaling.unsqueeze(-1)
+    torch.testing.assert_close(
+        pred[baseline_mask],
+        expected_scaled[baseline_mask],
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.parametrize(
+    "depth,n,d,bf,seed",
+    [
+        (CUDAIndexer.DEPTH.TWO_LEVELS, 257, 32, 8, 59),
+        (CUDAIndexer.DEPTH.THREE_LEVELS, 513, 64, 8, 60),
+    ],
+)
+def test_cuda_searcher_per_head_scaling_scales_per_query_head(depth, n, d, bf, seed):
+    h = 2
+    scaling = torch.tensor([0.65, 0.9], device="cuda", dtype=torch.float32)
+    keys = _normalized_keys(h, n, d, seed=seed)
+    indexer = CUDAIndexer(
+        num_levels=depth,
+        branching_factor=bf,
+        max_iterations=2,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+    q = _random_query(h, d, seed=seed + 1)
+    gt = _brute_force_children_scores(indexer.children, q)
+    threshold = torch.full((h,), -2.0, device="cuda", dtype=torch.float32)
+
+    searcher = CUDASearcher(block_c=_choose_block_c(bf))
+    pred = searcher.search(q, threshold, indexer, scaling=scaling)
+
+    expected = torch.where(valid, gt * scaling.unsqueeze(-1), torch.zeros_like(gt))
     torch.testing.assert_close(
         torch.where(valid, pred, torch.zeros_like(pred)),
         expected,
@@ -394,6 +532,65 @@ def test_cuda_searcher_supports_explicit_query_to_kv_mapping():
     )
 
 
+@pytest.mark.parametrize(
+    "depth,bf,seed",
+    [
+        (CUDAIndexer.DEPTH.TWO_LEVELS, 8, 111),
+        (CUDAIndexer.DEPTH.THREE_LEVELS, 8, 112),
+    ],
+)
+def test_cuda_indexer_build_reorders_values_with_children(depth, bf, seed):
+    h, n, d = 2, 257, 32
+    keys = _normalized_keys(h, n, d, seed=seed)
+    values = _values_from_keys(keys)
+    indexer = CUDAIndexer(
+        num_levels=depth,
+        branching_factor=bf,
+        max_iterations=2,
+        pad_value=0.0,
+    ).build(keys, values)
+
+    assert indexer.children is not None
+    assert indexer.values is not None
+    assert indexer.values.shape[:3] == (
+        1,
+        indexer.children.shape[0],
+        indexer.children.shape[1],
+    )
+    _assert_values_follow_children(indexer)
+
+
+@pytest.mark.parametrize(
+    "depth,bf,seed",
+    [
+        (CUDAIndexer.DEPTH.TWO_LEVELS, 8, 121),
+        (CUDAIndexer.DEPTH.THREE_LEVELS, 8, 122),
+    ],
+)
+def test_cuda_indexer_update_reorders_values_with_children(depth, bf, seed):
+    h, n, d = 2, 320, 32
+    n0 = int(n * 0.65)
+    all_keys = _normalized_keys(h, n, d, seed=seed)
+    all_values = _values_from_keys(all_keys)
+
+    keys_base = all_keys[:, :, :n0, :].contiguous()
+    vals_base = all_values[:, :, :n0, :].contiguous()
+    keys_new = all_keys[:, :, n0:, :].contiguous()
+    vals_new = all_values[:, :, n0:, :].contiguous()
+
+    indexer = CUDAIndexer(
+        num_levels=depth,
+        branching_factor=bf,
+        max_iterations=2,
+        pad_value=0.0,
+    ).build(keys_base, vals_base)
+    indexer.update(keys_new, vals_new)
+
+    assert indexer.children is not None
+    assert indexer.values is not None
+    _assert_values_follow_children(indexer)
+
+
 def test_cuda_indexer_update_rejects_invalid_shape():
     h, n, d, bf = 2, 128, 32, 8
     keys = _normalized_keys(h, n, d, seed=61)
@@ -406,5 +603,5 @@ def test_cuda_indexer_update_rejects_invalid_shape():
     ).build(keys)
 
     bad = torch.randn(2, h, 7, d, device="cuda", dtype=torch.float32)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         indexer.update(bad)

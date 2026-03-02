@@ -18,9 +18,7 @@ if str(HIRA_ROOT) not in sys.path:
 
 from indexer.cuda import CUDAIndexer
 from hira.kernels.triton_search_wrappers import (
-    triton_three_level_filter_kernel_v1,
-    triton_three_level_filter_kernel_v2,
-    triton_three_level_filter_v1,
+    triton_three_level_filter,
     triton_two_level_filter,
 )
 
@@ -242,7 +240,99 @@ def test_triton_two_level_filter_writes_to_provided_output_buffer():
     assert out.is_cuda
 
 
-def test_triton_three_level_variants_match_each_other_and_bruteforce():
+def test_triton_two_level_filter_scaling_low_threshold_scales_scores():
+    h, n, d, bf = 2, 257, 64, 8
+    scaling = torch.tensor([0.6, 0.85], device="cuda", dtype=torch.float32)
+    keys = _normalized_keys(h, n, d, seed=33)
+    indexer = CUDAIndexer(
+        num_levels=CUDAIndexer.DEPTH.TWO_LEVELS,
+        max_iterations=2,
+        branching_factor=bf,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    assert indexer.parents is not None
+    assert indexer.parent_radii is not None
+
+    q = _random_query(h, d, seed=34)
+    valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+    gt = _bruteforce_children_scores(indexer.children, q)
+    threshold = torch.full((h,), -2.0, device="cuda", dtype=torch.float32)
+
+    out = triton_two_level_filter(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        q,
+        threshold,
+        branch=bf,
+        BLOCK_C=_choose_block_c(bf),
+        scaling=scaling,
+    )
+
+    expected = torch.where(valid, gt * scaling.unsqueeze(-1), torch.zeros_like(gt))
+    torch.testing.assert_close(
+        torch.where(valid, out, torch.zeros_like(out)),
+        expected,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+def test_triton_two_level_filter_scaling_does_not_change_thresholding():
+    h, n, d, bf = 2, 257, 64, 8
+    scaling = torch.tensor([0.6, 0.9], device="cuda", dtype=torch.float32)
+    keys = _normalized_keys(h, n, d, seed=35)
+    indexer = CUDAIndexer(
+        num_levels=CUDAIndexer.DEPTH.TWO_LEVELS,
+        max_iterations=2,
+        branching_factor=bf,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    assert indexer.parents is not None
+    assert indexer.parent_radii is not None
+    q = _random_query(h, d, seed=36)
+    valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+    gt = _bruteforce_children_scores(indexer.children, q)
+    threshold = _per_head_quantile_threshold(gt, valid, q=0.75)
+    block_c = _choose_block_c(bf)
+
+    baseline = triton_two_level_filter(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        q,
+        threshold,
+        branch=bf,
+        BLOCK_C=block_c,
+    )
+    out = triton_two_level_filter(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        q,
+        threshold,
+        branch=bf,
+        BLOCK_C=block_c,
+        scaling=scaling,
+    )
+
+    baseline_mask = (baseline != 0) & valid
+    out_mask = (out != 0) & valid
+    assert torch.equal(out_mask, baseline_mask)
+    expected_scaled = baseline * scaling.unsqueeze(-1)
+    torch.testing.assert_close(
+        out[baseline_mask],
+        expected_scaled[baseline_mask],
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+def test_triton_three_level_filter_high_recall_against_bruteforce():
     h, n, d, bf = 3, 769, 64, 8
     keys = _normalized_keys(h, n, d, seed=41)
     assert keys.is_cuda
@@ -272,29 +362,7 @@ def test_triton_three_level_variants_match_each_other_and_bruteforce():
     assert th.is_cuda
     block_c = _choose_block_c(bf)
 
-    out_wrapper = triton_three_level_filter_v1(
-        indexer.children,
-        indexer.parents,
-        indexer.parent_radii,
-        indexer.grand_parents,
-        indexer.grand_parent_radii,
-        q,
-        th,
-        branch=bf,
-        BLOCK_C=block_c,
-    )
-    out_k1 = triton_three_level_filter_kernel_v1(
-        indexer.children,
-        indexer.parents,
-        indexer.parent_radii,
-        indexer.grand_parents,
-        indexer.grand_parent_radii,
-        q,
-        th,
-        branch=bf,
-        BLOCK_C=block_c,
-    )
-    out_k2 = triton_three_level_filter_kernel_v2(
+    out = triton_three_level_filter(
         indexer.children,
         indexer.parents,
         indexer.parent_radii,
@@ -306,15 +374,111 @@ def test_triton_three_level_variants_match_each_other_and_bruteforce():
         BLOCK_C=block_c,
     )
 
-    assert out_wrapper.is_cuda
-    assert out_k1.is_cuda
-    assert out_k2.is_cuda
-    assert _recall(out_wrapper, gt, th, valid) >= 0.99
-    assert _recall(out_k1, gt, th, valid) >= 0.99
-    assert _recall(out_k2, gt, th, valid) >= 0.99
+    assert out.is_cuda
+    assert _recall(out, gt, th, valid) >= 0.99
 
-    torch.testing.assert_close(out_k1, out_k2, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(out_wrapper, out_k1, atol=1e-4, rtol=1e-4)
+
+def test_triton_three_level_filter_scaling_low_threshold_scales_scores():
+    h, n, d, bf = 2, 769, 64, 8
+    scaling = torch.tensor([0.7, 0.95], device="cuda", dtype=torch.float32)
+    keys = _normalized_keys(h, n, d, seed=43)
+    indexer = CUDAIndexer(
+        num_levels=CUDAIndexer.DEPTH.THREE_LEVELS,
+        max_iterations=2,
+        branching_factor=bf,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    assert indexer.parents is not None
+    assert indexer.parent_radii is not None
+    assert indexer.grand_parents is not None
+    assert indexer.grand_parent_radii is not None
+
+    q = _random_query(h, d, seed=44)
+    valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+    gt = _bruteforce_children_scores(indexer.children, q)
+    threshold = torch.full((h,), -2.0, device="cuda", dtype=torch.float32)
+    block_c = _choose_block_c(bf)
+
+    out = triton_three_level_filter(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        indexer.grand_parents,
+        indexer.grand_parent_radii,
+        q,
+        threshold,
+        branch=bf,
+        BLOCK_C=block_c,
+        scaling=scaling,
+    )
+
+    expected = torch.where(valid, gt * scaling.unsqueeze(-1), torch.zeros_like(gt))
+    torch.testing.assert_close(
+        torch.where(valid, out, torch.zeros_like(out)),
+        expected,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+def test_triton_three_level_filter_scaling_does_not_change_thresholding():
+    h, n, d, bf = 2, 769, 64, 8
+    scaling = torch.tensor([0.7, 0.9], device="cuda", dtype=torch.float32)
+    keys = _normalized_keys(h, n, d, seed=45)
+    indexer = CUDAIndexer(
+        num_levels=CUDAIndexer.DEPTH.THREE_LEVELS,
+        max_iterations=2,
+        branching_factor=bf,
+        pad_value=0.0,
+    ).build(keys)
+
+    assert indexer.children is not None
+    assert indexer.parents is not None
+    assert indexer.parent_radii is not None
+    assert indexer.grand_parents is not None
+    assert indexer.grand_parent_radii is not None
+    q = _random_query(h, d, seed=46)
+    valid = _valid_rows(indexer.children, pad_value=indexer.pad_value)
+    gt = _bruteforce_children_scores(indexer.children, q)
+    threshold = _per_head_quantile_threshold(gt, valid, q=0.75)
+    block_c = _choose_block_c(bf)
+
+    baseline = triton_three_level_filter(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        indexer.grand_parents,
+        indexer.grand_parent_radii,
+        q,
+        threshold,
+        branch=bf,
+        BLOCK_C=block_c,
+    )
+    out = triton_three_level_filter(
+        indexer.children,
+        indexer.parents,
+        indexer.parent_radii,
+        indexer.grand_parents,
+        indexer.grand_parent_radii,
+        q,
+        threshold,
+        branch=bf,
+        BLOCK_C=block_c,
+        scaling=scaling,
+    )
+
+    baseline_mask = (baseline != 0) & valid
+    out_mask = (out != 0) & valid
+    assert torch.equal(out_mask, baseline_mask)
+    expected_scaled = baseline * scaling.unsqueeze(-1)
+    torch.testing.assert_close(
+        out[baseline_mask],
+        expected_scaled[baseline_mask],
+        atol=1e-4,
+        rtol=1e-4,
+    )
 
 
 @pytest.mark.parametrize(
@@ -364,18 +528,7 @@ def test_triton_kernels_support_grouped_attention(depth, d, seed):
 
     assert indexer.grand_parents is not None
     assert indexer.grand_parent_radii is not None
-    out_k1 = triton_three_level_filter_kernel_v1(
-        indexer.children,
-        indexer.parents,
-        indexer.parent_radii,
-        indexer.grand_parents,
-        indexer.grand_parent_radii,
-        q,
-        th,
-        branch=bf,
-        BLOCK_C=block_c,
-    )
-    out_k2 = triton_three_level_filter_kernel_v2(
+    out = triton_three_level_filter(
         indexer.children,
         indexer.parents,
         indexer.parent_radii,
@@ -387,11 +540,8 @@ def test_triton_kernels_support_grouped_attention(depth, d, seed):
         BLOCK_C=block_c,
     )
 
-    assert out_k1.shape == gt.shape
-    assert out_k2.shape == gt.shape
-    assert _recall(out_k1, gt, th, valid_q) >= 0.99
-    assert _recall(out_k2, gt, th, valid_q) >= 0.99
-    torch.testing.assert_close(out_k1, out_k2, atol=1e-4, rtol=1e-4)
+    assert out.shape == gt.shape
+    assert _recall(out, gt, th, valid_q) >= 0.99
 
 
 def test_triton_two_level_filter_validates_inputs():

@@ -1,11 +1,29 @@
 import torch
+from dataclasses import dataclass
 from transformers.cache_utils import Cache, CacheLayerMixin
 from transformers.configuration_utils import PreTrainedConfig
 from typing import Any
 
 from hira.cache.hira_config import HiraConfig
 from hira.cache.hira_config import DeviceMode
-from hira.index.indexer import CPUIndexer, CUDAIndexer
+from hira.indexer import CPUIndexer, CUDAIndexer
+from hira.searcher import CPUSearcher, CUDASearcher
+
+"""
+Tasks:
+    - [x] Update every, keep a local list of keys.
+    - [ ] Implement threshold finding.
+"""
+
+
+@dataclass
+class CacheOutput:
+    queued_keys: torch.Tensor
+    queued_values: torch.Tensor
+    prefill_keys: torch.Tensor | None
+    prefill_values: torch.Tensor | None
+    indexer: CPUIndexer | CUDAIndexer
+    searcher: CPUSearcher | CUDASearcher
 
 
 class HiraCacheLayer(CacheLayerMixin):
@@ -24,16 +42,27 @@ class HiraCacheLayer(CacheLayerMixin):
         : H_kv = 8
     """
 
-    def __init__(self, device_mode: DeviceMode, indexer_kwargs: dict[str, Any]):
+    def __init__(
+        self,
+        device_mode: DeviceMode,
+        update_every: int,
+        indexer_kwargs: dict[str, Any],
+        searcher_kwargs: dict[str, Any],
+    ):
         super().__init__()
         self.device_mode = device_mode
+        self.update_every = update_every
         self.indexer_kwargs = indexer_kwargs
+        self.searcher_kwargs = searcher_kwargs
 
         self.indexer_cls = None
+        self.searcher_cls = None
         if self.device_mode == DeviceMode.CPU_ONLY:
             self.indexer_cls = CPUIndexer
+            self.searcher_cls = CPUSearcher
         elif self.device_mode == DeviceMode.CUDA_ONLY:
             self.indexer_cls = CUDAIndexer
+            self.searcher_cls = CUDASearcher
         else:
             raise NotImplementedError(
                 f"Device mode {self.device_mode} not supported yet"
@@ -44,27 +73,84 @@ class HiraCacheLayer(CacheLayerMixin):
         # this is called once after prefilling
         self.dim = key_states.shape[-1]
         self.H_kv = key_states.shape[-3]
+        self.dtype = key_states.dtype
+        self.device = key_states.device
 
-        # create indexers
+        # create indexer and searcher
         self.indexer = self.indexer_cls(**self.indexer_kwargs)
-
-        self.values = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.searcher = self.searcher_cls(**self.searcher_kwargs)
+        # queued key/values
+        self.queued_keys = torch.empty(
+            (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
+        )
+        self.queued_values = torch.empty(
+            (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
+        )
+        self.queued_len = 0
+        # place holders
         self.keys = None  # no self.keys, just indexer
+        self.values = None  # no self.values, just indexer
 
         self.is_initialized = True
 
-    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, **kwargs):
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cache_kwargs: dict[str, Any] | None = None,
+    ):
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
-            # build
-            self.indexer.build(key_states)
-        else:
-            # update
-            self.indexer.update(key_states)
-        # concat
-        self.values = torch.cat([self.values, value_states], dim=1)
 
-        return self.indexer, self.values
+            self.indexer.build(key_states, value_states)
+            self.indexed_len = key_states.shape[-2]
+
+            # prefill step
+            return (
+                CacheOutput(
+                    queued_keys=self.queued_keys,
+                    queued_values=self.queued_values,
+                    prefill_keys=key_states,
+                    prefill_values=value_states,
+                    indexer=self.indexer,
+                    searcher=self.searcher,
+                ),
+                None,
+            )
+
+        # concat
+        self.queued_keys = torch.cat([self.queued_keys, key_states], dim=-2)
+        self.queued_values = torch.cat([self.queued_values, value_states], dim=-2)
+        self.queued_len += key_states.shape[-2]
+
+        # periodic update
+        if self.queued_len >= self.update_every:
+            self.update_index()
+
+        return (
+            CacheOutput(
+                queued_keys=self.queued_keys,
+                queued_values=self.queued_values,
+                prefill_keys=None,
+                prefill_values=None,
+                indexer=self.indexer,
+                searcher=self.searcher,
+            ),
+            None,
+        )  # backward compatibility
+
+    def update_index(self):
+        # append keys to index
+        self.indexer.update(self.queued_keys, self.queued_values)
+        # empty queues
+        self.queued_keys = torch.empty(
+            (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
+        )
+        self.queued_values = torch.empty(
+            (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
+        )
+        self.indexed_len += self.queued_len
+        self.queued_len = 0
 
     def get_mask_sizes(self, cache_position):
         kv_offset = 0
@@ -74,9 +160,9 @@ class HiraCacheLayer(CacheLayerMixin):
 
     def get_seq_length(self):
         """Returns the sequence length of the cached states."""
-        if not self.is_initialized or self.values.numel() == 0:
+        if not self.is_initialized:
             return 0
-        return self.values.shape[-2]
+        return self.indexed_len + self.queued_len
 
     def get_max_cache_shape(self):
         return -1
@@ -85,13 +171,20 @@ class HiraCacheLayer(CacheLayerMixin):
         """Resets the cache values while preserving the objects"""
         if self.is_initialized:
             self.indexer = self.indexer_cls(**self.indexer_kwargs)
-            self.values.zero_()
+            self.queued_keys = torch.empty(
+                (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
+            )
+            self.queued_values = torch.empty(
+                (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
+            )
+            self.queued_len = 0
+            self.is_initialized = False
         # This attribute is set on several Layers
         if hasattr(self, "cumulative_length"):
             self.cumulative_length = 0
 
 
-class HiraIndex(Cache):
+class HiraCache(Cache):
     """
     Implements HuggingFace's Cache interface for HIRA index.
     """
@@ -100,12 +193,11 @@ class HiraIndex(Cache):
         self,
         cache_config: PreTrainedConfig,
         hira_config: HiraConfig,
-        num_layers: int,
     ):
         self.device_mode = hira_config.device_mode
         self.update_every = hira_config.update_every
 
-        # extract num layers [COPIED CODE]
+        # extract num layers [COPIED CODE from 'transformers']
         config = cache_config.get_text_config(decoder=True)
         layer_types = getattr(config, "layer_types", None)
         # If `layer_types` is not explicitly provided, infer if the model is fully sliding
@@ -128,17 +220,18 @@ class HiraIndex(Cache):
 
         # build layers
         layers = []
-        for _ in range(num_layers):
+        for _ in layer_types:
             # treating all layer types the same
             layer = HiraCacheLayer(
                 device_mode=self.device_mode,
+                update_every=self.update_every,
                 indexer_kwargs=hira_config.get_indexer_kwargs(),
+                searcher_kwargs=hira_config.get_searcher_kwargs(),
             )
             layers.append(layer)
 
         super().__init__(
             layers=layers,
-            layer_class_to_replicate=HiraCacheLayer,
             offloading=False,  # handle manually
             offload_only_non_sliding=None,
         )
@@ -150,7 +243,7 @@ class HiraIndex(Cache):
         layer_idx: int,
         cache_kwargs: dict[str, Any] | None = None,
     ):
-        indexer, values = self.layers[layer_idx].update(
+        cache_output, _ = self.layers[layer_idx].update(
             key_states, value_states, cache_kwargs
         )
-        return indexer, values
+        return cache_output, None
