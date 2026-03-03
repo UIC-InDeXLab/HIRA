@@ -1,13 +1,18 @@
+from __future__ import annotations
+
 import torch
 from dataclasses import dataclass
 from transformers.cache_utils import Cache, CacheLayerMixin
 from transformers.configuration_utils import PreTrainedConfig
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from hira.cache.hira_config import HiraConfig
 from hira.cache.hira_config import DeviceMode
 from hira.indexer import CPUIndexer, CUDAIndexer
-from hira.searcher import CPUSearcher, CUDASearcher
+
+if TYPE_CHECKING:
+    from hira.searcher.cpu import CPUSearcher
+    from hira.searcher.cuda import CUDASearcher
 
 """
 Tasks:
@@ -58,9 +63,13 @@ class HiraCacheLayer(CacheLayerMixin):
         self.indexer_cls = None
         self.searcher_cls = None
         if self.device_mode == DeviceMode.CPU_ONLY:
+            from hira.searcher.cpu import CPUSearcher
+
             self.indexer_cls = CPUIndexer
             self.searcher_cls = CPUSearcher
         elif self.device_mode == DeviceMode.CUDA_ONLY:
+            from hira.searcher.cuda import CUDASearcher
+
             self.indexer_cls = CUDAIndexer
             self.searcher_cls = CUDASearcher
         else:
@@ -80,6 +89,7 @@ class HiraCacheLayer(CacheLayerMixin):
         self.indexer = self.indexer_cls(**self.indexer_kwargs)
         self.searcher = self.searcher_cls(**self.searcher_kwargs)
         # queued key/values
+        # TODO: create buffers of size self.update_every
         self.queued_keys = torch.empty(
             (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
         )
