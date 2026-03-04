@@ -108,7 +108,7 @@ def test_hira_cache_layer_prefill_update_initializes_and_returns_cache_output():
 
     assert layer.is_initialized
     assert layer.indexed_len == 3
-    assert layer.queued_len == 0
+    assert layer.q_len == 0
     assert layer.get_seq_length() == 3
     assert layer.get_max_cache_shape() == -1
     # assert len(layer.indexer.build_calls) == 1
@@ -130,7 +130,7 @@ def test_hira_cache_layer_decode_update_returns_backward_compat_tuple():
     assert out.prefill_values is None
     torch.testing.assert_close(out.queued_keys, k1, atol=0.0, rtol=0.0)
     torch.testing.assert_close(out.queued_values, v1, atol=0.0, rtol=0.0)
-    assert layer.queued_len == 1
+    assert layer.q_len == 1
     assert layer.indexed_len == 2
     assert layer.get_seq_length() == 3
 
@@ -142,24 +142,17 @@ def test_hira_cache_layer_periodic_flush_updates_indexer_and_clears_queue():
 
     k1, v1 = _make_kv(h=2, l=1, d=8, seed=5)
     out1, _ = layer.update(k1, v1)
-    assert out1.queued_keys.shape == (1, 2, 1, 8)
-    assert layer.queued_len == 1
+    assert out1.queued_keys[:, : layer.q_len, :].shape == (2, 1, 8)
+    assert layer.q_len == 1
 
     k2, v2 = _make_kv(h=2, l=2, d=8, seed=6)
     out2, _ = layer.update(k2, v2)
 
-    expected_queued_keys = torch.cat([k1, k2], dim=-2)
     expected_queued_values = torch.cat([v1, v2], dim=-2)
-    # assert len(layer.indexer.update_calls) == 1
-    # update_keys, update_values = layer.indexer.update_calls[0]
-    # torch.testing.assert_close(update_keys, expected_queued_keys, atol=0.0, rtol=0.0)
-    # torch.testing.assert_close(
-        # update_values, expected_queued_values, atol=0.0, rtol=0.0
-    # )
 
-    assert out2.queued_keys.shape == (1, 2, 0, 8)
-    assert out2.queued_values.shape == (1, 2, 0, 8)
-    assert layer.queued_len == 0
+    assert out2.queued_keys[:, : layer.q_len, :].shape == (2, 0, 8)
+    assert out2.queued_values[:, : layer.q_len, :].shape == (2, 0, 8)
+    assert layer.q_len == 0
     assert layer.indexed_len == 5
     assert layer.get_seq_length() == 5
 
@@ -198,9 +191,9 @@ def test_hira_cache_layer_reset_reinitializes_runtime_state():
 
     assert not layer.is_initialized
     assert layer.indexer is not old_indexer
-    assert layer.queued_len == 0
-    assert layer.queued_keys.shape == (1, 2, 0, 8)
-    assert layer.queued_values.shape == (1, 2, 0, 8)
+    assert layer.q_len == 0
+    assert layer.queued_keys[:, : layer.q_len, :].shape == (2, 0, 8)
+    assert layer.queued_values[:, : layer.q_len, :].shape == (2, 0, 8)
     assert layer.get_seq_length() == 0
     assert layer.cumulative_length == 0
 

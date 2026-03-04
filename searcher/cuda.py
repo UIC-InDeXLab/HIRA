@@ -78,14 +78,16 @@ class CUDASearcher(BaseSearcher):
             query:     ``(1, H, 1, D)`` query tensor.
             threshold: ``(H,)`` per-head threshold tensor.
             scaling:   Optional ``(H,)`` per-head scaling tensor for returned scores.
-            indexer:   Built :class:`CPUIndexer` (all tensors ``(H, …)``).
+        Returns:
+            ``(H_q, N)`` float tensor -- dot-product scores for qualifying
+            keys, ``output_fill_value`` for pruned / below-threshold keys.
         """
         if indexer.children is None:
             raise ValueError("Indexer is not built: missing children tensor.")
         num_kv_heads = int(indexer.children.shape[0])
         num_keys = int(indexer.children.shape[1])
 
-        query = query.squeeze(0).squeeze(-2).contiguous()
+        # query = query.squeeze(0).squeeze(-2).contiguous()
         num_query_heads = int(query.shape[0])
 
         assert threshold.shape == (

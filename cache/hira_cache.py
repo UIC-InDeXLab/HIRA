@@ -21,10 +21,11 @@ Tasks:
 """
 
 
-@dataclass
+@dataclass(slots=True)
 class CacheOutput:
     queued_keys: torch.Tensor
     queued_values: torch.Tensor
+    queued_len: int
     prefill_keys: torch.Tensor | None
     prefill_values: torch.Tensor | None
     indexer: CPUIndexer | CUDAIndexer
@@ -88,18 +89,19 @@ class HiraCacheLayer(CacheLayerMixin):
         # create indexer and searcher
         self.indexer = self.indexer_cls(**self.indexer_kwargs)
         self.searcher = self.searcher_cls(**self.searcher_kwargs)
-        # queued key/values
-        # TODO: create buffers of size self.update_every
+
+        # queued key/values. Pre-allocated ring buffers
         self.queued_keys = torch.empty(
-            (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
-        )
+            (self.H_kv, self.update_every, self.dim),
+            dtype=self.dtype,
+            device=self.device,
+        ).contiguous()
         self.queued_values = torch.empty(
-            (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
-        )
-        self.queued_len = 0
-        # place holders
-        self.keys = None  # no self.keys, just indexer
-        self.values = None  # no self.values, just indexer
+            (self.H_kv, self.update_every, self.dim),
+            dtype=self.dtype,
+            device=self.device,
+        ).contiguous()
+        self.q_len = 0
 
         self.is_initialized = True
 
@@ -111,15 +113,14 @@ class HiraCacheLayer(CacheLayerMixin):
     ):
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
-
             self.indexer.build(key_states, value_states)
             self.indexed_len = key_states.shape[-2]
-
             # prefill step
             return (
                 CacheOutput(
                     queued_keys=self.queued_keys,
                     queued_values=self.queued_values,
+                    queued_len=self.q_len,
                     prefill_keys=key_states,
                     prefill_values=value_states,
                     indexer=self.indexer,
@@ -128,19 +129,21 @@ class HiraCacheLayer(CacheLayerMixin):
                 None,
             )
 
-        # concat
-        self.queued_keys = torch.cat([self.queued_keys, key_states], dim=-2)
-        self.queued_values = torch.cat([self.queued_values, value_states], dim=-2)
-        self.queued_len += key_states.shape[-2]
+        # concat to ring buffer
+        n = key_states.shape[-2]
+        self.queued_keys[:, self.q_len : self.q_len + n, :] = key_states
+        self.queued_values[:, self.q_len : self.q_len + n, :] = value_states
+        self.q_len += n
 
         # periodic update
-        if self.queued_len >= self.update_every:
+        if self.q_len >= self.update_every:
             self.update_index()
 
         return (
             CacheOutput(
                 queued_keys=self.queued_keys,
                 queued_values=self.queued_values,
+                queued_len=self.q_len,
                 prefill_keys=None,
                 prefill_values=None,
                 indexer=self.indexer,
@@ -152,15 +155,8 @@ class HiraCacheLayer(CacheLayerMixin):
     def update_index(self):
         # append keys to index
         self.indexer.update(self.queued_keys, self.queued_values)
-        # empty queues
-        self.queued_keys = torch.empty(
-            (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
-        )
-        self.queued_values = torch.empty(
-            (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
-        )
-        self.indexed_len += self.queued_len
-        self.queued_len = 0
+        self.indexed_len += self.q_len
+        self.q_len = 0
 
     def get_mask_sizes(self, cache_position):
         kv_offset = 0
@@ -172,7 +168,7 @@ class HiraCacheLayer(CacheLayerMixin):
         """Returns the sequence length of the cached states."""
         if not self.is_initialized:
             return 0
-        return self.indexed_len + self.queued_len
+        return self.indexed_len + self.q_len
 
     def get_max_cache_shape(self):
         return -1
@@ -182,12 +178,16 @@ class HiraCacheLayer(CacheLayerMixin):
         if self.is_initialized:
             self.indexer = self.indexer_cls(**self.indexer_kwargs)
             self.queued_keys = torch.empty(
-                (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
-            )
+                (self.H_kv, self.update_every, self.dim),
+                dtype=self.dtype,
+                device=self.device,
+            ).contiguous()
             self.queued_values = torch.empty(
-                (1, self.H_kv, 0, self.dim), dtype=self.dtype, device=self.device
-            )
-            self.queued_len = 0
+                (self.H_kv, self.update_every, self.dim),
+                dtype=self.dtype,
+                device=self.device,
+            ).contiguous()
+            self.q_len = 0
             self.is_initialized = False
         # This attribute is set on several Layers
         if hasattr(self, "cumulative_length"):

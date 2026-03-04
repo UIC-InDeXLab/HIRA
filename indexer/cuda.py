@@ -41,7 +41,7 @@ class CUDAIndexer(BaseIndexer):
         # to build
         self.dim: int = 0
         self.children: Optional[torch.Tensor] = None  # padded keys
-        self.values: Optional[torch.Tensor] = None  # (1,H,N,V), aligned with children
+        self.values: Optional[torch.Tensor] = None  # (H,N,V), aligned with children
         self.parents: Optional[torch.Tensor] = None  # level 1
         self.parent_radii: Optional[torch.Tensor] = None  # level 1
         self.grand_parents: Optional[torch.Tensor] = None  # level 2
@@ -75,11 +75,7 @@ class CUDAIndexer(BaseIndexer):
                 self.branching_factor,
                 values=values,
             )
-            self.values = (
-                None
-                if values_layout is None
-                else values_layout.unsqueeze(0).contiguous()
-            )
+            self.values = None if values_layout is None else values_layout.contiguous()
             self.parent_radii = self._compute_parent_radii_from_layout()
         elif self.depth == CUDAIndexer.DEPTH.THREE_LEVELS:
             (
@@ -92,11 +88,7 @@ class CUDAIndexer(BaseIndexer):
                 self.branching_factor,
                 values=values,
             )
-            self.values = (
-                None
-                if values_layout is None
-                else values_layout.unsqueeze(0).contiguous()
-            )
+            self.values = None if values_layout is None else values_layout.contiguous()
             self.parent_radii = self._compute_parent_radii_from_layout()
             self.grand_parent_radii = self._compute_grandparent_radii_from_layout()
         else:
@@ -561,15 +553,17 @@ class CUDAIndexer(BaseIndexer):
             4. Update all radii and refresh internal state.
         """
         assert new_values is None or new_keys.shape == new_values.shape
-        assert new_keys.ndim == 4
+        # assert new_keys.ndim == 4
 
-        new_keys = new_keys.squeeze(0).contiguous()
+        # new_keys = new_keys.squeeze(0).contiguous()
+        new_keys = new_keys.contiguous()
         H, M, D = new_keys.shape
         assert D == self.dim
 
         has_values = self.values is not None
         if has_values:
-            new_values = new_values.squeeze(0).contiguous()
+            # new_values = new_values.squeeze(0).contiguous()
+            new_values = new_values.contiguous()
 
         bf = int(self.branching_factor)
         device = new_keys.device
@@ -596,7 +590,7 @@ class CUDAIndexer(BaseIndexer):
                 H, M
             )
             placed_rows = placed_flat[placed_mask].to(torch.long)
-            values_3d = self.values.squeeze(0)
+            values_3d = self.values
             values_3d[h_idx[placed_mask], placed_rows] = new_values[placed_mask]
 
         # Update parent radii for placed keys (atomic max).
@@ -651,7 +645,7 @@ class CUDAIndexer(BaseIndexer):
             ).contiguous()
             if has_values:
                 self.values = torch.cat(
-                    [self.values, new_children_values_flat.unsqueeze(0)], dim=-2
+                    [self.values, new_children_values_flat], dim=-2
                 ).contiguous()
             self._refresh_after_update()
             return self
@@ -912,7 +906,7 @@ class CUDAIndexer(BaseIndexer):
             )
         has_values = new_children_values_flat is not None
         V = int(new_children_values_flat.shape[-1]) if has_values else 0
-        dst_values = self.values.squeeze(0) if has_values else None
+        dst_values = self.values if has_values else None
 
         # Find nearest GP for each new parent.
         nearest_gp, _ = nearest_l2_triton_batched(
@@ -1194,7 +1188,7 @@ class CUDAIndexer(BaseIndexer):
         ).contiguous()
         if has_values:
             self.values = torch.cat(
-                [self.values, new_children_values_block.unsqueeze(0)], dim=-2
+                [self.values, new_children_values_block], dim=-2
             ).contiguous()
 
     def _update_gp_radii_for_placed_children(
