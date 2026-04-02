@@ -112,6 +112,11 @@ def measure_scanned_fraction(gate_fn, queries, keys, q_indices, q_head_to_kv, K,
     return mean_frac, mean_search_ms
 
 
+def format_speedup(ratio: float) -> str:
+    """Format analytical speedup relative to full scan."""
+    return f"{1 / ratio:.2f}x"
+
+
 # =====================================================================
 #  MAIN
 # =====================================================================
@@ -208,29 +213,64 @@ def main():
                            for k, v in enc_info.items())
             )
 
+    # ── Gate cost per enclosing method (in dot-product equivalents) ──
+    # A dot product of D-dim vectors costs 2D FLOPs.
+    # gate_g = gate_FLOPs_per_cluster / (2*D)
+    GATE_COST_DP = {
+        "ball_centroid": 1.0,       # einsum (2D) + add + cmp
+        "min_enclosing_ball": 1.0,  # same gate as ball
+        "aabb": 1.5,                # 2 muls + max + sum (3D)
+        "cone": 1.5,                # einsum + trig (~2D+20)
+        "hybrid": 3.5,              # ball + AABB + cone
+        "ellipsoid": 2.5,           # einsum + scaled norm (5D)
+        "split_aabb": 3.0,          # 2x AABB
+        "split_hybrid": 6.5,        # split_aabb + ball + ellipsoid
+        "split_full_hybrid": 9.1,   # split_aabb + ball + AABB + cone + ellipsoid
+        "hybrid_plus": 9.5,         # ball + AABB + cone + ellipsoid + centerline
+        "quad_aabb": 6.0,           # 4x AABB
+        "bisect_aabb": 3.5,         # 2x AABB + ball
+        "slab_bundle": 2.0,         # projection + ball
+        "pca_obb": 1.5,             # rotated AABB
+        "topk_aabb_residual": 3.0,  # partial AABB + residual
+        "centerline": 3.0,          # einsum + proj + residual
+        "span_ball": 1.0,           # einsum + add (same as ball)
+    }
+
     # ── Summary table ──
-    print("\n" + "=" * 105)
+    print("\n" + "=" * 120)
     print(
         f"{'CLUSTERING':<22s} {'ENCLOSING':<22s} {'SCANNED':>8s} {'PRUNED':>8s} "
-        f"{'SEARCH_ms':>10s} {'BUILD_ms':>9s}"
+        f"{'SEARCH_ms':>10s} {'BUILD_ms':>9s} {'g':>5s} {'RATIO':>7s} {'SPEEDUP':>8s}"
     )
-    print("-" * 105)
+    print("-" * 120)
 
     results.sort(key=lambda r: r["scanned_frac"])
     for r in results:
         build_ms = r["clust_ms"] + r["enc_ms"]
         pruned = 1.0 - r["scanned_frac"]
+        g = GATE_COST_DP.get(r["enclosing"], 2.0)
+        ratio = g / args.bf + (1.0 - pruned)  # g/bf + (1-p)  where p=pruned
         print(
             f"{r['clustering']:<22s} {r['enclosing']:<22s} "
             f"{r['scanned_frac']:>8.4f} {pruned:>8.4f} "
-            f"{r['search_ms']:>10.3f} {build_ms:>9.1f}"
+            f"{r['search_ms']:>10.3f} {build_ms:>9.1f} "
+            f"{g:>5.1f} {ratio:>7.3f} {format_speedup(ratio):>8s}"
         )
 
-    print("=" * 105)
+    print("=" * 120)
     best = results[0]
     print(
-        f"\nBest: {best['clustering']} + {best['enclosing']} "
+        f"\nBest pruning: {best['clustering']} + {best['enclosing']} "
         f"-> scanned={best['scanned_frac']:.4f} (pruned {1-best['scanned_frac']:.4f})"
+    )
+    # Find best analytical speedup
+    best_speedup = min(results, key=lambda r:
+        GATE_COST_DP.get(r["enclosing"], 2.0) / args.bf + r["scanned_frac"])
+    g_best = GATE_COST_DP.get(best_speedup["enclosing"], 2.0)
+    ratio_best = g_best / args.bf + best_speedup["scanned_frac"]
+    print(
+        f"Best speedup: {best_speedup['clustering']} + {best_speedup['enclosing']} "
+        f"-> ratio={ratio_best:.3f} ({format_speedup(ratio_best)})"
     )
 
 
