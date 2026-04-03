@@ -80,7 +80,7 @@ def topk_threshold(q_normal, keys, k=20):
     return th[:, -1]
 
 
-def measure_scanned_fraction(gate_fn, queries, keys, q_indices, q_head_to_kv, K, bf, topk):
+def measure_scanned_fraction(gate_fn, queries, keys, q_indices, q_head_to_kv, K, bf, topk, assign=None):
     """Run queries through the gate and measure scanned fraction + search time."""
     H_kv, N, D = keys.shape
     fracs = []
@@ -103,7 +103,7 @@ def measure_scanned_fraction(gate_fn, queries, keys, q_indices, q_head_to_kv, K,
         torch.cuda.synchronize()
         search_times.append(time.perf_counter() - t0)
 
-        scanned = parent_pass.sum(dim=1).float() * bf
+        scanned = parent_pass.gather(1, assign).sum(dim=1).float()
         frac = scanned / max(1, N)
         fracs.append(frac.mean().item())
 
@@ -117,6 +117,20 @@ def format_speedup(ratio: float) -> str:
     return f"{1 / ratio:.2f}x"
 
 
+def _select_methods(methods: dict[str, object], wanted: str, label: str):
+    if wanted == "all":
+        return methods
+
+    names = [name.strip() for name in wanted.split(",") if name.strip()]
+    selected = {}
+    for name in names:
+        if name not in methods:
+            available = ", ".join(sorted(methods))
+            raise ValueError(f"Unknown {label} method '{name}'. Available: {available}")
+        selected[name] = methods[name]
+    return selected
+
+
 # =====================================================================
 #  MAIN
 # =====================================================================
@@ -128,10 +142,19 @@ def main():
     parser.add_argument("--n-queries", type=int, default=30, help="Number of queries to evaluate")
     parser.add_argument("--topk", type=int, default=20, help="Top-k for threshold")
     parser.add_argument("--model", type=str, default=MODEL_NAME)
+    parser.add_argument("--clusterings", type=str, default="all", help='Comma-separated clustering names or "all"')
+    parser.add_argument("--enclosings", type=str, default="all", help='Comma-separated enclosing names or "all"')
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducible comparisons")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required.")
+
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    clustering_methods = _select_methods(CLUSTERING_METHODS, args.clusterings, "clustering")
+    enclosing_methods = _select_methods(ENCLOSING_METHODS, args.enclosings, "enclosing")
 
     print(f"Capturing {args.n_tokens} tokens from {args.model} ...")
     t0 = time.perf_counter()
@@ -169,7 +192,7 @@ def main():
 
     results = []
 
-    for clust_name, clust_fn in CLUSTERING_METHODS.items():
+    for clust_name, clust_fn in clustering_methods.items():
         print(f"\nClustering: {clust_name} ...")
         t0 = time.perf_counter()
         assign, centers = clust_fn(keys, args.bf)
@@ -185,13 +208,14 @@ def main():
             centers_q = centers
             keys_q = keys
 
-        for enc_name, enc_fn in ENCLOSING_METHODS.items():
+        for enc_name, enc_fn in enclosing_methods.items():
             t1 = time.perf_counter()
             gate_fn, enc_info = enc_fn(keys_q, assign_q, centers_q, K, args.bf)
             enc_time = time.perf_counter() - t1
 
             frac, search_ms = measure_scanned_fraction(
-                gate_fn, queries, keys_q, q_indices, None, K, args.bf, args.topk
+                gate_fn, queries, keys_q, q_indices, None, K, args.bf, args.topk,
+                assign=assign_q,
             )
 
             results.append({
@@ -234,6 +258,9 @@ def main():
         "topk_aabb_residual": 3.0,  # partial AABB + residual
         "centerline": 3.0,          # einsum + proj + residual
         "span_ball": 1.0,           # einsum + add (same as ball)
+        "axis_interval": 1.0,       # one axis projection + orth residual
+        "dual_axis_interval": 2.0,  # two axis projections + orth residual
+        "pca_interval": 1.0,        # one local-PCA axis projection + orth residual
     }
 
     # ── Summary table ──

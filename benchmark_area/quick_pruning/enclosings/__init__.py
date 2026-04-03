@@ -16,6 +16,9 @@ from .quad_aabb import enclose_quad_aabb
 from .bisect_aabb import enclose_bisect_aabb
 from .slab_bundle import enclose_slab_bundle
 from .span_ball import enclose_span_ball
+from .axis_interval import enclose_axis_interval
+from .dual_axis_interval import enclose_dual_axis_interval
+from .pca_interval import enclose_pca_interval
 
 ENCLOSING_METHODS = {
     "ball_centroid": enclose_ball_centroid,
@@ -38,4 +41,7 @@ ENCLOSING_METHODS = {
     "slab_bundle": enclose_slab_bundle,
     # "split_full_hybrid": enclose_split_full_hybrid,
     "span_ball": enclose_span_ball,
+    "axis_interval": enclose_axis_interval,
+    "dual_axis_interval": enclose_dual_axis_interval,
+    "pca_interval": enclose_pca_interval,
 }
