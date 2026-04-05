@@ -17,6 +17,7 @@ from .whitened_pq import cluster_whitened_pq
 from .direction_kmeans import cluster_direction_kmeans
 from .shell_kmeans import cluster_shell_kmeans
 from .dirnorm_pq import cluster_dirnorm_pq
+# from .kdtree_partition import cluster_kcenter_linf
 
 CLUSTERING_METHODS = {
     "kmeans": cluster_kmeans,
@@ -39,6 +40,7 @@ CLUSTERING_METHODS = {
     "direction_kmeans": cluster_direction_kmeans,
     "shell_kmeans": cluster_shell_kmeans,
     "dirnorm_pq": cluster_dirnorm_pq,
+    # "kcenter_linf": cluster_kcenter_linf,
     # "whitened_pq_span": cluster_whitened_pq_span,
     # "interleaved_whitened_pq": cluster_interleaved_whitened_pq,
     # "pca_bisect": cluster_pca_bisect, => Too slow

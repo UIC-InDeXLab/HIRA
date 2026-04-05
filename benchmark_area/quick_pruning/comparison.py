@@ -29,6 +29,7 @@ from enclosings import ENCLOSING_METHODS
 
 # ── Model / capture settings ──
 MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
+# MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 LAYER_IDX = 15
 DEVICE = "cuda"
 DTYPE = torch.float32
@@ -261,6 +262,8 @@ def main():
         "axis_interval": 1.0,       # one axis projection + orth residual
         "dual_axis_interval": 2.0,  # two axis projections + orth residual
         "pca_interval": 1.0,        # one local-PCA axis projection + orth residual
+        "outlier_aabb": 2.5,        # AABB on core (1.5) + dot for outlier (1.0)
+        "pca_aabb_resid": 1.2,      # centroid dot (1.0) + AABB in 16d (~0.2)
     }
 
     # ── Summary table ──
