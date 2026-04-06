@@ -17,6 +17,21 @@ from .whitened_pq import cluster_whitened_pq
 from .direction_kmeans import cluster_direction_kmeans
 from .shell_kmeans import cluster_shell_kmeans
 from .dirnorm_pq import cluster_dirnorm_pq
+from .balanced_kmeans import cluster_balanced_kmeans
+from .balanced_kcenter import cluster_balanced_kcenter
+from .balanced_pca_tree import cluster_balanced_pca_tree
+from .pca_morton_chunk import cluster_pca_morton_chunk
+from .balanced_ray_kmeans import cluster_balanced_ray_kmeans
+from .balanced_ray_kcenter import cluster_balanced_ray_kcenter
+from .ball_ratio_kmeans import cluster_ball_ratio_kmeans, cluster_ball_ratio_kcenter
+from .ray_kmeans import cluster_ray_kmeans, cluster_ray_kcenter, cluster_ray_kcenter_meb
+from .aabb_chunks import cluster_pca_axis_chunk, cluster_pca_morton_span
+from .pq_aabb_refine import cluster_pq_span_refine, cluster_pq_balanced_span
+from .batch_nn import cluster_batch_nn, cluster_batch_nn_l1, cluster_batch_nn_linf, cluster_batch_nn_aabb_aware
+from .batch_nn_lp import cluster_batch_nn_lp, make_cluster_batch_nn_lp
+from .kcenter_meb import cluster_kcenter_meb
+from .kcenter_minimax import cluster_kcenter_minimax
+from .kcenter_lp import cluster_kcenter_lp, make_cluster_kcenter_lp
 # from .kdtree_partition import cluster_kcenter_linf
 
 CLUSTERING_METHODS = {
@@ -40,6 +55,29 @@ CLUSTERING_METHODS = {
     "direction_kmeans": cluster_direction_kmeans,
     "shell_kmeans": cluster_shell_kmeans,
     "dirnorm_pq": cluster_dirnorm_pq,
+    "balanced_kmeans": cluster_balanced_kmeans,
+    "balanced_kcenter": cluster_balanced_kcenter,
+    "balanced_pca_tree": cluster_balanced_pca_tree,
+    "pca_morton_chunk": cluster_pca_morton_chunk,
+    "balanced_ray_kmeans": cluster_balanced_ray_kmeans,
+    "balanced_ray_kcenter": cluster_balanced_ray_kcenter,
+    "ball_ratio_kmeans": cluster_ball_ratio_kmeans,
+    "ball_ratio_kcenter": cluster_ball_ratio_kcenter,
+    "ray_kmeans": cluster_ray_kmeans,
+    "ray_kcenter": cluster_ray_kcenter,
+    "ray_kcenter_meb": cluster_ray_kcenter_meb,
+    "pca_axis_chunk": cluster_pca_axis_chunk,
+    "pca_morton_span": cluster_pca_morton_span,
+    "pq_span_refine": cluster_pq_span_refine,
+    "pq_balanced_span": cluster_pq_balanced_span,
+    "batch_nn": cluster_batch_nn,
+    "batch_nn_l1": cluster_batch_nn_l1,
+    "batch_nn_linf": cluster_batch_nn_linf,
+    "batch_nn_aabb_aware": cluster_batch_nn_aabb_aware,
+    "batch_nn_lp": cluster_batch_nn_lp,
+    "kcenter_meb": cluster_kcenter_meb,
+    "kcenter_minimax": cluster_kcenter_minimax,
+    "kcenter_lp": cluster_kcenter_lp,
     # "kcenter_linf": cluster_kcenter_linf,
     # "whitened_pq_span": cluster_whitened_pq_span,
     # "interleaved_whitened_pq": cluster_interleaved_whitened_pq,

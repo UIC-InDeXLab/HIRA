@@ -1,91 +1,119 @@
 # Methods in `benchmark_area/quick_pruning`
 
+This note tracks all concrete clustering and enclosing implementations currently present under `clusterings/` and `enclosings/`.
+
+Status tags:
+- `default`: exposed through the main registries in `clusterings/__init__.py` or `enclosings/__init__.py`
+- `implemented`: code exists in the tree, but it is not enabled in the main default registry
+
+Helper-only modules such as `clusterings/_balanced_utils.py` and `clusterings/_lp_utils.py` are intentionally omitted.
+
 ## Clustering Methods
 
-- **k-means**: Standard Lloyd updates in the original key space, minimizing within-cluster L2 distortion.
+### General-purpose centroid and distortion methods
 
-- **Spherical k-means**: Runs k-means on L2-normalized keys so assignments follow angular similarity rather than Euclidean distance.
+- `kmeans` (`default`): standard Lloyd k-means in the original key space.
+- `kmeans_pp` (`default`): standard k-means with k-means++ seeding.
+- `spherical_kmeans` (`implemented`): k-means on L2-normalized keys, targeting cosine similarity.
+- `gmm_diag` (`implemented`): diagonal-covariance Gaussian mixture model with hard-EM updates.
+- `random_partition` (`default`): assigns points uniformly at random; useful as a structure-free baseline.
+- `random_proj` (`default`): LSH-style random-projection hashing followed by center refinement.
+- `pca_kmeans` (`implemented`): runs k-means in a low-rank global PCA subspace, then rebuilds original-space centroids.
 
-- **Random Projection**: Uses random projections and median thresholding to form hash buckets, then refines with nearest-center reassignment.
+### K-center and ball-oriented methods
 
-- **Random Partition**: Assigns keys to clusters uniformly at random. Useful as a lower-bound baseline for how much structure matters.
+- `kcenter` (`default`): greedy farthest-point seeding under L2 followed by centroid refinement.
+- `kcenter_lp` (`default`): `L_p`-aware k-center with `L_p` reassignment and simple `L_p`-aware recentering.
+- `kcenter_meb` (`default`): uses `kcenter` assignments, then replaces means with approximate minimum-enclosing-ball centers.
+- `kcenter_minimax` (`default`): k-center with repeated minimax-style 1-center recentering instead of Lloyd mean updates.
+- `ball_ratio_kmeans` (`default`): optimizes a ball-radius-versus-center-norm objective intended for ball gates.
+- `ball_ratio_kcenter` (`default`): k-center-style variant of the same radius-to-center-ratio objective.
+- `ray_kmeans` (`default`): clusters on ray features mixing direction and log-norm.
+- `ray_kcenter` (`default`): farthest-point clustering on the same ray features.
+- `ray_kcenter_meb` (`default`): ray-based k-center assignments with per-cluster MEB-style centers.
 
-- **PQ Subspace**: Splits dimensions into subspaces, clusters each subspace independently, then combines the subspace codes into a composite cluster id.
+### Direction and norm-aware methods
 
-- **PQ L2**: Uses PQ-style subspace clustering for initialization, then refines with ordinary L2 k-means.
+- `direction_kmeans` (`default`): clusters on L2-normalized directions, then recomputes original-space centroids.
+- `shell_kmeans` (`default`): partitions by norm shells, then clusters directions within each shell.
+- `dirnorm_pq` (`default`): PQ-style clustering on direction features augmented with a scaled norm feature.
 
-- **PQ Linf**: PQ-style initialization followed by Linf-oriented refinement to reduce worst-coordinate spread.
+### AABB- and span-oriented methods
 
-- **PQ8**: PQ-style clustering with a fixed 8-way subspace coding scheme.
+- `linf_kmeans` (`default`): Chebyshev-distance k-means with midrange centers, directly targeting worst-axis spread.
+- `span_kmeans` (`default`): assigns keys to minimize AABB span extension instead of L2 distortion.
+- `pq_linf` (`default`): PQ initialization followed by `L_inf`-oriented refinement.
+- `pq_l2` (`default`): PQ initialization followed by ordinary L2 refinement.
+- `pq_span` (`default`): PQ initialization followed by span-aware refinement.
+- `pq_span_refine` (`default`): PQ initialization followed by weighted box-extension reassignment.
+- `pq_balanced_span` (`default`): balanced-capacity version of the PQ span refinement.
+- `pca_axis_chunk` (`default`): exact-size contiguous chunking along the first PCA axis, followed by span refinement.
+- `pca_morton_span` (`default`): PCA projection, Morton ordering, then balanced span refinement.
 
-- **PQ Span**: Starts from PQ-subspace assignments, then refines by minimizing how much each point expands the destination cluster's AABB.
+### Product-quantization and whitening families
 
-- **Whitened PQ**: Normalizes each dimension by global per-head standard deviation before PQ clustering, then maps centers back to the original space. This reduces domination by a few high-variance coordinates and worked well with AABB gating.
+- `pq_subspace` (`default`): product-quantization-inspired clustering by splitting dimensions into subspaces.
+- `pca_pq` (`default`): full PCA rotation followed by PQ-style subspace clustering.
+- `whitened_pq` (`default`): PQ-style clustering in globally variance-whitened coordinates.
+- `whitened_pq_kpp` (`implemented`): whitened PQ with k-means++ initialization in each subspace.
+- `whitened_pq_span` (`implemented`): whitened PQ initialization followed by span-aware refinement.
 
-- **Whitened PQ Span**: Combines whitened PQ initialization with span-aware refinement. In the recent experiments this was the strongest clustering method for `aabb`.
+### Balanced and exact-capacity partitioners
 
-- **Interleaved Whitened PQ**: Whitens dimensions, sorts them by variance, then distributes them round-robin across PQ subspaces so each subspace sees a mix of strong and weak coordinates.
+- `balanced_kmeans` (`default`): capacity-constrained Lloyd updates with exact near-`bf` cluster sizes.
+- `balanced_kcenter` (`default`): farthest-point seeding followed by balanced exact-capacity reassignment.
+- `balanced_pca_tree` (`default`): recursively splits along dominant local axes while matching final leaf capacities.
+- `balanced_ray_kmeans` (`default`): balanced clustering on ray features.
+- `balanced_ray_kcenter` (`default`): balanced farthest-point clustering on ray features.
+- `pca_morton_chunk` (`default`): PCA projection, Morton ordering, and exact-size contiguous chunking.
+- `pca_tree` (`implemented`): balanced PCA-tree partitioning in a low-rank global PCA basis.
+- `pca_bisect` (`implemented`): recursive PCA bisection with balanced splits.
 
-- **Diagonal GMM**: Fits a diagonal-covariance Gaussian mixture with EM and assigns each point to the highest-responsibility component.
+### Nearest-neighbor grouping methods
 
-- **k-center**: Greedy farthest-point seeding followed by centroid refinement, targeting tight ball radii.
-
-- **k-means++**: Standard k-means with distance-aware seeding to reduce bad initializations.
-
-- **KD-tree**: Recursively splits along the widest axis at the median, producing balanced, box-friendly partitions.
-
-- **PCA Tree**: Like KD-tree, but first projects into a small PCA basis and then splits along the widest projected axis.
-
-- **PCA k-means**: Runs Lloyd iterations in a low-rank PCA subspace, then computes final centers in the original space.
-
-- **PCA Bisect**: Recursive PCA-guided bisection intended to make elongated clusters easier to separate.
-
-- **Linf k-means**: A k-means-style clustering objective based on coordinatewise worst-case deviation instead of only L2 distance.
-
-- **Span k-means**: Assigns each point to the cluster whose AABB it enlarges the least, directly targeting `aabb`-style pruning quality.
+- `batch_nn` (`default`): greedy grouping from L2 nearest-neighbor candidate balls.
+- `batch_nn_l1` (`default`): nearest-neighbor grouping scored with L1 distance.
+- `batch_nn_linf` (`default`): nearest-neighbor grouping scored with `L_inf` distance.
+- `batch_nn_aabb_aware` (`default`): weighted-L1 nearest-neighbor grouping that approximates AABB slack.
+- `batch_nn_lp` (`default`): generic `L_p` nearest-neighbor grouping.
 
 ## Enclosing Methods
 
-- **Ball (Centroid)**: Uses the centroid as center and stores the farthest child distance as radius. The gate is `center . q + radius > threshold`.
+### Ball-family bounds
 
-- **Minimum Enclosing Ball**: Approximates a tighter enclosing ball by iteratively shifting toward farthest points.
+- `ball_centroid` (`default`): centroid-centered L2 ball with radius equal to the farthest assigned point.
+- `l1_ball` (`default`): centroid-centered `L_1` ball using the exact dual-norm support bound.
+- `lp_ball` (`implemented`): generic centroid-centered `L_p` ball with dual-norm gate; used directly by `comparison_lp_ball.py`.
+- `min_enclosing_ball` (`default`): approximate minimum-enclosing-ball centering via iterative farthest-point shifts.
+- `span_ball` (`default`): ball centered at the AABB midrange with radius from the AABB half-span vector.
+- `outlier_ball_centroid` (`default`): removes one farthest point, fits a centroid ball to the core, and checks the outlier directly.
+- `outlier_span_ball` (`default`): removes one farthest point, fits a span-ball to the core, and checks the outlier directly.
+- `multi_ball` (`implemented`): covers each cluster with a small union of balls and uses the best anchor.
 
-- **AABB (Axis-Aligned Bounding Box)**: Stores per-dimension min/max values and upper-bounds the dot product by choosing the best corner for each coordinate.
+### Axis-aligned and box-family bounds
 
-- **Cone**: Uses a mean direction plus a half-angle and max norm to upper-bound support in angular space.
+- `aabb` (`default`): per-cluster axis-aligned bounding box with max-corner support evaluation.
+- `outlier_aabb` (`default`): removes one outlier per cluster, builds an AABB on the core, and checks the outlier directly.
+- `split_aabb` (`implemented`): splits each cluster into two axis-based halves and uses one AABB per half.
+- `bisect_aabb` (`implemented`): performs a small 2-means-like split, builds one AABB per half, and intersects with a ball bound.
+- `quad_aabb` (`implemented`): recursively bisects each cluster twice to build four sub-boxes.
+- `pca_obb` (`default`): rotates into a global PCA basis and builds an oriented bounding box there.
+- `topk_aabb_residual` (`default`): exact AABB on a small set of salient dimensions plus a residual L2 bound.
+- `global_pca_box` (`implemented`): global PCA subspace box plus orthogonal residual ball.
+- `subspace_box` (`implemented`): per-cluster low-rank oriented box plus orthogonal residual.
 
-- **Hybrid**: Intersects several cheap bounds such as ball, AABB, and cone to tighten pruning.
+### Directional and low-rank interval bounds
 
-- **Ellipsoid**: Uses a diagonal ellipsoidal scaling around the cluster center to capture anisotropic spread more tightly than a ball.
+- `cone` (`default`): angular cone bound using mean direction, half-angle, and max norm.
+- `centerline` (`default`): rank-1 cluster-local directional bound with an orthogonal residual ball.
+- `dual_centerline` (`implemented`): rank-2 extension of `centerline` with a second cheap residual axis.
+- `axis_interval` (`default`): one local axis interval plus orthogonal residual radius.
+- `dual_axis_interval` (`default`): two local axis intervals plus residual radius.
 
-- **Multi-ball**: Covers a cluster with a small set of balls to handle multimodal structure inside one parent.
+### Ellipsoidal, slab, and hybrid intersections
 
-- **Subspace Box**: Builds a box in a low-rank local subspace plus a residual norm bound for the orthogonal complement.
-
-- **Tight Hybrid**: Combines several of the strongest complementary bounds, typically ball, box, subspace, and multi-anchor terms.
-
-- **Top-k AABB Residual**: Uses exact AABB support on a few salient dimensions and an L2 residual bound for the remaining ones.
-
-- **Centerline**: Uses the centroid direction as a cheap rank-1 local axis and bounds the remaining orthogonal energy with a residual ball.
-
-- **Dual Centerline**: Extends centerline to two cluster-local axes, giving a tighter rank-2 bound at slightly higher gate cost.
-
-- **PCA OBB**: Rotates keys into a PCA basis and applies an axis-aligned box in that rotated space.
-
-- **Global PCA Box**: Uses a small global PCA basis per head, stores a box in that subspace, and adds a residual norm bound outside the basis.
-
-- **Hybrid Plus**: A larger intersection of ball, AABB, cone, ellipsoid, and centerline style bounds.
-
-- **Split AABB**: Splits each cluster into two sub-boxes and passes if either sub-box can exceed the threshold.
-
-- **Quad AABB**: Generalizes split-style boxing to four sub-boxes for tighter but more expensive support evaluation.
-
-- **Split Hybrid**: Applies split-style partitioning and then intersects with additional bounds such as ball or ellipsoid terms.
-
-- **Bisect AABB**: Uses a two-way AABB split with an additional fallback bound, typically a ball.
-
-- **Slab Bundle**: Projects onto several directions, stores min/max slab extents, and optionally intersects with a ball-style fallback.
-
-- **Split Full Hybrid**: A high-cost intersection of several split and non-split geometric bounds.
-
-- **Outlier AABB**: Builds the box on the cluster core after removing a few farthest points, then keeps those outliers explicitly as point supports. This was useful experimentally but is not yet part of the main enclosing registry.
+- `ellipsoid` (`default`): diagonal Mahalanobis-style ellipsoid with a ball fallback.
+- `slab_bundle` (`default`): several random-direction interval slabs intersected together, plus a ball safeguard.
+- `hybrid` (`implemented`): intersection of ball, AABB, and cone bounds.
+- `hybrid_plus` (`implemented`): 5-way intersection of ball, AABB, cone, ellipsoid, and centerline.
+- `tight_hybrid` (`implemented`): minimum of several complementary support bounds, including ball, AABB, subspace box, and multi-ball ideas.

@@ -1,4 +1,6 @@
 from .ball_centroid import enclose_ball_centroid
+from .l1_ball import enclose_l1_ball
+from .lp_ball import enclose_lp_ball, make_enclose_lp_ball
 from .min_enclosing_ball import enclose_min_ball
 from .aabb import enclose_aabb
 from .cone import enclose_cone
@@ -26,6 +28,7 @@ from .dual_axis_interval import enclose_dual_axis_interval
 
 ENCLOSING_METHODS = {
     "ball_centroid": enclose_ball_centroid,
+    "l1_ball": enclose_l1_ball,
     "min_enclosing_ball": enclose_min_ball,
     "aabb": enclose_aabb,
     "cone": enclose_cone,

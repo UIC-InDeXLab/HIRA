@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Compare clustering + enclosing methods for halfspace pruning.
-
-For each (clustering_method, enclosing_method) pair, measures what fraction
-of children must be scanned when using the parent-level gate to prune.
+Compare clustering methods using only the parameterized Lp-ball enclosing.
 
 Usage:
-    python method_comparison_bench.py [--bf 16] [--n-tokens 2000] [--n-queries 50]
+    python comparison_lp_ball.py --p 1.5,2,inf [--bf 16] [--n-tokens 2000] [--n-queries 50]
+    python comparison_lp_ball.py --p 1.5 --p 2 --p inf
 """
 
 from __future__ import annotations
@@ -25,11 +23,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from pruning_bench_utils import _capture_qkv, _q_to_kv_map
 from clusterings import CLUSTERING_METHODS
-from enclosings import ENCLOSING_METHODS
+from clusterings import make_cluster_batch_nn_lp, make_cluster_kcenter_lp
+from enclosings.lp_ball import make_enclose_lp_ball
 
 # ── Model / capture settings ──
 MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
-# MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 LAYER_IDX = 15
 DEVICE = "cuda"
 DTYPE = torch.float32
@@ -65,9 +63,37 @@ PROMPT = (
 )
 
 
-# =====================================================================
-#  BENCHMARK CORE
-# =====================================================================
+def parse_p(value: str) -> float:
+    lowered = value.strip().lower()
+    if lowered in {"inf", "+inf", "infinity", "+infinity"}:
+        return float("inf")
+    p = float(value)
+    if p < 1.0:
+        raise argparse.ArgumentTypeError(f"--p must be >= 1, got {value}")
+    return p
+
+
+def parse_p_values(values: list[str]) -> list[float]:
+    parsed = []
+    seen = set()
+    for value in values:
+        for part in value.split(","):
+            token = part.strip()
+            if not token:
+                continue
+            p = parse_p(token)
+            key = "inf" if math.isinf(p) else f"{p:.12g}"
+            if key in seen:
+                continue
+            seen.add(key)
+            parsed.append(p)
+    if not parsed:
+        raise argparse.ArgumentTypeError("--p requires at least one value")
+    return parsed
+
+
+def format_p(p: float) -> str:
+    return "inf" if math.isinf(p) else f"{p:g}"
 
 
 def topk_threshold(q_normal, keys, k=20):
@@ -92,12 +118,9 @@ def measure_scanned_fraction(gate_fn, queries, keys, q_indices, q_head_to_kv, K,
         q_norm = q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
         q_normal = q / q_norm
 
-        # Expand to query heads via q_head_to_kv
         q_kv = q_normal[q_head_to_kv] if q_head_to_kv is not None else q_normal
-
         th = topk_threshold(q_kv, keys, k=topk)
 
-        # Gate: (H_q, K) bool — timed
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         parent_pass = gate_fn(q_kv, th)
@@ -114,13 +137,12 @@ def measure_scanned_fraction(gate_fn, queries, keys, q_indices, q_head_to_kv, K,
 
 
 def format_speedup(ratio: float) -> str:
-    """Format analytical speedup relative to full scan."""
     return f"{1 / ratio:.2f}x"
 
 
 def _select_methods(methods: dict[str, object], wanted: str, label: str):
     if wanted == "all":
-        return methods
+        return dict(methods)
 
     names = [name.strip() for name in wanted.split(",") if name.strip()]
     selected = {}
@@ -132,19 +154,62 @@ def _select_methods(methods: dict[str, object], wanted: str, label: str):
     return selected
 
 
-# =====================================================================
-#  MAIN
-# =====================================================================
+def _build_clustering_methods(p: float, wanted: str) -> dict[str, object]:
+    p_label = format_p(p)
+    lp_methods = {
+        f"kcenter_lp(p={p_label})": make_cluster_kcenter_lp(p),
+        f"batch_nn_lp(p={p_label})": make_cluster_batch_nn_lp(p),
+    }
+
+    if wanted == "lp_only":
+        return lp_methods
+
+    base_methods = {
+        name: fn
+        for name, fn in CLUSTERING_METHODS.items()
+        if name not in {"kcenter_lp", "batch_nn_lp"}
+    }
+
+    if wanted == "all":
+        merged = dict(base_methods)
+        merged.update(lp_methods)
+        return merged
+
+    available = dict(base_methods)
+    available["kcenter_lp"] = lp_methods[f"kcenter_lp(p={p_label})"]
+    available["batch_nn_lp"] = lp_methods[f"batch_nn_lp(p={p_label})"]
+
+    selected = _select_methods(available, wanted, "clustering")
+    renamed = {}
+    for name, fn in selected.items():
+        if name == "kcenter_lp":
+            renamed[f"kcenter_lp(p={p_label})"] = fn
+        elif name == "batch_nn_lp":
+            renamed[f"batch_nn_lp(p={p_label})"] = fn
+        else:
+            renamed[name] = fn
+    return renamed
+
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--p",
+        action="append",
+        required=True,
+        help="Lp-ball exponents, e.g. --p 1.5,2,inf or repeated --p 1.5 --p 2",
+    )
     parser.add_argument("--bf", type=int, default=4, help="Branching factor")
     parser.add_argument("--n-tokens", type=int, default=2000, help="Tokens to capture")
     parser.add_argument("--n-queries", type=int, default=30, help="Number of queries to evaluate")
     parser.add_argument("--topk", type=int, default=20, help="Top-k for threshold")
     parser.add_argument("--model", type=str, default=MODEL_NAME)
-    parser.add_argument("--clusterings", type=str, default="all", help='Comma-separated clustering names or "all"')
-    parser.add_argument("--enclosings", type=str, default="all", help='Comma-separated enclosing names or "all"')
+    parser.add_argument(
+        "--clusterings",
+        type=str,
+        default="lp_only",
+        help='Clustering set: "lp_only" (default), "all", or comma-separated names',
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducible comparisons")
     args = parser.parse_args()
 
@@ -154,8 +219,8 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    clustering_methods = _select_methods(CLUSTERING_METHODS, args.clusterings, "clustering")
-    enclosing_methods = _select_methods(ENCLOSING_METHODS, args.enclosings, "enclosing")
+    p_values = parse_p_values(args.p)
+    gate_cost_dp = 1.0
 
     print(f"Capturing {args.n_tokens} tokens from {args.model} ...")
     t0 = time.perf_counter()
@@ -181,37 +246,43 @@ def main():
     q_head_to_kv = _q_to_kv_map(H_q, H_kv, DEVICE) if H_q != H_kv else None
     K = max(1, math.ceil(N / args.bf))
 
-    # Query indices: sample from end of sequence
     total_q = queries.shape[1]
     stride = max(1, total_q // args.n_queries)
     q_indices = list(range(total_q - 1, max(0, total_q - args.n_queries * stride) - 1, -stride))
     q_indices = q_indices[: args.n_queries]
 
     print(f"Layer {layer}: H_kv={H_kv}, H_q={H_q}, N={N}, D={D}")
-    print(f"K={K} parents (bf={args.bf}), {len(q_indices)} queries, topk={args.topk}")
+    print(
+        f"K={K} parents (bf={args.bf}), {len(q_indices)} queries, topk={args.topk}, "
+        f"p={','.join(format_p(p) for p in p_values)}"
+    )
     print("=" * 90)
 
     results = []
 
-    for clust_name, clust_fn in clustering_methods.items():
-        print(f"\nClustering: {clust_name} ...")
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        assign, centers = clust_fn(keys, args.bf)
-        torch.cuda.synchronize()
-        clust_time = time.perf_counter() - t0
+    for p in p_values:
+        p_label = format_p(p)
+        enc_name = f"lp_ball(p={p_label})"
+        enc_fn = make_enclose_lp_ball(p)
+        clustering_methods = _build_clustering_methods(p, args.clusterings)
 
-        # Expand centers/assign to query heads if needed
-        if q_head_to_kv is not None:
-            assign_q = assign[q_head_to_kv]
-            centers_q = centers[q_head_to_kv]
-            keys_q = keys[q_head_to_kv]
-        else:
-            assign_q = assign
-            centers_q = centers
-            keys_q = keys
+        for clust_name, clust_fn in clustering_methods.items():
+            print(f"\nClustering: {clust_name} ...")
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            assign, centers = clust_fn(keys, args.bf)
+            torch.cuda.synchronize()
+            clust_time = time.perf_counter() - t0
 
-        for enc_name, enc_fn in enclosing_methods.items():
+            if q_head_to_kv is not None:
+                assign_q = assign[q_head_to_kv]
+                centers_q = centers[q_head_to_kv]
+                keys_q = keys[q_head_to_kv]
+            else:
+                assign_q = assign
+                centers_q = centers
+                keys_q = keys
+
             torch.cuda.synchronize()
             t1 = time.perf_counter()
             gate_fn, enc_info = enc_fn(keys_q, assign_q, centers_q, K, args.bf)
@@ -242,38 +313,6 @@ def main():
                            for k, v in enc_info.items())
             )
 
-    # ── Gate cost per enclosing method (in dot-product equivalents) ──
-    # A dot product of D-dim vectors costs 2D FLOPs.
-    # gate_g = gate_FLOPs_per_cluster / (2*D)
-    GATE_COST_DP = {
-        "ball_centroid": 1.0,       # einsum (2D) + add + cmp
-        "l1_ball": 1.0,             # centroid dot; ||q||_inf is query-only overhead
-        "min_enclosing_ball": 1.0,  # same gate as ball
-        "aabb": 1.5,                # 2 muls + max + sum (3D)
-        "cone": 1.5,                # einsum + trig (~2D+20)
-        "hybrid": 3.5,              # ball + AABB + cone
-        "ellipsoid": 2.5,           # einsum + scaled norm (5D)
-        "split_aabb": 3.0,          # 2x AABB
-        "split_hybrid": 6.5,        # split_aabb + ball + ellipsoid
-        "split_full_hybrid": 9.1,   # split_aabb + ball + AABB + cone + ellipsoid
-        "hybrid_plus": 9.5,         # ball + AABB + cone + ellipsoid + centerline
-        "quad_aabb": 6.0,           # 4x AABB
-        "bisect_aabb": 3.5,         # 2x AABB + ball
-        "slab_bundle": 2.0,         # projection + ball
-        "pca_obb": 1.5,             # rotated AABB
-        "topk_aabb_residual": 3.0,  # partial AABB + residual
-        "centerline": 3.0,          # einsum + proj + residual
-        "span_ball": 1.0,           # einsum + add (same as ball)
-        "outlier_ball_centroid": 2.0,  # core ball (1.0) + outlier dot (1.0)
-        "outlier_span_ball": 2.0,  # core span-ball (1.0) + outlier dot (1.0)
-        "axis_interval": 1.0,       # one axis projection + orth residual
-        "dual_axis_interval": 2.0,  # two axis projections + orth residual
-        "pca_interval": 1.0,        # one local-PCA axis projection + orth residual
-        "outlier_aabb": 2.5,        # AABB on core (1.5) + dot for outlier (1.0)
-        "pca_aabb_resid": 1.2,      # centroid dot (1.0) + AABB in 16d (~0.2)
-    }
-
-    # ── Summary table ──
     print("\n" + "=" * 120)
     print(
         f"{'CLUSTERING':<22s} {'ENCLOSING':<22s} {'SCANNED':>8s} {'PRUNED':>8s} "
@@ -285,13 +324,12 @@ def main():
     for r in results:
         build_ms = r["clust_ms"] + r["enc_ms"]
         pruned = 1.0 - r["scanned_frac"]
-        g = GATE_COST_DP.get(r["enclosing"], 2.0)
-        ratio = g / args.bf + (1.0 - pruned)  # g/bf + (1-p)  where p=pruned
+        ratio = gate_cost_dp / args.bf + r["scanned_frac"]
         print(
             f"{r['clustering']:<22s} {r['enclosing']:<22s} "
             f"{r['scanned_frac']:>8.4f} {pruned:>8.4f} "
             f"{r['search_ms']:>10.3f} {build_ms:>9.1f} "
-            f"{g:>5.1f} {ratio:>7.3f} {format_speedup(ratio):>8s}"
+            f"{gate_cost_dp:>5.1f} {ratio:>7.3f} {format_speedup(ratio):>8s}"
         )
 
     print("=" * 120)
@@ -300,11 +338,9 @@ def main():
         f"\nBest pruning: {best['clustering']} + {best['enclosing']} "
         f"-> scanned={best['scanned_frac']:.4f} (pruned {1-best['scanned_frac']:.4f})"
     )
-    # Find best analytical speedup
-    best_speedup = min(results, key=lambda r:
-        GATE_COST_DP.get(r["enclosing"], 2.0) / args.bf + r["scanned_frac"])
-    g_best = GATE_COST_DP.get(best_speedup["enclosing"], 2.0)
-    ratio_best = g_best / args.bf + best_speedup["scanned_frac"]
+
+    best_speedup = min(results, key=lambda r: gate_cost_dp / args.bf + r["scanned_frac"])
+    ratio_best = gate_cost_dp / args.bf + best_speedup["scanned_frac"]
     print(
         f"Best speedup: {best_speedup['clustering']} + {best_speedup['enclosing']} "
         f"-> ratio={ratio_best:.3f} ({format_speedup(ratio_best)})"
