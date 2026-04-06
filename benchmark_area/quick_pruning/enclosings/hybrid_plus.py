@@ -13,7 +13,7 @@ def enclose_hybrid_plus(keys, assign, centers, K, bf):
       ball ∩ AABB ∩ cone ∩ ellipsoid ∩ centerline
 
     Each bound captures different geometric structure; their intersection
-    is strictly tighter than any subset. Gate cost is ~5x ball but pruning
+    is strictly tighter than any subset. Gate cost is ~10x ball but pruning
     should be substantially better than the 3-way hybrid.
 
     Returns:

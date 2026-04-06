@@ -11,7 +11,7 @@ def enclose_hybrid(keys, assign, centers, K, bf):
     """
     Combines ball-centroid, AABB, and cone bounds.
     A cluster passes the gate ONLY if ALL three bounds exceed the threshold.
-    Strictly tighter than any individual method at ~3x gate cost.
+    Strictly tighter than any individual method at ~4.5x ball-gate cost.
 
     Returns:
         gate: callable(q, th) -> (H, K) bool.

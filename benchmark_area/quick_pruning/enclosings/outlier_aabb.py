@@ -4,7 +4,7 @@ With ~bf keys per cluster, removing the single key that contributes most
 to the AABB span can significantly tighten the box.  The outlier gets a
 direct dot-product check.
 
-Gate cost: 1.5 (tight AABB) + 1.0 (outlier dot) = 2.5 dp-equiv.
+Gate cost: 2.0 (tight AABB) + 1.0 (outlier dot) = 3.0 dp-equiv.
 """
 
 from __future__ import annotations

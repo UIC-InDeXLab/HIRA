@@ -82,13 +82,19 @@ def topk_threshold(q_normal, keys, k=20):
 
 
 def measure_scanned_fraction(gate_fn, queries, keys, q_indices, q_head_to_kv, K, bf, topk, assign=None):
-    """Run queries through the gate and measure scanned fraction + search time."""
+    """Run queries through the gate and measure scanned fraction + search time.
+
+    queries may be a CPU tensor; each query is moved to GPU on demand to avoid
+    holding all T queries on GPU simultaneously.
+    """
     H_kv, N, D = keys.shape
+    device = keys.device
     fracs = []
     search_times = []
 
     for qi in q_indices:
-        q = queries[:, qi, :]
+        # Move only this query to GPU (queries may live on CPU)
+        q = queries[:, qi, :].to(device=device, dtype=torch.float32)
         q_norm = q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
         q_normal = q / q_norm
 
@@ -132,6 +138,54 @@ def _select_methods(methods: dict[str, object], wanted: str, label: str):
     return selected
 
 
+GATE_COST_DP = {
+    "ball_centroid": 1.0,       # einsum (2D) + add + cmp
+    "l1_ball": 1.0,             # centroid dot; ||q||_inf is query-only overhead
+    "min_enclosing_ball": 1.0,  # same gate as ball
+    "aabb": 2.0,                # 2 muls + max + sum (3D)
+    "cone": 1.5,                # einsum + trig (~2D+20)
+    "hybrid": 4.5,              # ball + AABB + cone
+    "ellipsoid": 2.5,           # einsum + scaled norm (5D)
+    "split_aabb": 4.0,          # 2x AABB
+    "split_hybrid": 7.5,        # split_aabb + ball + ellipsoid
+    "split_full_hybrid": 11.0,  # split_aabb + ball + AABB + cone + ellipsoid
+    "hybrid_plus": 10.0,        # ball + AABB + cone + ellipsoid + centerline
+    "quad_aabb": 8.0,           # 4x AABB
+    "bisect_aabb": 5.0,         # 2x AABB + ball
+    "slab_bundle": 2.0,         # projection + ball
+    "pca_obb": 2.0,             # rotated AABB
+    "topk_aabb_residual": 3.0,  # partial AABB + residual
+    "centerline": 3.0,          # einsum + proj + residual
+    "span_ball": 1.0,           # einsum + add (same as ball)
+    "outlier_ball_centroid": 2.0,  # core ball (1.0) + outlier dot (1.0)
+    "outlier_span_ball": 2.0,  # core span-ball (1.0) + outlier dot (1.0)
+    "axis_interval": 1.0,       # one axis projection + orth residual
+    "dual_axis_interval": 2.0,  # two axis projections + orth residual
+    "pca_interval": 1.0,        # one local-PCA axis projection + orth residual
+    "outlier_aabb": 3.0,        # AABB on core (2.0) + dot for outlier (1.0)
+    "pca_aabb_resid": 1.2,      # centroid dot (1.0) + AABB in 16d (~0.2)
+    "centered_pca_d4": 0.05,
+    "centered_pca_d8": 0.10,
+    "centered_pca_d16": 0.19,
+    "centered_pca_d32": 0.38,
+    "centered_pca_d64": 0.75,
+    "partial_aabb_d4": 1.03,    # mid dot (1.0) + 4 exact dims (~0.03)
+    "partial_aabb_d8": 1.06,    # mid dot (1.0) + 8 exact dims
+    "partial_aabb_d16": 1.12,   # mid dot (1.0) + 16 exact dims
+    "partial_aabb_d32": 1.25,   # mid dot (1.0) + 32 exact dims
+    "partial_aabb_d64": 1.50,   # approaches full AABB
+    "cheap_outlier_aabb": 2.0,  # tight AABB + outlier norm (free)
+    "cheap_outlier_ball_aabb": 3.0,  # tight AABB + centroid ball
+    "pca_proj_d4": 0.05,        # 3*4/(2*128) per cluster + amortized shared
+    "pca_proj_d8": 0.10,        # 3*8/(2*128) per cluster
+    "pca_proj_d16": 0.19,       # 3*16/(2*128) per cluster
+    "pca_proj_d32": 0.38,       # 3*32/(2*128) per cluster
+    "centroid_pca_d4": 1.05,    # centroid (1.0) + PCA residual (~0.05)
+    "centroid_pca_d8": 1.10,    # centroid (1.0) + PCA residual (~0.10)
+    "centroid_pca_d16": 1.19,   # centroid (1.0) + PCA residual (~0.19)
+}
+
+
 # =====================================================================
 #  MAIN
 # =====================================================================
@@ -146,6 +200,8 @@ def main():
     parser.add_argument("--clusterings", type=str, default="all", help='Comma-separated clustering names or "all"')
     parser.add_argument("--enclosings", type=str, default="all", help='Comma-separated enclosing names or "all"')
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducible comparisons")
+    parser.add_argument("--fp16-keys", action="store_true",
+                        help="Store keys on GPU as float16 instead of float32 (~2x memory reduction)")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -167,14 +223,22 @@ def main():
         torch_dtype=DTYPE,
         show_progress=True,
     )
-    print(f"Capture done in {time.perf_counter() - t0:.1f}s\n")
+    print(f"Capture done in {time.perf_counter() - t0:.1f}s")
+
+    # Free GPU memory used by the model — it is no longer needed.
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"GPU memory after model free: {torch.cuda.memory_allocated()/1e9:.2f} GB\n")
 
     layer_ids = capture.layer_ids()
     layer = LAYER_IDX if LAYER_IDX in layer_ids else layer_ids[len(layer_ids) // 2]
     queries_cpu, keys_cpu, _ = capture.to_layer_tensors(layer)
 
-    keys = keys_cpu.to(device=DEVICE, dtype=torch.float32)
-    queries = queries_cpu.to(device=DEVICE, dtype=torch.float32)
+    # Keys go to GPU; queries stay on CPU and are moved one-at-a-time during measurement.
+    keys_dtype = torch.float16 if args.fp16_keys else torch.float32
+    keys = keys_cpu.to(device=DEVICE, dtype=keys_dtype)
+    queries = queries_cpu  # CPU tensor — moved per-query in measure_scanned_fraction
     H_kv, N, D = keys.shape
     H_q = queries.shape[0]
 
@@ -187,17 +251,36 @@ def main():
     q_indices = list(range(total_q - 1, max(0, total_q - args.n_queries * stride) - 1, -stride))
     q_indices = q_indices[: args.n_queries]
 
+    keys_mb = keys.numel() * keys.element_size() / 1e6
+    queries_mb = queries.numel() * queries.element_size() / 1e6
     print(f"Layer {layer}: H_kv={H_kv}, H_q={H_q}, N={N}, D={D}")
     print(f"K={K} parents (bf={args.bf}), {len(q_indices)} queries, topk={args.topk}")
+    print(f"Memory: keys={keys_mb:.0f} MB on GPU ({keys.dtype}), "
+          f"queries={queries_mb:.0f} MB on CPU (moved per-query)")
+    print(f"GPU allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     print("=" * 90)
 
     results = []
+
+    # Clustering and enclosing methods expect float32.
+    # If we stored keys as float16 to save memory, cast here.
+    keys_f32 = keys.float() if keys.dtype != torch.float32 else keys
+
+    # Warn if clustering will require a large N×N distance matrix.
+    # nn_greedy / fast_balanced_nn use cdist -> O(N²) memory.
+    cdist_gb = N * N * 4 / 1e9
+    if cdist_gb > 1.0 and any(
+        name in clustering_methods for name in ("nn_greedy", "fast_balanced_nn", "block_nn")
+    ):
+        print(f"WARNING: N={N} — cdist-based clustering will allocate ~{cdist_gb:.1f} GB. "
+              f"Use --clusterings kcenter,kmeans to avoid OOM.")
+
 
     for clust_name, clust_fn in clustering_methods.items():
         print(f"\nClustering: {clust_name} ...")
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        assign, centers = clust_fn(keys, args.bf)
+        assign, centers = clust_fn(keys_f32, args.bf)
         torch.cuda.synchronize()
         clust_time = time.perf_counter() - t0
 
@@ -205,11 +288,11 @@ def main():
         if q_head_to_kv is not None:
             assign_q = assign[q_head_to_kv]
             centers_q = centers[q_head_to_kv]
-            keys_q = keys[q_head_to_kv]
+            keys_q = keys_f32[q_head_to_kv]
         else:
             assign_q = assign
             centers_q = centers
-            keys_q = keys
+            keys_q = keys_f32
 
         for enc_name, enc_fn in enclosing_methods.items():
             torch.cuda.synchronize()
@@ -245,34 +328,6 @@ def main():
     # ── Gate cost per enclosing method (in dot-product equivalents) ──
     # A dot product of D-dim vectors costs 2D FLOPs.
     # gate_g = gate_FLOPs_per_cluster / (2*D)
-    GATE_COST_DP = {
-        "ball_centroid": 1.0,       # einsum (2D) + add + cmp
-        "l1_ball": 1.0,             # centroid dot; ||q||_inf is query-only overhead
-        "min_enclosing_ball": 1.0,  # same gate as ball
-        "aabb": 1.5,                # 2 muls + max + sum (3D)
-        "cone": 1.5,                # einsum + trig (~2D+20)
-        "hybrid": 3.5,              # ball + AABB + cone
-        "ellipsoid": 2.5,           # einsum + scaled norm (5D)
-        "split_aabb": 3.0,          # 2x AABB
-        "split_hybrid": 6.5,        # split_aabb + ball + ellipsoid
-        "split_full_hybrid": 9.1,   # split_aabb + ball + AABB + cone + ellipsoid
-        "hybrid_plus": 9.5,         # ball + AABB + cone + ellipsoid + centerline
-        "quad_aabb": 6.0,           # 4x AABB
-        "bisect_aabb": 3.5,         # 2x AABB + ball
-        "slab_bundle": 2.0,         # projection + ball
-        "pca_obb": 1.5,             # rotated AABB
-        "topk_aabb_residual": 3.0,  # partial AABB + residual
-        "centerline": 3.0,          # einsum + proj + residual
-        "span_ball": 1.0,           # einsum + add (same as ball)
-        "outlier_ball_centroid": 2.0,  # core ball (1.0) + outlier dot (1.0)
-        "outlier_span_ball": 2.0,  # core span-ball (1.0) + outlier dot (1.0)
-        "axis_interval": 1.0,       # one axis projection + orth residual
-        "dual_axis_interval": 2.0,  # two axis projections + orth residual
-        "pca_interval": 1.0,        # one local-PCA axis projection + orth residual
-        "outlier_aabb": 2.5,        # AABB on core (1.5) + dot for outlier (1.0)
-        "pca_aabb_resid": 1.2,      # centroid dot (1.0) + AABB in 16d (~0.2)
-    }
-
     # ── Summary table ──
     print("\n" + "=" * 120)
     print(
