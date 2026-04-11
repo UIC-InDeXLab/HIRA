@@ -11,16 +11,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import sys
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
-from transformers.modeling_utils import AttentionInterface
-from transformers.models.llama.modeling_llama import eager_attention_forward
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface
+from transformers.models.llama.modeling_llama import eager_attention_forward as _llama_eager_attn
+
+_FLASH_ONLY_KWARGS = frozenset({"sliding_window"})
 
 try:
     from tqdm.auto import tqdm as _tqdm
@@ -51,6 +55,7 @@ from hira.threshold.algs import (
 
 ATTN_CAPTURE_IMPL = "sim_capture_attention_ref"
 _CAPTURE_STATE: "CaptureState | None" = None
+_QWEN2_CAPTURE_PATCHED = False
 
 
 @dataclass
@@ -204,7 +209,9 @@ def _capture_attention_forward(
     if _CAPTURE_STATE is not None:
         _CAPTURE_STATE.record(module=module, query=query, key=key, value=value)
 
-    return eager_attention_forward(
+    eager_attn = _resolve_model_eager_attention(type(module).__module__)
+    filtered = {k: v for k, v in kwargs.items() if k not in _FLASH_ONLY_KWARGS}
+    return eager_attn(
         module,
         query,
         key,
@@ -212,8 +219,23 @@ def _capture_attention_forward(
         attention_mask,
         scaling,
         dropout,
-        **kwargs,
+        **filtered,
     )
+
+
+@lru_cache(maxsize=None)
+def _resolve_model_eager_attention(module_name: str):
+    if module_name.startswith("transformers.models.llama."):
+        return _llama_eager_attn
+
+    module = importlib.import_module(module_name)
+    eager_attn = getattr(module, "eager_attention_forward", None)
+    if eager_attn is None:
+        raise RuntimeError(
+            f"Capture attention does not know how to dispatch eager attention for "
+            f"module '{module_name}'."
+        )
+    return eager_attn
 
 
 def _register_capture_attention_impl() -> None:
@@ -222,6 +244,77 @@ def _register_capture_attention_impl() -> None:
     except ValueError:
         # Already registered in this process.
         pass
+
+
+def _install_qwen2_capture_forward() -> None:
+    global _QWEN2_CAPTURE_PATCHED
+    if _QWEN2_CAPTURE_PATCHED:
+        return
+
+    qwen2_mod = importlib.import_module("transformers.models.qwen2.modeling_qwen2")
+    original_forward = qwen2_mod.Qwen2Attention.forward
+
+    def _capture_forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values=None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = qwen2_mod.apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
+
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+                cache_kwargs,
+            )
+
+        if _CAPTURE_STATE is not None:
+            _CAPTURE_STATE.record(
+                module=self,
+                query=query_states,
+                key=key_states,
+                value=value_states,
+            )
+
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation,
+            qwen2_mod.eager_attention_forward,
+        )
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+    qwen2_mod.Qwen2Attention.forward = _capture_forward
+    qwen2_mod.Qwen2Attention._capture_original_forward = original_forward
+    _QWEN2_CAPTURE_PATCHED = True
 
     try:
         ALL_MASK_ATTENTION_FUNCTIONS.register(
@@ -420,15 +513,23 @@ def _capture_qkv(
 ) -> CaptureState:
     global _CAPTURE_STATE
 
-    _register_capture_attention_impl()
-
+    config = AutoConfig.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map=device,
-        dtype=torch_dtype,
-        attn_implementation=ATTN_CAPTURE_IMPL,
-    )
+    if config.model_type == "qwen2":
+        _install_qwen2_capture_forward()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map=device,
+            dtype=torch_dtype,
+        )
+    else:
+        _register_capture_attention_impl()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map=device,
+            dtype=torch_dtype,
+            attn_implementation=ATTN_CAPTURE_IMPL,
+        )
     model.eval()
 
     messages = [{"role": "user", "content": prompt_text}]
@@ -438,6 +539,7 @@ def _capture_qkv(
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
 
     generated_ids = inputs.input_ids
+    attention_mask = inputs.attention_mask
     past_key_values = None
 
     capture = CaptureState()
@@ -459,6 +561,7 @@ def _capture_qkv(
                 input_ids = generated_ids if step == 0 else generated_ids[:, -1:]
                 outputs = model(
                     input_ids=input_ids,
+                    attention_mask=attention_mask,
                     use_cache=True,
                     past_key_values=past_key_values,
                 )
@@ -472,6 +575,17 @@ def _capture_qkv(
                     outputs.logits[:, -1, :], dim=-1, keepdim=True
                 )
                 generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                attention_mask = torch.cat(
+                    [
+                        attention_mask,
+                        torch.ones(
+                            (attention_mask.shape[0], 1),
+                            dtype=attention_mask.dtype,
+                            device=attention_mask.device,
+                        ),
+                    ],
+                    dim=1,
+                )
 
                 if show_tokens:
                     tok_str = tokenizer.decode(
@@ -484,14 +598,15 @@ def _capture_qkv(
     finally:
         _CAPTURE_STATE = None
 
+    gen_count = capture.generated_token_count()
+
     if show_tokens:
-        print(f"\n\033[90m--- [{n}/{n} done] ---\033[0m")
+        print(f"\n\033[90m--- [{gen_count}/{n} done] ---\033[0m")
         print(f"{'=' * 60}\n")
 
     if capture.prompt_length is None:
         raise RuntimeError("Failed to capture prompt length from attention calls.")
 
-    gen_count = capture.generated_token_count()
     if gen_count < n:
         raise RuntimeError(
             f"Captured only {gen_count} generated queries, expected at least {n}."
