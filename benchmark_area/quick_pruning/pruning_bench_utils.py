@@ -62,6 +62,43 @@ class CaptureState:
     generated_keys: dict[int, list[torch.Tensor]] = field(default_factory=dict)
     generated_values: dict[int, list[torch.Tensor]] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "prompt_length": self.prompt_length,
+            "prefill_keys": self.prefill_keys,
+            "prefill_values": self.prefill_values,
+            "generated_queries": self.generated_queries,
+            "generated_keys": self.generated_keys,
+            "generated_values": self.generated_values,
+        }
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.to_dict(), path)
+
+    @classmethod
+    def load(cls, path: Path) -> "CaptureState":
+        data = torch.load(path, map_location="cpu")
+        return cls(
+            prompt_length=data["prompt_length"],
+            prefill_keys={int(k): v.contiguous() for k, v in data["prefill_keys"].items()},
+            prefill_values={
+                int(k): v.contiguous() for k, v in data["prefill_values"].items()
+            },
+            generated_queries={
+                int(k): [x.contiguous() for x in values]
+                for k, values in data["generated_queries"].items()
+            },
+            generated_keys={
+                int(k): [x.contiguous() for x in values]
+                for k, values in data["generated_keys"].items()
+            },
+            generated_values={
+                int(k): [x.contiguous() for x in values]
+                for k, values in data["generated_values"].items()
+            },
+        )
+
     def _to_cpu_half(self, x: torch.Tensor) -> torch.Tensor:
         return x.detach().to(device="cpu", dtype=torch.float16).contiguous()
 
@@ -379,6 +416,7 @@ def _capture_qkv(
     device: str,
     torch_dtype: torch.dtype,
     show_progress: bool,
+    show_tokens: bool = False,
 ) -> CaptureState:
     global _CAPTURE_STATE
 
@@ -405,9 +443,16 @@ def _capture_qkv(
     capture = CaptureState()
     _CAPTURE_STATE = capture
 
+    if show_tokens:
+        print(f"\n{'=' * 60}")
+        print("GENERATED TEXT (progressive)")
+        print(f"{'=' * 60}")
+
     try:
         steps = range(n + 1)
-        iterator = _tqdm(steps, desc="Capture QKV", disable=not show_progress)
+        # Disable tqdm when showing tokens — use inline progress instead.
+        use_tqdm = show_progress and not show_tokens
+        iterator = _tqdm(steps, desc="Capture QKV", disable=not use_tqdm)
 
         with torch.no_grad():
             for step in iterator:
@@ -428,8 +473,20 @@ def _capture_qkv(
                 )
                 generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
+                if show_tokens:
+                    tok_str = tokenizer.decode(
+                        next_token[0, 0].item(), skip_special_tokens=False
+                    )
+                    print(tok_str, end="", flush=True)
+                    if step % 200 == 0:
+                        print(f"\n\033[90m--- [{step}/{n}] ---\033[0m", flush=True)
+
     finally:
         _CAPTURE_STATE = None
+
+    if show_tokens:
+        print(f"\n\033[90m--- [{n}/{n} done] ---\033[0m")
+        print(f"{'=' * 60}\n")
 
     if capture.prompt_length is None:
         raise RuntimeError("Failed to capture prompt length from attention calls.")

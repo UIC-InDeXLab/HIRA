@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from pruning_bench_utils import _capture_qkv, _q_to_kv_map
+from pruning_bench_utils import CaptureState, _capture_qkv, _q_to_kv_map
 from clusterings import CLUSTERING_METHODS
 from enclosings import ENCLOSING_METHODS
 
@@ -157,6 +157,7 @@ GATE_COST_DP = {
     "topk_aabb_residual": 3.0,  # partial AABB + residual
     "centerline": 3.0,          # einsum + proj + residual
     "span_ball": 1.0,           # einsum + add (same as ball)
+    "pair_ball": 1.0,           # exact midpoint ball for bf=2 pairs
     "outlier_ball_centroid": 2.0,  # core ball (1.0) + outlier dot (1.0)
     "outlier_span_ball": 2.0,  # core span-ball (1.0) + outlier dot (1.0)
     "axis_interval": 1.0,       # one axis projection + orth residual
@@ -200,6 +201,12 @@ def main():
     parser.add_argument("--clusterings", type=str, default="all", help='Comma-separated clustering names or "all"')
     parser.add_argument("--enclosings", type=str, default="all", help='Comma-separated enclosing names or "all"')
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducible comparisons")
+    parser.add_argument(
+        "--input-qkv",
+        type=Path,
+        default=None,
+        help="Optional path to a saved QKV capture from debug_capture.py.",
+    )
     parser.add_argument("--fp16-keys", action="store_true",
                         help="Store keys on GPU as float16 instead of float32 (~2x memory reduction)")
     args = parser.parse_args()
@@ -213,17 +220,23 @@ def main():
     clustering_methods = _select_methods(CLUSTERING_METHODS, args.clusterings, "clustering")
     enclosing_methods = _select_methods(ENCLOSING_METHODS, args.enclosings, "enclosing")
 
-    print(f"Capturing {args.n_tokens} tokens from {args.model} ...")
-    t0 = time.perf_counter()
-    capture = _capture_qkv(
-        model_name=args.model,
-        prompt_text=PROMPT,
-        n=args.n_tokens,
-        device=DEVICE,
-        torch_dtype=DTYPE,
-        show_progress=True,
-    )
-    print(f"Capture done in {time.perf_counter() - t0:.1f}s")
+    if args.input_qkv is not None:
+        print(f"Loading captured QKV from {args.input_qkv} ...")
+        t0 = time.perf_counter()
+        capture = CaptureState.load(args.input_qkv)
+        print(f"Load done in {time.perf_counter() - t0:.1f}s")
+    else:
+        print(f"Capturing {args.n_tokens} tokens from {args.model} ...")
+        t0 = time.perf_counter()
+        capture = _capture_qkv(
+            model_name=args.model,
+            prompt_text=PROMPT,
+            n=args.n_tokens,
+            device=DEVICE,
+            torch_dtype=DTYPE,
+            show_progress=True,
+        )
+        print(f"Capture done in {time.perf_counter() - t0:.1f}s")
 
     # Free GPU memory used by the model — it is no longer needed.
     import gc
