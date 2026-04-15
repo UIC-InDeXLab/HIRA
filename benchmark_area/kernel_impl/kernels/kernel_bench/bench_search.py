@@ -142,6 +142,16 @@ def main():
     results.append(("torch_baseline (full dot)", per_q))
     print(f"  {'torch_baseline':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
 
+    def matmul_baseline():
+        keys_q = keys if q_head_to_kv is None else keys[q_head_to_kv]
+        for qn in qn_list:
+            _ = torch.matmul(keys_q, qn.unsqueeze(-1)).squeeze(-1)
+
+    ms = time_call(matmul_baseline, iters=args.iters, warmup=3)
+    per_q = ms / len(qn_list)
+    results.append(("matmul baseline", per_q))
+    print(f"  {'matmul baseline':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
+
     print("-" * 70)
     best = min(results, key=lambda r: r[1])
     print(f"Fastest: {best[0]} at {best[1]:.3f} ms/query")

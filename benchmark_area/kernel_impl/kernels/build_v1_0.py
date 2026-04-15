@@ -11,6 +11,9 @@ Output:
     assigns:    list[(H, N) int64] — point -> cluster for each subspace
     centers:    list[(H, K, d_s) float32]
     radii:      list[(H, K) float32]
+    child_order:   list[(H, N) int64]   — parent-major child permutation
+    child_offsets: list[(H, K + 1) int32] — offsets into child_order
+    child_counts:  list[(H, K) int32]   — members per parent
 """
 
 from __future__ import annotations
@@ -98,6 +101,35 @@ def _ball_centroid(keys_sub, assign, centers, K):
     return radii
 
 
+def _parent_major_layout(assign: torch.Tensor, K: int):
+    """Build a per-head parent-major child order for the current assignments.
+
+    Exact fixed-width [i*bf:(i+1)*bf] blocks are not valid for the current
+    unconstrained k-center assignment because cluster sizes can exceed bf.
+    This stores the next-best layout: each parent's children are contiguous in
+    a variable-length range [offset[i]:offset[i+1]].
+    """
+    H, N = assign.shape
+    device = assign.device
+
+    child_order = torch.empty(H, N, dtype=torch.long, device=device)
+    child_offsets = torch.empty(H, K + 1, dtype=torch.int32, device=device)
+    child_counts = torch.empty(H, K, dtype=torch.int32, device=device)
+
+    for h in range(H):
+        counts = torch.bincount(assign[h], minlength=K).to(torch.int32)
+        order = torch.argsort(assign[h], stable=True)
+        offsets = torch.empty(K + 1, dtype=torch.int32, device=device)
+        offsets[0] = 0
+        offsets[1:] = counts.cumsum(dim=0)
+
+        child_order[h] = order
+        child_offsets[h] = offsets
+        child_counts[h] = counts
+
+    return child_order, child_offsets, child_counts
+
+
 def build(keys: torch.Tensor, bf: int, n_subspaces: int, refine_iter: int = 5):
     """Build subspace k-center index.
 
@@ -108,19 +140,27 @@ def build(keys: torch.Tensor, bf: int, n_subspaces: int, refine_iter: int = 5):
     slices = _split_contiguous(D, n_subspaces)
 
     assigns, centers, radii = [], [], []
+    child_order, child_offsets, child_counts = [], [], []
     for start, end in slices:
         keys_sub = keys[:, :, start:end].contiguous()
         a, c = _kcenter_subspace(keys_sub, K, refine_iter)
         r = _ball_centroid(keys_sub, a, c, K)
+        order, offsets, counts = _parent_major_layout(a, K)
         assigns.append(a)
         centers.append(c)
         radii.append(r)
+        child_order.append(order)
+        child_offsets.append(offsets)
+        child_counts.append(counts)
 
     return {
         "dim_slices": slices,
         "assigns": assigns,
         "centers": centers,
         "radii": radii,
+        "child_order": child_order,
+        "child_offsets": child_offsets,
+        "child_counts": child_counts,
         "K": K,
         "N": N,
     }

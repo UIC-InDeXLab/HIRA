@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from .build_v1_0 import build as _build_v1_0
+from .build_v1_0 import _parent_major_layout, build as _build_v1_0
 
 KERNEL_VERSION = "v1.0"
 
@@ -44,6 +44,7 @@ def update(
         K_old = state["K"]
         new_dim_slices = state["dim_slices"]  # same splits
         new_assigns, new_centers, new_radii = [], [], []
+        new_child_order, new_child_offsets, new_child_counts = [], [], []
 
         for s in range(n_subspaces):
             # Offset buffer assigns into the appended parent range.
@@ -52,15 +53,22 @@ def update(
             )
             c_new = torch.cat([state["centers"][s], sub_state["centers"][s]], dim=1)
             r_new = torch.cat([state["radii"][s], sub_state["radii"][s]], dim=1)
+            order, offsets, counts = _parent_major_layout(a_new, K_old + sub_state["K"])
             new_assigns.append(a_new)
             new_centers.append(c_new)
             new_radii.append(r_new)
+            new_child_order.append(order)
+            new_child_offsets.append(offsets)
+            new_child_counts.append(counts)
 
         new_state = {
             "dim_slices": new_dim_slices,
             "assigns": new_assigns,
             "centers": new_centers,
             "radii": new_radii,
+            "child_order": new_child_order,
+            "child_offsets": new_child_offsets,
+            "child_counts": new_child_counts,
             "K": K_old + sub_state["K"],
             "N": state["N"] + sub_state["N"],
         }
