@@ -6,6 +6,8 @@ Per subspace:
     assigns[s]: (H, N) int64 — point -> cluster id
     centers[s]: (H, K, d_s) — parent layer
     radii[s]:   (H, K) — ball radius
+    child_order[s]:   (H, N) int64 — parent-major child permutation
+    child_offsets[s]: (H, K + 1) int32 — offsets into child_order
 """
 
 from __future__ import annotations
@@ -122,7 +124,11 @@ class SubspaceKCenterIndex:
         if self.buffer is not None:
             total += self.buffer.element_size() * self.buffer.numel()
         if self.state is not None:
-            for t in self.state["assigns"] + self.state["centers"] + self.state["radii"]:
+            tensors = self.state["assigns"] + self.state["centers"] + self.state["radii"]
+            tensors += self.state.get("child_order", [])
+            tensors += self.state.get("child_offsets", [])
+            tensors += self.state.get("child_counts", [])
+            for t in tensors:
                 total += t.element_size() * t.numel()
         return total
 
