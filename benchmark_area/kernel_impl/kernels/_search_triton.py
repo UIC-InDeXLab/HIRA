@@ -440,6 +440,32 @@ def triton_fused_cluster_pass(
     K = centers.shape[2]
     out = torch.empty(S, H_q, K, device=q_packed.device, dtype=torch.int8)
 
+    triton_fused_cluster_pass_out(
+        q_packed=q_packed,
+        q_norm=q_norm,
+        th=th,
+        centers=centers,
+        radii=radii,
+        groups=groups,
+        out=out,
+    )
+    return out
+
+
+def triton_fused_cluster_pass_out(
+    q_packed: torch.Tensor,   # (S, H_q, max_d)
+    q_norm: torch.Tensor,     # (S, H_q)
+    th: torch.Tensor,         # (S, H_q)
+    centers: torch.Tensor,    # (S, H_kv, K, max_d)
+    radii: torch.Tensor,      # (S, H_kv, K)
+    groups: int,
+    out: torch.Tensor,        # (S, H_q, K)
+) -> torch.Tensor:
+    """Writes int8 cluster_pass into ``out`` and returns it."""
+    S, H_q, max_d = q_packed.shape
+    H_kv = centers.shape[1]
+    K = centers.shape[2]
+
     groups_pow = 1
     while groups_pow < max(groups, 8):
         groups_pow *= 2

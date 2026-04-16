@@ -23,11 +23,39 @@ if str(REPO_ROOT) not in sys.path:
 
 from hira.benchmark_area.kernel_impl.kernels import search_kernels
 from hira.benchmark_area.kernel_impl.kernels.build_v1_0 import build as build_v1
+from hira.benchmark_area.kernel_impl.kernels.build_v2_0 import build as build_v2
+from hira.benchmark_area.kernel_impl.kernels.build_v2_1 import build as build_v2_1
+from hira.benchmark_area.kernel_impl.kernels.build_v2_2 import build as build_v2_2
+from hira.benchmark_area.kernel_impl.kernels.build_v2_3 import build as build_v2_3
 from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
     CaptureState,
     _capture_qkv,
     _q_to_kv_map,
 )
+
+SEARCH_BUILD_KERNELS = {
+    "search_v10_0": "build_v2_0",
+    "search_v11_0": "build_v2_1",
+    "search_v12_0": "build_v2_2",
+    "search_v12_1": "build_v2_2",
+    "search_v13_0": "build_v2_1",
+    "search_v14_0": "build_v2_3",
+    "search_v15_0": "build_v2_1",
+    "search_v16_0": "build_v2_1",
+    "search_v16_1": "build_v2_1",
+    "search_v17_0": "build_v2_1",
+    "search_v17_1": "build_v2_1",
+    "search_v18_0": "build_v2_1",
+    "search_v18_1": "build_v2_1",
+}
+
+BUILD_FNS = {
+    "build_v1_0": build_v1,
+    "build_v2_0": build_v2,
+    "build_v2_1": build_v2_1,
+    "build_v2_2": build_v2_2,
+    "build_v2_3": build_v2_3,
+}
 
 
 def subspace_topk_thresholds(q, keys, topk, dim_slices):
@@ -93,32 +121,45 @@ def main():
     H_kv, N, D = keys.shape
     q_head_to_kv = _q_to_kv_map(H_q, H_kv, "cuda") if H_q != H_kv else None
 
-    # Build once (v1 kernel) — we're benching search, not build.
-    state = build_v1(keys, args.bf, args.S, args.refine_iter)
     buffer = torch.empty(H_kv, 0, D, device="cuda", dtype=torch.float32)
+    state_cache: dict[str, dict] = {}
+
+    def get_state(build_name: str) -> dict:
+        state = state_cache.get(build_name)
+        if state is None:
+            state = BUILD_FNS[build_name](keys, args.bf, args.S, args.refine_iter)
+            state_cache[build_name] = state
+        return state
 
     # Pre-compute per-subspace thresholds over a sweep of queries; average across them.
     total_q = queries.shape[1]
     stride = max(1, total_q // args.n_queries)
     q_indices = list(range(total_q - 1, max(0, total_q - args.n_queries * stride) - 1, -stride))[: args.n_queries]
 
-    # Precompute (q, thresholds) pairs to avoid including them in timing.
-    qn_list, th_list = [], []
-    for qi in q_indices:
-        q = queries[:, qi, :].to(device="cuda", dtype=torch.float32)
-        qn = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        keys_eval = keys if q_head_to_kv is None else keys[q_head_to_kv]
-        q_eval = qn
-        th = subspace_topk_thresholds(q_eval, keys_eval, args.topk, state["dim_slices"])
-        qn_list.append(qn)
-        th_list.append(th)
+    required_builds = {
+        SEARCH_BUILD_KERNELS.get(name, "build_v1_0")
+        for name in search_kernels()
+    }
+    query_pairs_by_build: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+    keys_eval = keys if q_head_to_kv is None else keys[q_head_to_kv]
+
+    # Precompute (q, thresholds) pairs per build layout to avoid including them in timing.
+    for build_name in sorted(required_builds):
+        state = get_state(build_name)
+        pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for qi in q_indices:
+            q = queries[:, qi, :].to(device="cuda", dtype=torch.float32)
+            qn = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            th = subspace_topk_thresholds(qn, keys_eval, args.topk, state["dim_slices"])
+            pairs.append((qn, th))
+        query_pairs_by_build[build_name] = pairs
 
     print(f"search micro-bench: layer {layer} H_q={H_q} H_kv={H_kv} N={N} D={D} S={args.S}")
     print("-" * 70)
 
-    def bench_fn(fn):
+    def bench_fn(fn, state, query_pairs):
         def f():
-            for qn, th in zip(qn_list, th_list):
+            for qn, th in query_pairs:
                 fn(q=qn, th_per_subspace=th, state=state,
                    buffer_keys=buffer, keys_children=keys,
                    q_head_to_kv=q_head_to_kv)
@@ -126,31 +167,58 @@ def main():
 
     results = []
     for name, info in sorted(search_kernels().items()):
-        ms = time_call(bench_fn(info.fn), iters=args.iters, warmup=3)
-        per_q = ms / len(qn_list)
+        build_name = SEARCH_BUILD_KERNELS.get(name, "build_v1_0")
+        state = get_state(build_name)
+        query_pairs = query_pairs_by_build[build_name]
+        ms = time_call(bench_fn(info.fn, state, query_pairs), iters=args.iters, warmup=3)
+        per_q = ms / len(query_pairs)
         results.append((f"{name} ({info.version})", per_q))
-        print(f"  {name:<24s} {info.version:<6s}  {per_q:8.3f} ms/query")
+        print(f"  {name:<24s} {info.version:<6s}  {per_q:8.3f} ms/query  [{build_name}]")
 
     # Torch baseline: brute-force dot product over all keys
+    keys_q = keys if q_head_to_kv is None else keys[q_head_to_kv]
+    baseline_pairs = query_pairs_by_build.get("build_v1_0")
+    if baseline_pairs is None:
+        baseline_pairs = next(iter(query_pairs_by_build.values()))
+
     def baseline():
-        keys_q = keys if q_head_to_kv is None else keys[q_head_to_kv]
-        for qn in qn_list:
+        for qn, _ in baseline_pairs:
             _ = torch.einsum("hd,hnd->hn", qn, keys_q)
 
     ms = time_call(baseline, iters=args.iters, warmup=3)
-    per_q = ms / len(qn_list)
+    per_q = ms / len(baseline_pairs)
     results.append(("torch_baseline (full dot)", per_q))
     print(f"  {'torch_baseline':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
 
     def matmul_baseline():
-        keys_q = keys if q_head_to_kv is None else keys[q_head_to_kv]
-        for qn in qn_list:
+        for qn, _ in baseline_pairs:
             _ = torch.matmul(keys_q, qn.unsqueeze(-1)).squeeze(-1)
 
     ms = time_call(matmul_baseline, iters=args.iters, warmup=3)
-    per_q = ms / len(qn_list)
+    per_q = ms / len(baseline_pairs)
     results.append(("matmul baseline", per_q))
     print(f"  {'matmul baseline':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
+
+    # FP16 baselines for fair comparison with fp16-key search kernels
+    keys_q_f16 = keys_q.half()
+
+    def baseline_fp16():
+        for qn, _ in baseline_pairs:
+            _ = torch.einsum("hd,hnd->hn", qn.half(), keys_q_f16)
+
+    ms = time_call(baseline_fp16, iters=args.iters, warmup=3)
+    per_q = ms / len(baseline_pairs)
+    results.append(("torch_baseline fp16", per_q))
+    print(f"  {'torch_baseline fp16':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
+
+    def matmul_baseline_fp16():
+        for qn, _ in baseline_pairs:
+            _ = torch.matmul(keys_q_f16, qn.half().unsqueeze(-1)).squeeze(-1)
+
+    ms = time_call(matmul_baseline_fp16, iters=args.iters, warmup=3)
+    per_q = ms / len(baseline_pairs)
+    results.append(("matmul baseline fp16", per_q))
+    print(f"  {'matmul baseline fp16':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
 
     print("-" * 70)
     best = min(results, key=lambda r: r[1])
