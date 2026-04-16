@@ -25,7 +25,9 @@ from hira.benchmark_area.kernel_impl.kernels import search_kernels
 from hira.benchmark_area.kernel_impl.kernels.build_v1_0 import build as build_v1
 from hira.benchmark_area.kernel_impl.kernels.build_v2_0 import build as build_v2
 from hira.benchmark_area.kernel_impl.kernels.build_v2_1 import build as build_v2_1
+from hira.benchmark_area.kernel_impl.kernels.build_v2_1_fp16 import build as build_v2_1_fp16
 from hira.benchmark_area.kernel_impl.kernels.build_v2_2 import build as build_v2_2
+from hira.benchmark_area.kernel_impl.kernels.build_v2_2_fp16 import build as build_v2_2_fp16
 from hira.benchmark_area.kernel_impl.kernels.build_v2_3 import build as build_v2_3
 from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
     CaptureState,
@@ -36,24 +38,31 @@ from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
 SEARCH_BUILD_KERNELS = {
     "search_v10_0": "build_v2_0",
     "search_v11_0": "build_v2_1",
+    "search_v11_1": "build_v2_1_fp16",
     "search_v12_0": "build_v2_2",
     "search_v12_1": "build_v2_2",
+    "search_v12_2": "build_v2_2_fp16",
     "search_v13_0": "build_v2_1",
     "search_v14_0": "build_v2_3",
     "search_v15_0": "build_v2_1",
+    "search_v15_1": "build_v2_1_fp16",
     "search_v16_0": "build_v2_1",
     "search_v16_1": "build_v2_1",
     "search_v17_0": "build_v2_1",
     "search_v17_1": "build_v2_1",
     "search_v18_0": "build_v2_1",
     "search_v18_1": "build_v2_1",
+    "search_v18_2": "build_v2_1_fp16",
+    "search_v18_3": "build_v2_1",
 }
 
 BUILD_FNS = {
     "build_v1_0": build_v1,
     "build_v2_0": build_v2,
     "build_v2_1": build_v2_1,
+    "build_v2_1_fp16": build_v2_1_fp16,
     "build_v2_2": build_v2_2,
+    "build_v2_2_fp16": build_v2_2_fp16,
     "build_v2_3": build_v2_3,
 }
 
