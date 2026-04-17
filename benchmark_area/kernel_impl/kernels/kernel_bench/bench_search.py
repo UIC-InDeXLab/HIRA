@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from hira.benchmark_area.kernel_impl.kernels import search_kernels
+from hira.benchmark_area.kernel_impl.kernels import attention_kernels, search_kernels
 from hira.benchmark_area.kernel_impl.kernels.build_v1_0 import build as build_v1
 from hira.benchmark_area.kernel_impl.kernels.build_v2_0 import build as build_v2
 from hira.benchmark_area.kernel_impl.kernels.build_v2_1 import build as build_v2_1
@@ -29,6 +29,7 @@ from hira.benchmark_area.kernel_impl.kernels.build_v2_1_fp16 import build as bui
 from hira.benchmark_area.kernel_impl.kernels.build_v2_2 import build as build_v2_2
 from hira.benchmark_area.kernel_impl.kernels.build_v2_2_fp16 import build as build_v2_2_fp16
 from hira.benchmark_area.kernel_impl.kernels.build_v2_3 import build as build_v2_3
+from hira.benchmark_area.kernel_impl.kernels.build_v2_4 import build as build_v2_4
 from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
     CaptureState,
     _capture_qkv,
@@ -56,6 +57,20 @@ SEARCH_BUILD_KERNELS = {
     "search_v18_3": "build_v2_1",
 }
 
+ATTENTION_BUILD_KERNELS = {
+    "attention_v1_0": "build_v2_4",
+    "attention_v1_1": "build_v2_4",
+    "attention_v1_2": "build_v2_4",
+    "attention_v1_3": "build_v2_4",
+    "attention_v1_4": "build_v2_4",
+    "attention_v1_5": "build_v2_4",
+    "attention_v1_6": "build_v2_4",
+    "attention_v1_7": "build_v2_4",
+    "attention_v1_8": "build_v2_4",
+    "attention_v1_9": "build_v2_4",
+    "attention_v1_10": "build_v2_4",
+}
+
 BUILD_FNS = {
     "build_v1_0": build_v1,
     "build_v2_0": build_v2,
@@ -64,6 +79,7 @@ BUILD_FNS = {
     "build_v2_2": build_v2_2,
     "build_v2_2_fp16": build_v2_2_fp16,
     "build_v2_3": build_v2_3,
+    "build_v2_4": build_v2_4,
 }
 
 
@@ -105,6 +121,11 @@ def main():
     p.add_argument("--topk", type=int, default=20)
     p.add_argument("--n-queries", type=int, default=20)
     p.add_argument("--iters", type=int, default=10)
+    p.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail on the first kernel error instead of skipping incompatible kernels.",
+    )
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -123,20 +144,34 @@ def main():
 
     layer_ids = cap.layer_ids()
     layer = args.layer if args.layer in layer_ids else layer_ids[len(layer_ids) // 2]
-    queries_cpu, keys_cpu, _ = cap.to_layer_tensors(layer)
+    queries_cpu, keys_cpu, values_cpu = cap.to_layer_tensors(layer)
     keys = keys_cpu.to(device="cuda", dtype=torch.float32)
+    values = (
+        values_cpu.to(device="cuda", dtype=torch.float32)
+        if values_cpu is not None else None
+    )
     queries = queries_cpu
     H_q = queries.shape[0]
     H_kv, N, D = keys.shape
+    D_v = int(values.shape[-1]) if values is not None else D
     q_head_to_kv = _q_to_kv_map(H_q, H_kv, "cuda") if H_q != H_kv else None
 
     buffer = torch.empty(H_kv, 0, D, device="cuda", dtype=torch.float32)
+    value_buffer = (
+        torch.empty(H_kv, 0, D_v, device="cuda", dtype=torch.float32)
+        if values is not None else None
+    )
     state_cache: dict[str, dict] = {}
 
     def get_state(build_name: str) -> dict:
         state = state_cache.get(build_name)
         if state is None:
-            state = BUILD_FNS[build_name](keys, args.bf, args.S, args.refine_iter)
+            if build_name == "build_v2_4":
+                state = BUILD_FNS[build_name](
+                    keys, args.bf, args.S, args.refine_iter, values=values
+                )
+            else:
+                state = BUILD_FNS[build_name](keys, args.bf, args.S, args.refine_iter)
             state_cache[build_name] = state
         return state
 
@@ -148,6 +183,9 @@ def main():
     required_builds = {
         SEARCH_BUILD_KERNELS.get(name, "build_v1_0")
         for name in search_kernels()
+    } | {
+        ATTENTION_BUILD_KERNELS.get(name, "build_v2_4")
+        for name in attention_kernels()
     }
     query_pairs_by_build: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
     keys_eval = keys if q_head_to_kv is None else keys[q_head_to_kv]
@@ -175,13 +213,45 @@ def main():
         return f
 
     results = []
+    skipped: list[tuple[str, str]] = []
+
+    def _record_skip(label: str, reason: str) -> None:
+        skipped.append((label, reason))
+
+    def _try_bench(label: str, build_name: str, fn) -> float | None:
+        try:
+            ms = time_call(fn, iters=args.iters, warmup=3)
+            return ms
+        except Exception as exc:
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            if args.strict:
+                raise
+            reason = f"{type(exc).__name__}: {exc}"
+            _record_skip(label, reason)
+            print(f"  {label:<24s} {'skip':<6s}  {'-':>8s} ms/query  [{build_name}]  {reason}")
+            return None
+
     for name, info in sorted(search_kernels().items()):
         build_name = SEARCH_BUILD_KERNELS.get(name, "build_v1_0")
-        state = get_state(build_name)
-        query_pairs = query_pairs_by_build[build_name]
-        ms = time_call(bench_fn(info.fn, state, query_pairs), iters=args.iters, warmup=3)
+        label = f"{name} ({info.version})"
+        try:
+            state = get_state(build_name)
+            query_pairs = query_pairs_by_build[build_name]
+        except Exception as exc:
+            if args.strict:
+                raise
+            reason = f"{type(exc).__name__}: {exc}"
+            _record_skip(label, reason)
+            print(f"  {name:<24s} {'skip':<6s}  {'-':>8s} ms/query  [{build_name}]  {reason}")
+            continue
+        ms = _try_bench(name, build_name, bench_fn(info.fn, state, query_pairs))
+        if ms is None:
+            continue
         per_q = ms / len(query_pairs)
-        results.append((f"{name} ({info.version})", per_q))
+        results.append((label, per_q))
         print(f"  {name:<24s} {info.version:<6s}  {per_q:8.3f} ms/query  [{build_name}]")
 
     # Torch baseline: brute-force dot product over all keys
@@ -229,9 +299,145 @@ def main():
     results.append(("matmul baseline fp16", per_q))
     print(f"  {'matmul baseline fp16':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
 
+    # ── Fused attention kernels + attention baselines ──
+    if values is not None:
+        print("-" * 70)
+        print("Attention (fused search + softmax + @V → (H_q, D_v))")
+        import math
+        scale = 1.0 / math.sqrt(D)
+        values_q = values if q_head_to_kv is None else values[q_head_to_kv]
+        values_q_f16 = values_q.half()
+        successful_attention: list[tuple[str, object, str]] = []
+
+        for name, info in sorted(attention_kernels().items()):
+            build_name = ATTENTION_BUILD_KERNELS.get(name, "build_v2_4")
+            label = f"{name} ({info.version})"
+            try:
+                state = get_state(build_name)
+                query_pairs = query_pairs_by_build.get(build_name) or next(
+                    iter(query_pairs_by_build.values())
+                )
+            except Exception as exc:
+                if args.strict:
+                    raise
+                reason = f"{type(exc).__name__}: {exc}"
+                _record_skip(label, reason)
+                print(f"  {name:<24s} {'skip':<6s}  {'-':>8s} ms/query  [{build_name}]  {reason}")
+                continue
+
+            def attend_fn():
+                for qn, th in query_pairs:
+                    info.fn(
+                        q=qn, th_per_subspace=th, state=state,
+                        buffer_keys=buffer,
+                        buffer_values=value_buffer,
+                        keys_children=keys,
+                        q_head_to_kv=q_head_to_kv,
+                        scale=scale,
+                    )
+
+            ms = _try_bench(name, build_name, attend_fn)
+            if ms is None:
+                continue
+            per_q = ms / len(query_pairs)
+            results.append((label, per_q))
+            successful_attention.append((name, info, build_name))
+            print(f"  {name:<24s} {info.version:<6s}  {per_q:8.3f} ms/query  [{build_name}]")
+
+        # Dense attention baseline (fp32 math, matches our fused output dtype).
+        def dense_attn_fp32():
+            for qn, _ in baseline_pairs:
+                scores = torch.einsum("hd,hnd->hn", qn, keys_q) * scale
+                probs = torch.softmax(scores, dim=-1)
+                _ = torch.einsum("hn,hnd->hd", probs, values_q)
+
+        ms = time_call(dense_attn_fp32, iters=args.iters, warmup=3)
+        per_q = ms / len(baseline_pairs)
+        results.append(("dense attn fp32", per_q))
+        print(f"  {'dense attn fp32':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
+
+        # FP16 dense attention.
+        def dense_attn_fp16():
+            for qn, _ in baseline_pairs:
+                scores = torch.einsum("hd,hnd->hn", qn.half(), keys_q_f16) * scale
+                probs = torch.softmax(scores.float(), dim=-1).half()
+                _ = torch.einsum("hn,hnd->hd", probs, values_q_f16)
+
+        ms = time_call(dense_attn_fp16, iters=args.iters, warmup=3)
+        per_q = ms / len(baseline_pairs)
+        results.append(("dense attn fp16", per_q))
+        print(f"  {'dense attn fp16':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
+
+        # SDPA (flash backend chosen automatically).
+        def sdpa_baseline():
+            for qn, _ in baseline_pairs:
+                q4 = qn.view(1, H_q, 1, D)
+                k4 = keys_q.view(1, H_q, N, D)
+                v4 = values_q.view(1, H_q, N, D_v)
+                _ = torch.nn.functional.scaled_dot_product_attention(
+                    q4, k4, v4, is_causal=False, scale=scale
+                )
+
+        ms = time_call(sdpa_baseline, iters=args.iters, warmup=3)
+        per_q = ms / len(baseline_pairs)
+        results.append(("sdpa fp32", per_q))
+        print(f"  {'sdpa fp32':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
+
+        def sdpa_baseline_fp16():
+            for qn, _ in baseline_pairs:
+                q4 = qn.half().view(1, H_q, 1, D)
+                k4 = keys_q_f16.view(1, H_q, N, D)
+                v4 = values_q_f16.view(1, H_q, N, D_v)
+                _ = torch.nn.functional.scaled_dot_product_attention(
+                    q4, k4, v4, is_causal=False, scale=scale
+                )
+
+        ms = time_call(sdpa_baseline_fp16, iters=args.iters, warmup=3)
+        per_q = ms / len(baseline_pairs)
+        results.append(("sdpa fp16", per_q))
+        print(f"  {'sdpa fp16':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
+
+        # Correctness checks: compare fused attention to dense attention.
+        #   - tight gate (as timed): expected sparse-approximation error.
+        #   - loose gate (all parents pass): should match dense to fp16 noise.
+        if successful_attention:
+            first_attn_name, info, build_name = successful_attention[0]
+            state = get_state(build_name)
+            qn0, th0 = query_pairs_by_build[build_name][0]
+            S_subspaces = len(state["dim_slices"])
+            th_loose = torch.full(
+                (S_subspaces, H_q), -1e9, device="cuda", dtype=torch.float32
+            )
+            scores_ref = torch.einsum("hd,hnd->hn", qn0, keys_q) * scale
+            probs_ref = torch.softmax(scores_ref, dim=-1)
+            out_ref = torch.einsum("hn,hnd->hd", probs_ref, values_q)
+            ref_scale = out_ref.float().abs().max().item() + 1e-9
+
+            for tag, th_used in (("tight(pruned)", th0), ("loose(all pass)", th_loose)):
+                out_ours = info.fn(
+                    q=qn0, th_per_subspace=th_used, state=state,
+                    buffer_keys=buffer,
+                    buffer_values=value_buffer,
+                    keys_children=keys,
+                    q_head_to_kv=q_head_to_kv,
+                    scale=scale,
+                )
+                diff = (out_ours.float() - out_ref.float()).abs().max().item()
+                print(
+                    f"  correctness[{tag:<15s}]: max_abs_diff={diff:.4e}  "
+                    f"rel={diff / ref_scale:.4e} ({first_attn_name})"
+                )
+
     print("-" * 70)
-    best = min(results, key=lambda r: r[1])
-    print(f"Fastest: {best[0]} at {best[1]:.3f} ms/query")
+    if results:
+        best = min(results, key=lambda r: r[1])
+        print(f"Fastest: {best[0]} at {best[1]:.3f} ms/query")
+    else:
+        print("Fastest: none (all kernels failed or were skipped)")
+    if skipped:
+        print("Skipped kernels:")
+        for label, reason in skipped:
+            print(f"  {label:<24s} {reason}")
 
 
 if __name__ == "__main__":
