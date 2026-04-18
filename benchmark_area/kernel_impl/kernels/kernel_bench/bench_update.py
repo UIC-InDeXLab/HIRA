@@ -5,6 +5,9 @@ into an existing v2_4 index, and verifies that the attention kernel
 (v1_5, the generic fallback) still produces correct output on the updated
 state (loose gate vs dense reference).
 
+By default the benchmark synthesizes random keys/values. Pass `--input-qkv`
+to slice a real decode trace from a captured QKV `.pt` file instead.
+
 Usage:
     python -m hira.benchmark_area.kernel_impl.kernels.kernel_bench.bench_update
 """
@@ -27,6 +30,10 @@ from hira.benchmark_area.kernel_impl.kernels.build_v2_4 import build as build_v2
 from hira.benchmark_area.kernel_impl.kernels import update_kernels, attention_kernels
 from hira.benchmark_area.kernel_impl.kernels._attention_triton_v1_5 import (
     triton_fused_cluster_pass_rawq,
+)
+from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
+    CaptureState,
+    _q_to_kv_map,
 )
 
 # Only include the v2.4-compatible updates.
@@ -59,9 +66,19 @@ def time_call(fn, iters=5, warmup=2):
     return (time.perf_counter() - t0) / iters * 1000
 
 
-def _rebuild_reference(old_keys, buffer_keys, old_values, buffer_values, bf, S, refine_iter):
+def _rebuild_reference(
+    old_keys,
+    buffer_keys,
+    old_values,
+    buffer_values,
+    bf,
+    S,
+    refine_iter,
+):
     full_keys = torch.cat([old_keys, buffer_keys], dim=1).contiguous()
-    full_values = torch.cat([old_values, buffer_values], dim=1).contiguous()
+    full_values = None
+    if old_values is not None and buffer_values is not None:
+        full_values = torch.cat([old_values, buffer_values], dim=1).contiguous()
     return build_v2_4(full_keys, bf, S, refine_iter, values=full_values), full_keys, full_values
 
 
@@ -160,15 +177,122 @@ def _pruning_stats(state, q, keys_q_expanded, full_keys, topk, q_head_to_kv):
     return kept_frac, recall
 
 
+def _select_real_queries(
+    queries_cpu: torch.Tensor,
+    prompt_length: int,
+    old_len: int,
+    B: int,
+    n_queries: int,
+    *,
+    device: str,
+) -> tuple[torch.Tensor, list[int]]:
+    """Return normalized real queries starting at the update window boundary.
+
+    The first selected query is aligned with the last token in the update buffer.
+    Later queries, when requested, are taken from subsequent decode steps in the
+    same capture.
+    """
+    q_start = old_len + B - prompt_length - 1
+    if q_start < 0:
+        raise ValueError(
+            f"Need --N + B to reach generated tokens in the capture, got "
+            f"N={old_len}, B={B}, prompt_length={prompt_length}."
+        )
+
+    q_stop = min(int(queries_cpu.shape[1]), q_start + max(1, n_queries))
+    if q_start >= q_stop:
+        raise ValueError(
+            f"Capture does not contain any generated queries for N={old_len}, B={B}."
+        )
+
+    q_batch = queries_cpu[:, q_start:q_stop, :].to(device=device, dtype=torch.float32)
+    q_batch = q_batch.permute(1, 0, 2).contiguous()
+    q_batch = q_batch / q_batch.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    return q_batch, list(range(q_start, q_stop))
+
+
+def _load_real_capture(args, max_b: int, *, device: str) -> dict:
+    print(f"Loading capture from {args.input_qkv} ...")
+    cap = CaptureState.load(args.input_qkv)
+    layer_ids = cap.layer_ids()
+    if not layer_ids:
+        raise ValueError(f"Capture {args.input_qkv} does not contain any layers.")
+
+    layer = args.layer if args.layer in layer_ids else layer_ids[len(layer_ids) // 2]
+    queries_cpu, keys_cpu, values_cpu = cap.to_layer_tensors(layer)
+    prompt_length = (
+        int(cap.prompt_length)
+        if cap.prompt_length is not None
+        else int(keys_cpu.shape[1] - queries_cpu.shape[1])
+    )
+    total_keys = int(keys_cpu.shape[1])
+
+    old_len = max(prompt_length, total_keys - max_b) if args.N is None else args.N
+    if old_len < prompt_length:
+        raise ValueError(
+            f"--N={old_len} is smaller than captured prompt_length={prompt_length}. "
+            "The update buffer must come from generated tokens."
+        )
+    if old_len + max_b > total_keys:
+        raise ValueError(
+            f"Need N + max(B) <= total captured keys ({total_keys}), got "
+            f"N={old_len}, max(B)={max_b}."
+        )
+
+    h_q = int(queries_cpu.shape[0])
+    h_kv = int(keys_cpu.shape[0])
+    q_head_to_kv = _q_to_kv_map(h_q, h_kv, device)
+
+    return {
+        "layer": layer,
+        "prompt_length": prompt_length,
+        "total_keys": total_keys,
+        "old_len": old_len,
+        "queries_cpu": queries_cpu,
+        "keys_cpu": keys_cpu,
+        "values_cpu": values_cpu,
+        "keys": keys_cpu[:, :old_len, :].to(device=device, dtype=torch.float32).contiguous(),
+        "values": (
+            values_cpu[:, :old_len, :].to(device=device, dtype=torch.float32).contiguous()
+            if values_cpu is not None else None
+        ),
+        "q_head_to_kv": q_head_to_kv,
+    }
+
+
+def _slice_real_case(real_data: dict, B: int, *, device: str, n_queries: int):
+    old_len = int(real_data["old_len"])
+    buf_slice = slice(old_len, old_len + B)
+    buffer_keys = real_data["keys_cpu"][:, buf_slice, :].to(
+        device=device, dtype=torch.float32
+    ).contiguous()
+    values_cpu = real_data["values_cpu"]
+    buffer_values = (
+        values_cpu[:, buf_slice, :].to(device=device, dtype=torch.float32).contiguous()
+        if values_cpu is not None else None
+    )
+    q_batch, q_indices = _select_real_queries(
+        real_data["queries_cpu"],
+        int(real_data["prompt_length"]),
+        old_len,
+        B,
+        n_queries,
+        device=device,
+    )
+    return buffer_keys, buffer_values, q_batch, q_indices
+
+
 def _run_for_B(
     args,
     B: int,
     keys: torch.Tensor,
-    values: torch.Tensor,
+    values: torch.Tensor | None,
     base_state: dict,
     q_head_to_kv: torch.Tensor,
     q_batch: torch.Tensor,
     *,
+    buffer_keys: torch.Tensor | None = None,
+    buffer_values: torch.Tensor | None = None,
     verbose: bool,
 ) -> dict:
     """Run timing + pruning/correctness for a single buffer size B.
@@ -178,13 +302,23 @@ def _run_for_B(
     Plus an entry under "fresh (rebuild)" with ms/kept_frac/recall.
     """
     device = keys.device
-    torch.manual_seed(1000 + B)  # Different buffer per B, reproducible.
-    buffer_keys = torch.randn(args.H_kv, B, args.D, device=device, dtype=torch.float32)
-    buffer_values = torch.randn(args.H_kv, B, args.D_v, device=device, dtype=torch.float32)
+    h_kv = int(keys.shape[0])
+    d = int(keys.shape[-1])
+    d_v = int(values.shape[-1]) if values is not None else d
+
+    if buffer_keys is None:
+        torch.manual_seed(1000 + B)  # Different buffer per B, reproducible.
+        buffer_keys = torch.randn(h_kv, B, d, device=device, dtype=torch.float32)
+    if buffer_values is None and values is not None:
+        buffer_values = torch.randn(h_kv, B, d_v, device=device, dtype=torch.float32)
+    if (values is None) != (buffer_values is None):
+        raise ValueError("old/base values and buffer values must either both be present or both be None.")
 
     def fresh_build():
         full_keys = torch.cat([keys, buffer_keys], dim=1).contiguous()
-        full_values = torch.cat([values, buffer_values], dim=1).contiguous()
+        full_values = None
+        if values is not None and buffer_values is not None:
+            full_values = torch.cat([values, buffer_values], dim=1).contiguous()
         build_v2_4(full_keys, args.bf, args.S, args.refine_iter, values=full_values)
 
     ms_fresh = time_call(fresh_build, iters=args.iters, warmup=2)
@@ -232,16 +366,19 @@ def _run_for_B(
     # Correctness (attention_v1_5, loose gate vs dense).
     attn = attention_kernels().get("attention_v1_5")
     full_keys = torch.cat([keys, buffer_keys], dim=1)
-    full_values = torch.cat([values, buffer_values], dim=1)
     keys_expanded = full_keys.index_select(0, q_head_to_kv)
-    values_expanded = full_values.index_select(0, q_head_to_kv)
-    scale = 1.0 / math.sqrt(args.D)
+    full_values = None
+    values_expanded = None
+    if values is not None and buffer_values is not None:
+        full_values = torch.cat([values, buffer_values], dim=1)
+        values_expanded = full_values.index_select(0, q_head_to_kv)
+    scale = 1.0 / math.sqrt(d)
     corr_abs: dict[str, float] = {}
-    if attn is not None:
+    if attn is not None and values_expanded is not None:
         q0 = q_batch[0]
         out_ref = _dense_attention(q0, keys_expanded, values_expanded, scale)
-        empty_buf = torch.empty(args.H_kv, 0, args.D, device=device, dtype=torch.float32)
-        empty_val = torch.empty(args.H_kv, 0, args.D_v, device=device, dtype=torch.float32)
+        empty_buf = torch.empty(h_kv, 0, d, device=device, dtype=torch.float32)
+        empty_val = torch.empty(h_kv, 0, d_v, device=device, dtype=torch.float32)
         for name, st in kept_states.items():
             s_eff = len(st["assigns_reord"])
             th_loose = torch.full((s_eff, q_batch.shape[1]), -1e9,
@@ -254,9 +391,11 @@ def _run_for_B(
             corr_abs[name] = (out_ours.float() - out_ref.float()).abs().max().item()
             if verbose:
                 print(f"  correctness[{name:<16s}]: max_abs_diff={corr_abs[name]:.4e}")
+    elif verbose:
+        print("  correctness: skipped (no captured values available)")
 
     # Pruning stats.
-    n_queries = args.prune_queries
+    n_queries = int(q_batch.shape[0])
     stats: dict[str, tuple[float, float]] = {}
     for name, st in stats_states.items():
         kept_sum = 0.0
@@ -295,19 +434,31 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--H-kv", type=int, default=8)
     p.add_argument("--H-q", type=int, default=24)
-    p.add_argument("--N", type=int, default=4096)
+    p.add_argument(
+        "--N",
+        type=int,
+        default=None,
+        help="Base index size. Defaults to 4096 for synthetic mode, or the "
+             "largest valid capture prefix when --input-qkv is used.",
+    )
     p.add_argument("--B", type=int, default=32, help="buffer size")
     p.add_argument("--B-sweep", type=str, default=None,
                    help="Comma-separated buffer sizes to sweep (overrides --B)")
     p.add_argument("--D", type=int, default=128)
     p.add_argument("--D-v", type=int, default=128)
+    p.add_argument("--input-qkv", type=Path, default=None,
+                   help="Path to a captured QKV .pt file. When set, the "
+                        "benchmark uses a real decode trace instead of "
+                        "synthetic random tensors.")
+    p.add_argument("--layer", type=int, default=15,
+                   help="Transformer layer to load from --input-qkv.")
     p.add_argument("--bf", type=int, default=4)
     p.add_argument("--S", type=int, default=8)
     p.add_argument("--refine-iter", type=int, default=5)
     p.add_argument("--iters", type=int, default=5)
     p.add_argument("--topk", type=int, default=32,
                    help="Top-k used to derive tight thresholds for pruning stats")
-    p.add_argument("--prune-queries", type=int, default=8,
+    p.add_argument("--prune-queries", type=int, default=20,
                    help="Number of distinct queries to average pruning stats over")
     args = p.parse_args()
 
@@ -318,36 +469,67 @@ def main():
         b_list = [int(x) for x in args.B_sweep.split(",") if x.strip()]
     else:
         b_list = [args.B]
+    max_b = max(b_list)
 
-    torch.manual_seed(0)
     device = "cuda"
-    keys = torch.randn(args.H_kv, args.N, args.D, device=device, dtype=torch.float32)
-    values = torch.randn(args.H_kv, args.N, args.D_v, device=device, dtype=torch.float32)
+    real_data = None
+    if args.input_qkv is None:
+        n_old = 4096 if args.N is None else args.N
+        torch.manual_seed(0)
+        keys = torch.randn(args.H_kv, n_old, args.D, device=device, dtype=torch.float32)
+        values = torch.randn(args.H_kv, n_old, args.D_v, device=device, dtype=torch.float32)
+        q_head_to_kv = _q_to_kv_map(args.H_q, args.H_kv, device)
+        q_batch = torch.randn(args.prune_queries, args.H_q, args.D, device=device, dtype=torch.float32)
+        q_batch = q_batch / q_batch.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    else:
+        real_data = _load_real_capture(args, max_b, device=device)
+        keys = real_data["keys"]
+        values = real_data["values"]
+        q_head_to_kv = real_data["q_head_to_kv"]
+        q_batch = None
 
     base_state = build_v2_4(keys, args.bf, args.S, args.refine_iter, values=values)
 
-    h_q = args.H_q
-    assert h_q % args.H_kv == 0
-    q_head_to_kv = (torch.arange(h_q, device=device) // (h_q // args.H_kv)).to(torch.int64)
+    h_q = int(q_head_to_kv.shape[0])
+    h_kv = int(keys.shape[0])
+    n_old = int(keys.shape[1])
+    d = int(keys.shape[-1])
+    d_v = int(values.shape[-1]) if values is not None else d
 
-    q_batch = torch.randn(args.prune_queries, h_q, args.D, device=device, dtype=torch.float32)
-    q_batch = q_batch / q_batch.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-
-    print(f"update micro-bench: H_kv={args.H_kv} N={args.N} "
-          f"D={args.D} D_v={args.D_v} bf={args.bf} S={args.S}")
+    if real_data is None:
+        print(f"update micro-bench [synthetic]: H_q={h_q} H_kv={h_kv} N={n_old} "
+              f"D={d} D_v={d_v} bf={args.bf} S={args.S}")
+    else:
+        print(f"update micro-bench [capture layer {real_data['layer']}]: "
+              f"H_q={h_q} H_kv={h_kv} N={n_old} D={d} D_v={d_v} bf={args.bf} S={args.S}")
+        print(f"capture={args.input_qkv}  prompt_length={real_data['prompt_length']}  "
+              f"total_keys={real_data['total_keys']}")
     print("=" * 78)
 
     all_results: dict[int, dict] = {}
     verbose = len(b_list) == 1
     for B in b_list:
+        buffer_keys = None
+        buffer_values = None
+        q_batch_B = q_batch
+        q_indices = None
+        if real_data is not None:
+            buffer_keys, buffer_values, q_batch_B, q_indices = _slice_real_case(
+                real_data, B, device=device, n_queries=args.prune_queries
+            )
         if not verbose:
             print(f"[B={B}] ...")
         else:
             print(f"  B={B}")
             print("-" * 78)
+            if q_indices is not None:
+                print(f"    capture window: old_keys=[0:{n_old})  buffer=[{n_old}:{n_old + B})  "
+                      f"generated_queries=[{q_indices[0]}:{q_indices[-1] + 1})")
         all_results[B] = _run_for_B(
             args, B, keys, values, base_state,
-            q_head_to_kv, q_batch, verbose=verbose,
+            q_head_to_kv, q_batch_B,
+            buffer_keys=buffer_keys, buffer_values=buffer_values,
+            verbose=verbose,
         )
 
     # Summary table across all Bs.
