@@ -66,6 +66,7 @@ ATTENTION_BUILD_KERNELS = {
     "attention_v1_5": "build_v2_4",
     "attention_v1_15": "build_v2_4",
     "attention_v1_15_s16": "build_v2_4",
+    "attention_v1_16": "build_v2_4",
 }
 
 BUILD_FNS = {
