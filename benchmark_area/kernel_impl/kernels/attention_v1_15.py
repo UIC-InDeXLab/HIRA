@@ -1,4 +1,4 @@
-"""attention_v1.8 — v1.7 with CUDA Graph replay on the empty-buffer path."""
+"""attention_v1.15 — v1.14 + wider PARENTS_PER_PROG=16 + num_stages=3."""
 
 from __future__ import annotations
 
@@ -14,14 +14,16 @@ except Exception:  # pragma: no cover
     HAS_TRITON = False
 
 from ._attention_fixed_utils import get_layout_attn_rawq, next_pow2, require_fixed_bf_s
-from ._attention_triton import NEG_SENT, run_attn_reduce, run_fused_attn_index
+from ._attention_triton import NEG_SENT, run_attn_reduce
 from ._attention_triton_v1_5 import triton_fused_cluster_pass_rawq
-from .attention_v1_7 import attend as attend_v1_7
+from ._attention_triton_v1_14 import run_fused_attn_index_ns
 
-KERNEL_VERSION = "v1.8"
-_PARENTS_PER_PROG = 8
+KERNEL_VERSION = "v1.15"
+_PARENTS_PER_PROG = 16
 _DEFAULT_NUM_SPLITS = 32
 _GROUPS_POW_FLOOR = 4
+_NUM_STAGES = 3
+_NUM_WARPS = 4
 
 
 def _empty_buffer(buffer_keys: torch.Tensor | None, buffer_values: torch.Tensor | None) -> bool:
@@ -52,6 +54,8 @@ def _make_workspace(layout: dict, q: torch.Tensor, th: torch.Tensor, num_splits:
         "graph": None,
         "capture_failed": False,
     }
+
+
 def _launch_no_buffer(
     work: dict,
     layout: dict,
@@ -76,7 +80,7 @@ def _launch_no_buffer(
         out=work["cluster_pass"],
     )
 
-    run_fused_attn_index(
+    run_fused_attn_index_ns(
         q=work["static_q"],
         keys_blocks_t_f16=layout["keys_blocks_t_f16"],
         values_blocks_f16=layout["values_blocks_f16"],
@@ -96,6 +100,8 @@ def _launch_no_buffer(
         out_m=work["m_idx"],
         out_l=work["l_idx"],
         out_o=work["o_idx"],
+        num_warps=_NUM_WARPS,
+        num_stages=_NUM_STAGES,
     )
 
     run_attn_reduce(
@@ -148,7 +154,7 @@ def _maybe_capture_graph(
 ) -> None:
     if work["graph"] is not None or work["capture_failed"]:
         return
-    if not bool(state.get("_attn_v1_8_use_cuda_graphs", True)):
+    if not bool(state.get("_attn_v1_15_use_cuda_graphs", True)):
         work["capture_failed"] = True
         return
 
@@ -159,34 +165,14 @@ def _maybe_capture_graph(
         with torch.cuda.stream(stream):
             for _ in range(3):
                 _launch_no_buffer(
-                    work,
-                    layout,
-                    h_q,
-                    d,
-                    d_v,
-                    k,
-                    groups,
-                    groups_pow,
-                    num_splits,
-                    anchor_s,
-                    scale,
+                    work, layout, h_q, d, d_v, k, groups, groups_pow, num_splits, anchor_s, scale,
                 )
         current.wait_stream(stream)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             _launch_no_buffer(
-                work,
-                layout,
-                h_q,
-                d,
-                d_v,
-                k,
-                groups,
-                groups_pow,
-                num_splits,
-                anchor_s,
-                scale,
+                work, layout, h_q, d, d_v, k, groups, groups_pow, num_splits, anchor_s, scale,
             )
         work["graph"] = graph
     except Exception:
@@ -201,7 +187,7 @@ def _get_fixed_empty_runtime(
     num_splits: int,
 ) -> tuple[dict, dict, int, int, int]:
     cache_key = _fixed_cache_key(state, q, th, q_head_to_kv, num_splits)
-    cache = state.setdefault("_attn_v1_8_fixed", {})
+    cache = state.setdefault("_attn_v1_15_fixed", {})
     fixed = cache.get("fixed")
     if cache.get("key") == cache_key and fixed is not None:
         return (
@@ -216,7 +202,7 @@ def _get_fixed_empty_runtime(
         state,
         q_head_to_kv,
         q,
-        cache_name="_attn_v1_8_layout",
+        cache_name="_attn_v1_15_layout",
     )
     require_fixed_bf_s(layout, bf=4, s=8, groups_max=8)
 
@@ -252,19 +238,8 @@ def attend(
         raise RuntimeError("attention_v1 requires Triton")
     if "keys_reord" not in state:
         raise RuntimeError("attention_v1 requires build_v2-style state")
-
     if not _empty_buffer(buffer_keys, buffer_values):
-        return attend_v1_7(
-            q=q,
-            th_per_subspace=th_per_subspace,
-            state=state,
-            buffer_keys=buffer_keys,
-            buffer_values=buffer_values,
-            keys_children=keys_children,
-            q_head_to_kv=q_head_to_kv,
-            scale=scale,
-            num_splits=num_splits,
-        )
+        raise RuntimeError("attention_v1_15 is a fixed-shape empty-buffer variant")
 
     h_q = q.shape[0]
     d = q.shape[1]
@@ -288,34 +263,13 @@ def attend(
     work["static_th"].copy_(th_view)
 
     _maybe_capture_graph(
-        state,
-        layout,
-        work,
-        h_q,
-        d,
-        d_v,
-        k,
-        groups,
-        groups_pow,
-        num_splits,
-        anchor_s,
-        scale,
+        state, layout, work, h_q, d, d_v, k, groups, groups_pow, num_splits, anchor_s, scale,
     )
     if work["graph"] is not None:
         work["graph"].replay()
     else:
         _launch_no_buffer(
-            work,
-            layout,
-            h_q,
-            d,
-            d_v,
-            k,
-            groups,
-            groups_pow,
-            num_splits,
-            anchor_s,
-            scale,
+            work, layout, h_q, d, d_v, k, groups, groups_pow, num_splits, anchor_s, scale,
         )
     return work["out"]
 

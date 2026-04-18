@@ -1,8 +1,8 @@
-"""Autotuned fused sparse attention index kernel (v1.4).
+"""v1.14 attention kernel — v1.8's non-packed kernel + num_stages pipelining.
 
-Same algorithm as `_attention_triton._fused_attn_index_kernel`, but
-autotuned over {PARENTS_PER_PROG, num_warps, num_stages}. Keyed on
-(K, BF, D, D_V, S) so different shapes compile independent winners.
+Same kernel body as `_fused_attn_index_kernel` from `_attention_triton.py`;
+only difference is the wrapper forwards `num_stages` to enable async cp.async
+pipelining of key/V HBM loads.
 """
 
 from __future__ import annotations
@@ -20,24 +20,8 @@ except Exception:  # pragma: no cover
 
 if HAS_TRITON:
 
-    _ATTN_AUTOTUNE_CONFIGS = [
-        triton.Config({"PARENTS_PER_PROG": 4}, num_warps=2, num_stages=1),
-        triton.Config({"PARENTS_PER_PROG": 4}, num_warps=4, num_stages=2),
-        triton.Config({"PARENTS_PER_PROG": 4}, num_warps=4, num_stages=3),
-        triton.Config({"PARENTS_PER_PROG": 8}, num_warps=4, num_stages=1),
-        triton.Config({"PARENTS_PER_PROG": 8}, num_warps=4, num_stages=2),
-        triton.Config({"PARENTS_PER_PROG": 8}, num_warps=4, num_stages=3),
-        triton.Config({"PARENTS_PER_PROG": 8}, num_warps=8, num_stages=2),
-        triton.Config({"PARENTS_PER_PROG": 16}, num_warps=4, num_stages=2),
-        triton.Config({"PARENTS_PER_PROG": 16}, num_warps=8, num_stages=2),
-    ]
-
-    @triton.autotune(
-        configs=_ATTN_AUTOTUNE_CONFIGS,
-        key=["K", "BF", "D", "D_V", "S", "GROUPS_POW", "NUM_SPLITS"],
-    )
     @triton.jit
-    def _fused_attn_index_kernel_autotuned(
+    def _fused_attn_index_ns_kernel(
         Q_ptr,
         KeysBlocksT_ptr,
         ValuesBlocks_ptr,
@@ -55,9 +39,9 @@ if HAS_TRITON:
         GROUPS: tl.constexpr,
         GROUPS_POW: tl.constexpr,
         S: tl.constexpr,
+        PARENTS_PER_PROG: tl.constexpr,
         NUM_SPLITS: tl.constexpr,
         SCALE: tl.constexpr,
-        PARENTS_PER_PROG: tl.constexpr,
     ):
         kvh = tl.program_id(0)
         split = tl.program_id(1)
@@ -74,8 +58,7 @@ if HAS_TRITON:
             mask=g_valid[:, None],
             other=0.0,
         )
-        q_scaled = q_full_f32 * SCALE
-        q_f16 = q_scaled.to(tl.float16)
+        q_f16 = (q_full_f32 * SCALE).to(tl.float16)
 
         m = tl.full([GROUPS_POW], -1.0e30, dtype=tl.float32)
         l_acc = tl.zeros([GROUPS_POW], dtype=tl.float32)
@@ -177,7 +160,7 @@ if HAS_TRITON:
         )
 
 
-def run_fused_attn_index_autotuned(
+def run_fused_attn_index_ns(
     q: torch.Tensor,
     keys_blocks_t_f16: torch.Tensor,
     values_blocks_f16: torch.Tensor,
@@ -190,17 +173,20 @@ def run_fused_attn_index_autotuned(
     groups: int,
     groups_pow: int,
     s_subspaces: int,
+    parents_per_prog: int,
     num_splits: int,
     anchor_s: int,
     scale: float,
     out_m: torch.Tensor,
     out_l: torch.Tensor,
     out_o: torch.Tensor,
+    num_warps: int = 4,
+    num_stages: int = 2,
 ) -> None:
     d = q.shape[1]
     d_v = values_blocks_f16.shape[-1]
     grid = (h_kv_eff, num_splits)
-    _fused_attn_index_kernel_autotuned[grid](
+    _fused_attn_index_ns_kernel[grid](
         q, keys_blocks_t_f16, values_blocks_f16,
         assigns_blocks, cluster_pass, invalid_blocks_i8,
         out_m, out_l, out_o,
@@ -208,7 +194,9 @@ def run_fused_attn_index_autotuned(
         ANCHOR_S=anchor_s,
         D=d, D_V=d_v, BF=values_blocks_f16.shape[2],
         GROUPS=groups, GROUPS_POW=groups_pow,
-        S=s_subspaces,
+        S=s_subspaces, PARENTS_PER_PROG=parents_per_prog,
         NUM_SPLITS=num_splits,
         SCALE=float(scale),
+        num_warps=num_warps,
+        num_stages=num_stages,
     )

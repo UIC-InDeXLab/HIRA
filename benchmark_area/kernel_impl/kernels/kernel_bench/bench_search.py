@@ -57,18 +57,15 @@ SEARCH_BUILD_KERNELS = {
     "search_v18_3": "build_v2_1",
 }
 
+# Only the winners are benched. Non-winners remain on disk but are filtered out
+# in the attention loop below (see `name not in ATTENTION_BUILD_KERNELS`).
+#   - v1.5         : generic fallback (any BF/S, handles non-empty buffer)
+#   - v1.15        : BF=4/S=8  specialist (empty buffer only)
+#   - v1.15_s16    : BF=16/S=16 specialist (empty buffer only)
 ATTENTION_BUILD_KERNELS = {
-    "attention_v1_0": "build_v2_4",
-    "attention_v1_1": "build_v2_4",
-    "attention_v1_2": "build_v2_4",
-    "attention_v1_3": "build_v2_4",
-    "attention_v1_4": "build_v2_4",
     "attention_v1_5": "build_v2_4",
-    "attention_v1_6": "build_v2_4",
-    "attention_v1_7": "build_v2_4",
-    "attention_v1_8": "build_v2_4",
-    "attention_v1_9": "build_v2_4",
-    "attention_v1_10": "build_v2_4",
+    "attention_v1_15": "build_v2_4",
+    "attention_v1_15_s16": "build_v2_4",
 }
 
 BUILD_FNS = {
@@ -184,8 +181,9 @@ def main():
         SEARCH_BUILD_KERNELS.get(name, "build_v1_0")
         for name in search_kernels()
     } | {
-        ATTENTION_BUILD_KERNELS.get(name, "build_v2_4")
+        ATTENTION_BUILD_KERNELS[name]
         for name in attention_kernels()
+        if name in ATTENTION_BUILD_KERNELS
     }
     query_pairs_by_build: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
     keys_eval = keys if q_head_to_kv is None else keys[q_head_to_kv]
@@ -213,10 +211,10 @@ def main():
         return f
 
     results = []
-    skipped: list[tuple[str, str]] = []
+    skipped: list[str] = []
 
-    def _record_skip(label: str, reason: str) -> None:
-        skipped.append((label, reason))
+    def _record_skip(label: str) -> None:
+        skipped.append(label)
 
     def _try_bench(label: str, build_name: str, fn) -> float | None:
         try:
@@ -229,9 +227,8 @@ def main():
                 pass
             if args.strict:
                 raise
-            reason = f"{type(exc).__name__}: {exc}"
-            _record_skip(label, reason)
-            print(f"  {label:<24s} {'skip':<6s}  {'-':>8s} ms/query  [{build_name}]  {reason}")
+            _record_skip(label)
+            print(f"  {label:<24s} skipped")
             return None
 
     for name, info in sorted(search_kernels().items()):
@@ -243,9 +240,8 @@ def main():
         except Exception as exc:
             if args.strict:
                 raise
-            reason = f"{type(exc).__name__}: {exc}"
-            _record_skip(label, reason)
-            print(f"  {name:<24s} {'skip':<6s}  {'-':>8s} ms/query  [{build_name}]  {reason}")
+            _record_skip(label)
+            print(f"  {label:<24s} skipped")
             continue
         ms = _try_bench(name, build_name, bench_fn(info.fn, state, query_pairs))
         if ms is None:
@@ -310,7 +306,9 @@ def main():
         successful_attention: list[tuple[str, object, str]] = []
 
         for name, info in sorted(attention_kernels().items()):
-            build_name = ATTENTION_BUILD_KERNELS.get(name, "build_v2_4")
+            if name not in ATTENTION_BUILD_KERNELS:
+                continue
+            build_name = ATTENTION_BUILD_KERNELS[name]
             label = f"{name} ({info.version})"
             try:
                 state = get_state(build_name)
@@ -320,9 +318,8 @@ def main():
             except Exception as exc:
                 if args.strict:
                     raise
-                reason = f"{type(exc).__name__}: {exc}"
-                _record_skip(label, reason)
-                print(f"  {name:<24s} {'skip':<6s}  {'-':>8s} ms/query  [{build_name}]  {reason}")
+                _record_skip(label)
+                print(f"  {label:<24s} skipped")
                 continue
 
             def attend_fn():
@@ -428,6 +425,31 @@ def main():
                     f"rel={diff / ref_scale:.4e} ({first_attn_name})"
                 )
 
+            # Additional per-kernel correctness using loose gate, for non-first kernels.
+            for attn_name, info_k, build_k in successful_attention[1:]:
+                state_k = get_state(build_k)
+                qn_k, _ = query_pairs_by_build[build_k][0]
+                S_k = len(state_k["dim_slices"])
+                th_loose_k = torch.full(
+                    (S_k, H_q), -1e9, device="cuda", dtype=torch.float32
+                )
+                try:
+                    out_k = info_k.fn(
+                        q=qn_k, th_per_subspace=th_loose_k, state=state_k,
+                        buffer_keys=buffer,
+                        buffer_values=value_buffer,
+                        keys_children=keys,
+                        q_head_to_kv=q_head_to_kv,
+                        scale=scale,
+                    )
+                    diff_k = (out_k.float() - out_ref.float()).abs().max().item()
+                    print(
+                        f"  correctness[loose(all pass)]: max_abs_diff={diff_k:.4e}  "
+                        f"rel={diff_k / ref_scale:.4e} ({attn_name})"
+                    )
+                except Exception as exc:
+                    print(f"  correctness[{attn_name}] FAILED: {type(exc).__name__}: {exc}")
+
     print("-" * 70)
     if results:
         best = min(results, key=lambda r: r[1])
@@ -436,8 +458,8 @@ def main():
         print("Fastest: none (all kernels failed or were skipped)")
     if skipped:
         print("Skipped kernels:")
-        for label, reason in skipped:
-            print(f"  {label:<24s} {reason}")
+        for label in skipped:
+            print(f"  {label:<24s} skipped")
 
 
 if __name__ == "__main__":
