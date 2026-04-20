@@ -25,37 +25,21 @@ from hira.benchmark_area.kernel_impl.kernels import attention_kernels, search_ke
 from hira.benchmark_area.kernel_impl.kernels.build_v1_0 import build as build_v1
 from hira.benchmark_area.kernel_impl.kernels.build_v2_0 import build as build_v2
 from hira.benchmark_area.kernel_impl.kernels.build_v2_1 import build as build_v2_1
-from hira.benchmark_area.kernel_impl.kernels.build_v2_1_fp16 import build as build_v2_1_fp16
+from hira.benchmark_area.kernel_impl.kernels.build_v2_1_fp16 import (
+    build as build_v2_1_fp16,
+)
 from hira.benchmark_area.kernel_impl.kernels.build_v2_2 import build as build_v2_2
-from hira.benchmark_area.kernel_impl.kernels.build_v2_2_fp16 import build as build_v2_2_fp16
+from hira.benchmark_area.kernel_impl.kernels.build_v2_2_fp16 import (
+    build as build_v2_2_fp16,
+)
 from hira.benchmark_area.kernel_impl.kernels.build_v2_3 import build as build_v2_3
 from hira.benchmark_area.kernel_impl.kernels.build_v2_4 import build as build_v2_4
+from hira.benchmark_area.kernel_impl.kernels.build_v2_5 import build as build_v2_5
 from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
     CaptureState,
     _capture_qkv,
     _q_to_kv_map,
 )
-
-SEARCH_BUILD_KERNELS = {
-    "search_v10_0": "build_v2_0",
-    "search_v11_0": "build_v2_1",
-    "search_v11_1": "build_v2_1_fp16",
-    "search_v12_0": "build_v2_2",
-    "search_v12_1": "build_v2_2",
-    "search_v12_2": "build_v2_2_fp16",
-    "search_v13_0": "build_v2_1",
-    "search_v14_0": "build_v2_3",
-    "search_v15_0": "build_v2_1",
-    "search_v15_1": "build_v2_1_fp16",
-    "search_v16_0": "build_v2_1",
-    "search_v16_1": "build_v2_1",
-    "search_v17_0": "build_v2_1",
-    "search_v17_1": "build_v2_1",
-    "search_v18_0": "build_v2_1",
-    "search_v18_1": "build_v2_1",
-    "search_v18_2": "build_v2_1_fp16",
-    "search_v18_3": "build_v2_1",
-}
 
 # Only the winners are benched. Non-winners remain on disk but are filtered out
 # in the attention loop below (see `name not in ATTENTION_BUILD_KERNELS`).
@@ -67,7 +51,22 @@ ATTENTION_BUILD_KERNELS = {
     "attention_v1_15": "build_v2_4",
     "attention_v1_15_s16": "build_v2_4",
     "attention_v1_16": "build_v2_4",
+    "attention_v1_17": "build_v2_4",
+    "attention_v1_18": "build_v2_4",
+    "attention_v1_18_1": "build_v2_4",
+    "attention_v1_20": "build_v2_4",
+    # "attention_v1_22": "build_v2_4",
+    # "attention_v1_23": "build_v2_4",
+    # "attention_v1_24": "build_v2_4",
+    "attention_v1_25": "build_v2_4",
+    "attention_v1_26": "build_v2_4",
+    "attention_v1_27": "build_v2_4",
+    "attention_v1_28": "build_v2_5",
+    "attention_v1_29": "build_v2_5",
+    "attention_v1_30": "build_v2_5",
 }
+
+FP16_ONLY_ATTENTION_KERNELS = {"attention_v1_18_1"}
 
 BUILD_FNS = {
     "build_v1_0": build_v1,
@@ -78,6 +77,7 @@ BUILD_FNS = {
     "build_v2_2_fp16": build_v2_2_fp16,
     "build_v2_3": build_v2_3,
     "build_v2_4": build_v2_4,
+    "build_v2_5": build_v2_5,
 }
 
 
@@ -120,6 +120,12 @@ def main():
     p.add_argument("--n-queries", type=int, default=20)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument(
+        "--buffer-len",
+        type=int,
+        default=0,
+        help="Hold the final N-buffer_len rows out as the decoding buffer.",
+    )
+    p.add_argument(
         "--strict",
         action="store_true",
         help="Fail on the first kernel error instead of skipping incompatible kernels.",
@@ -135,30 +141,52 @@ def main():
     else:
         print(f"Capturing {args.n_tokens} tokens from {args.model} ...")
         cap = _capture_qkv(
-            model_name=args.model, prompt_text="Benchmark.",
-            n=args.n_tokens, device="cuda",
-            torch_dtype=torch.float16, show_progress=True,
+            model_name=args.model,
+            prompt_text="Benchmark.",
+            n=args.n_tokens,
+            device="cuda",
+            torch_dtype=torch.float16,
+            show_progress=True,
         )
 
     layer_ids = cap.layer_ids()
     layer = args.layer if args.layer in layer_ids else layer_ids[len(layer_ids) // 2]
     queries_cpu, keys_cpu, values_cpu = cap.to_layer_tensors(layer)
-    keys = keys_cpu.to(device="cuda", dtype=torch.float32)
-    values = (
+    keys_full = keys_cpu.to(device="cuda", dtype=torch.float32)
+    values_full = (
         values_cpu.to(device="cuda", dtype=torch.float32)
-        if values_cpu is not None else None
+        if values_cpu is not None
+        else None
     )
     queries = queries_cpu
     H_q = queries.shape[0]
-    H_kv, N, D = keys.shape
-    D_v = int(values.shape[-1]) if values is not None else D
+    H_kv, N, D = keys_full.shape
+    D_v = int(values_full.shape[-1]) if values_full is not None else D
     q_head_to_kv = _q_to_kv_map(H_q, H_kv, "cuda") if H_q != H_kv else None
 
-    buffer = torch.empty(H_kv, 0, D, device="cuda", dtype=torch.float32)
-    value_buffer = (
-        torch.empty(H_kv, 0, D_v, device="cuda", dtype=torch.float32)
-        if values is not None else None
+    if args.buffer_len < 0 or args.buffer_len >= N:
+        raise ValueError(f"--buffer-len must be in [0, {N - 1}], got {args.buffer_len}")
+
+    n_index = N - args.buffer_len
+    keys = keys_full[:, :n_index, :].contiguous()
+    values = (
+        values_full[:, :n_index, :].contiguous() if values_full is not None else None
     )
+
+    if args.buffer_len:
+        buffer = keys_full[:, n_index:, :].contiguous()
+        value_buffer = (
+            values_full[:, n_index:, :].contiguous()
+            if values_full is not None
+            else None
+        )
+    else:
+        buffer = torch.empty(H_kv, 0, D, device="cuda", dtype=torch.float32)
+        value_buffer = (
+            torch.empty(H_kv, 0, D_v, device="cuda", dtype=torch.float32)
+            if values is not None
+            else None
+        )
     state_cache: dict[str, dict] = {}
 
     def get_state(build_name: str) -> dict:
@@ -176,39 +204,59 @@ def main():
     # Pre-compute per-subspace thresholds over a sweep of queries; average across them.
     total_q = queries.shape[1]
     stride = max(1, total_q // args.n_queries)
-    q_indices = list(range(total_q - 1, max(0, total_q - args.n_queries * stride) - 1, -stride))[: args.n_queries]
+    q_indices = list(
+        range(total_q - 1, max(0, total_q - args.n_queries * stride) - 1, -stride)
+    )[: args.n_queries]
 
     required_builds = {
-        SEARCH_BUILD_KERNELS.get(name, "build_v1_0")
-        for name in search_kernels()
-    } | {
         ATTENTION_BUILD_KERNELS[name]
         for name in attention_kernels()
         if name in ATTENTION_BUILD_KERNELS
     }
     query_pairs_by_build: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
-    keys_eval = keys if q_head_to_kv is None else keys[q_head_to_kv]
+    query_pairs_fp16_by_build: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+    keys_eval = keys_full if q_head_to_kv is None else keys_full[q_head_to_kv]
 
     # Precompute (q, thresholds) pairs per build layout to avoid including them in timing.
     for build_name in sorted(required_builds):
         state = get_state(build_name)
         pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        pairs_fp16: list[tuple[torch.Tensor, torch.Tensor]] = []
         for qi in q_indices:
             q = queries[:, qi, :].to(device="cuda", dtype=torch.float32)
             qn = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             th = subspace_topk_thresholds(qn, keys_eval, args.topk, state["dim_slices"])
             pairs.append((qn, th))
+            q_norms = torch.stack(
+                [qn[:, start:end].norm(dim=-1) for start, end in state["dim_slices"]],
+                dim=0,
+            )
+            th_packed_fp16 = torch.cat(
+                [th, q_norms],
+                dim=0,
+            ).to(torch.float16)
+            pairs_fp16.append((qn.to(torch.float16), th_packed_fp16))
         query_pairs_by_build[build_name] = pairs
+        query_pairs_fp16_by_build[build_name] = pairs_fp16
 
-    print(f"search micro-bench: layer {layer} H_q={H_q} H_kv={H_kv} N={N} D={D} S={args.S}")
+    print(
+        f"search micro-bench: layer {layer} H_q={H_q} H_kv={H_kv} "
+        f"N_idx={n_index} N_buf={args.buffer_len} D={D} S={args.S}"
+    )
     print("-" * 70)
 
     def bench_fn(fn, state, query_pairs):
         def f():
             for qn, th in query_pairs:
-                fn(q=qn, th_per_subspace=th, state=state,
-                   buffer_keys=buffer, keys_children=keys,
-                   q_head_to_kv=q_head_to_kv)
+                fn(
+                    q=qn,
+                    th_per_subspace=th,
+                    state=state,
+                    buffer_keys=buffer,
+                    keys_children=keys,
+                    q_head_to_kv=q_head_to_kv,
+                )
+
         return f
 
     results = []
@@ -232,34 +280,49 @@ def main():
             print(f"  {label:<24s} skipped")
             return None
 
-    for name, info in sorted(search_kernels().items()):
-        build_name = SEARCH_BUILD_KERNELS.get(name, "build_v1_0")
-        label = f"{name} ({info.version})"
-        try:
-            state = get_state(build_name)
-            query_pairs = query_pairs_by_build[build_name]
-        except Exception as exc:
-            if args.strict:
-                raise
-            _record_skip(label)
-            print(f"  {label:<24s} skipped")
-            continue
-        ms = _try_bench(name, build_name, bench_fn(info.fn, state, query_pairs))
-        if ms is None:
-            continue
-        per_q = ms / len(query_pairs)
-        results.append((label, per_q))
-        print(f"  {name:<24s} {info.version:<6s}  {per_q:8.3f} ms/query  [{build_name}]")
+    # for name, info in sorted(search_kernels().items()):
+    #     build_name = SEARCH_BUILD_KERNELS.get(name, "build_v1_0")
+    #     label = f"{name} ({info.version})"
+    #     try:
+    #         state = get_state(build_name)
+    #         query_pairs = query_pairs_by_build[build_name]
+    #     except Exception as exc:
+    #         if args.strict:
+    #             raise
+    #         _record_skip(label)
+    #         print(f"  {label:<24s} skipped")
+    #         continue
+    #     ms = _try_bench(name, build_name, bench_fn(info.fn, state, query_pairs))
+    #     if ms is None:
+    #         continue
+    #     per_q = ms / len(query_pairs)
+    #     results.append((label, per_q))
+    #     print(f"  {name:<24s} {info.version:<6s}  {per_q:8.3f} ms/query  [{build_name}]")
 
-    # Torch baseline: brute-force dot product over all keys
-    keys_q = keys if q_head_to_kv is None else keys[q_head_to_kv]
+    # Torch baseline: brute-force dot product over all keys.
+    # GQA-aware: keep K at H_kv and use grouped einsum rather than expanding to
+    # H_q. Matches how real attention runs with GQA (no materialized H_q copies).
     baseline_pairs = query_pairs_by_build.get("build_v1_0")
     if baseline_pairs is None:
         baseline_pairs = next(iter(query_pairs_by_build.values()))
+    baseline_pairs_fp16 = query_pairs_fp16_by_build.get("build_v1_0")
+    if baseline_pairs_fp16 is None:
+        baseline_pairs_fp16 = next(iter(query_pairs_fp16_by_build.values()))
+
+    groups = H_q // H_kv if q_head_to_kv is not None else 1
+    keys_full_f16 = keys_full.half()
+    buffer_f16 = buffer.to(torch.float16)
+    value_buffer_f16 = (
+        value_buffer.to(torch.float16) if value_buffer is not None else None
+    )
 
     def baseline():
         for qn, _ in baseline_pairs:
-            _ = torch.einsum("hd,hnd->hn", qn, keys_q)
+            if groups == 1:
+                _ = torch.einsum("hd,hnd->hn", qn, keys_full)
+            else:
+                q_hg = qn.view(H_kv, groups, D)
+                _ = torch.einsum("hgd,hnd->hgn", q_hg, keys_full)
 
     ms = time_call(baseline, iters=args.iters, warmup=3)
     per_q = ms / len(baseline_pairs)
@@ -268,7 +331,11 @@ def main():
 
     def matmul_baseline():
         for qn, _ in baseline_pairs:
-            _ = torch.matmul(keys_q, qn.unsqueeze(-1)).squeeze(-1)
+            if groups == 1:
+                _ = torch.matmul(keys_full, qn.unsqueeze(-1)).squeeze(-1)
+            else:
+                q_hg = qn.view(H_kv, groups, D)
+                _ = torch.matmul(q_hg, keys_full.transpose(-1, -2))
 
     ms = time_call(matmul_baseline, iters=args.iters, warmup=3)
     per_q = ms / len(baseline_pairs)
@@ -276,11 +343,14 @@ def main():
     print(f"  {'matmul baseline':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
 
     # FP16 baselines for fair comparison with fp16-key search kernels
-    keys_q_f16 = keys_q.half()
 
     def baseline_fp16():
-        for qn, _ in baseline_pairs:
-            _ = torch.einsum("hd,hnd->hn", qn.half(), keys_q_f16)
+        for qn, _ in baseline_pairs_fp16:
+            if groups == 1:
+                _ = torch.einsum("hd,hnd->hn", qn, keys_full_f16)
+            else:
+                q_hg = qn.view(H_kv, groups, D)
+                _ = torch.einsum("hgd,hnd->hgn", q_hg, keys_full_f16)
 
     ms = time_call(baseline_fp16, iters=args.iters, warmup=3)
     per_q = ms / len(baseline_pairs)
@@ -288,8 +358,12 @@ def main():
     print(f"  {'torch_baseline fp16':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
 
     def matmul_baseline_fp16():
-        for qn, _ in baseline_pairs:
-            _ = torch.matmul(keys_q_f16, qn.half().unsqueeze(-1)).squeeze(-1)
+        for qn, _ in baseline_pairs_fp16:
+            if groups == 1:
+                _ = torch.matmul(keys_full_f16, qn.unsqueeze(-1)).squeeze(-1)
+            else:
+                q_hg = qn.view(H_kv, groups, D)
+                _ = torch.matmul(q_hg, keys_full_f16.transpose(-1, -2))
 
     ms = time_call(matmul_baseline_fp16, iters=args.iters, warmup=3)
     per_q = ms / len(baseline_pairs)
@@ -301,10 +375,57 @@ def main():
         print("-" * 70)
         print("Attention (fused search + softmax + @V → (H_q, D_v))")
         import math
+
         scale = 1.0 / math.sqrt(D)
-        values_q = values if q_head_to_kv is None else values[q_head_to_kv]
-        values_q_f16 = values_q.half()
+        values_full_f16 = values_full.half()
         successful_attention: list[tuple[str, object, str]] = []
+
+        def attention_inputs(
+            attn_name: str,
+            build_name: str,
+        ) -> tuple[
+            list[tuple[torch.Tensor, torch.Tensor]],
+            torch.Tensor,
+            torch.Tensor | None,
+            torch.dtype,
+        ]:
+            if attn_name in FP16_ONLY_ATTENTION_KERNELS:
+                return (
+                    query_pairs_fp16_by_build[build_name],
+                    buffer_f16,
+                    value_buffer_f16,
+                    torch.float16,
+                )
+            return (
+                query_pairs_by_build[build_name],
+                buffer,
+                value_buffer,
+                torch.float32,
+            )
+
+        def loose_threshold(
+            attn_name: str,
+            state: dict,
+            qn: torch.Tensor,
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            s_subspaces = len(state["dim_slices"])
+            fill_value = (
+                -1e9 if dtype == torch.float32 else float(torch.finfo(dtype).min)
+            )
+            th_loose = torch.full(
+                (s_subspaces, H_q), fill_value, device="cuda", dtype=dtype
+            )
+            if attn_name in FP16_ONLY_ATTENTION_KERNELS:
+                q_norms = torch.stack(
+                    [
+                        qn.float()[:, start:end].norm(dim=-1)
+                        for start, end in state["dim_slices"]
+                    ],
+                    dim=0,
+                ).to(dtype)
+                return torch.cat([th_loose, q_norms], dim=0)
+            return th_loose
 
         for name, info in sorted(attention_kernels().items()):
             if name not in ATTENTION_BUILD_KERNELS:
@@ -313,8 +434,8 @@ def main():
             label = f"{name} ({info.version})"
             try:
                 state = get_state(build_name)
-                query_pairs = query_pairs_by_build.get(build_name) or next(
-                    iter(query_pairs_by_build.values())
+                query_pairs, buffer_arg, value_buffer_arg, _ = attention_inputs(
+                    name, build_name
                 )
             except Exception as exc:
                 if args.strict:
@@ -326,9 +447,11 @@ def main():
             def attend_fn():
                 for qn, th in query_pairs:
                     info.fn(
-                        q=qn, th_per_subspace=th, state=state,
-                        buffer_keys=buffer,
-                        buffer_values=value_buffer,
+                        q=qn,
+                        th_per_subspace=th,
+                        state=state,
+                        buffer_keys=buffer_arg,
+                        buffer_values=value_buffer_arg,
                         keys_children=keys,
                         q_head_to_kv=q_head_to_kv,
                         scale=scale,
@@ -340,14 +463,23 @@ def main():
             per_q = ms / len(query_pairs)
             results.append((label, per_q))
             successful_attention.append((name, info, build_name))
-            print(f"  {name:<24s} {info.version:<6s}  {per_q:8.3f} ms/query  [{build_name}]")
+            print(
+                f"  {name:<24s} {info.version:<6s}  {per_q:8.3f} ms/query  [{build_name}]"
+            )
 
         # Dense attention baseline (fp32 math, matches our fused output dtype).
+        # GQA-aware: no H_q expansion on K/V.
         def dense_attn_fp32():
             for qn, _ in baseline_pairs:
-                scores = torch.einsum("hd,hnd->hn", qn, keys_q) * scale
-                probs = torch.softmax(scores, dim=-1)
-                _ = torch.einsum("hn,hnd->hd", probs, values_q)
+                if groups == 1:
+                    scores = torch.einsum("hd,hnd->hn", qn, keys_full) * scale
+                    probs = torch.softmax(scores, dim=-1)
+                    _ = torch.einsum("hn,hnd->hd", probs, values_full)
+                else:
+                    q_hg = qn.view(H_kv, groups, D)
+                    scores = torch.einsum("hgd,hnd->hgn", q_hg, keys_full) * scale
+                    probs = torch.softmax(scores, dim=-1)
+                    _ = torch.einsum("hgn,hnd->hgd", probs, values_full)
 
         ms = time_call(dense_attn_fp32, iters=args.iters, warmup=3)
         per_q = ms / len(baseline_pairs)
@@ -356,24 +488,36 @@ def main():
 
         # FP16 dense attention.
         def dense_attn_fp16():
-            for qn, _ in baseline_pairs:
-                scores = torch.einsum("hd,hnd->hn", qn.half(), keys_q_f16) * scale
-                probs = torch.softmax(scores.float(), dim=-1).half()
-                _ = torch.einsum("hn,hnd->hd", probs, values_q_f16)
+            for qn, _ in baseline_pairs_fp16:
+                if groups == 1:
+                    scores = torch.einsum("hd,hnd->hn", qn, keys_full_f16) * scale
+                    probs = torch.softmax(scores.float(), dim=-1).half()
+                    _ = torch.einsum("hn,hnd->hd", probs, values_full_f16)
+                else:
+                    q_hg = qn.view(H_kv, groups, D)
+                    scores = torch.einsum("hgd,hnd->hgn", q_hg, keys_full_f16) * scale
+                    probs = torch.softmax(scores.float(), dim=-1).half()
+                    _ = torch.einsum("hgn,hnd->hgd", probs, values_full_f16)
 
         ms = time_call(dense_attn_fp16, iters=args.iters, warmup=3)
         per_q = ms / len(baseline_pairs)
         results.append(("dense attn fp16", per_q))
         print(f"  {'dense attn fp16':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
 
-        # SDPA (flash backend chosen automatically).
+        # SDPA (flash backend chosen automatically). Uses enable_gqa so K/V stay
+        # at H_kv — mirrors baseline_sdpa in index.py.
         def sdpa_baseline():
             for qn, _ in baseline_pairs:
                 q4 = qn.view(1, H_q, 1, D)
-                k4 = keys_q.view(1, H_q, N, D)
-                v4 = values_q.view(1, H_q, N, D_v)
+                k4 = keys_full.view(1, H_kv, N, D)
+                v4 = values_full.view(1, H_kv, N, D_v)
                 _ = torch.nn.functional.scaled_dot_product_attention(
-                    q4, k4, v4, is_causal=False, scale=scale
+                    q4,
+                    k4,
+                    v4,
+                    is_causal=False,
+                    scale=scale,
+                    enable_gqa=(groups > 1),
                 )
 
         ms = time_call(sdpa_baseline, iters=args.iters, warmup=3)
@@ -382,12 +526,17 @@ def main():
         print(f"  {'sdpa fp32':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
 
         def sdpa_baseline_fp16():
-            for qn, _ in baseline_pairs:
-                q4 = qn.half().view(1, H_q, 1, D)
-                k4 = keys_q_f16.view(1, H_q, N, D)
-                v4 = values_q_f16.view(1, H_q, N, D_v)
+            for qn, _ in baseline_pairs_fp16:
+                q4 = qn.view(1, H_q, 1, D)
+                k4 = keys_full_f16.view(1, H_kv, N, D)
+                v4 = values_full_f16.view(1, H_kv, N, D_v)
                 _ = torch.nn.functional.scaled_dot_product_attention(
-                    q4, k4, v4, is_causal=False, scale=scale
+                    q4,
+                    k4,
+                    v4,
+                    is_causal=False,
+                    scale=scale,
+                    enable_gqa=(groups > 1),
                 )
 
         ms = time_call(sdpa_baseline_fp16, iters=args.iters, warmup=3)
@@ -401,21 +550,33 @@ def main():
         if successful_attention:
             first_attn_name, info, build_name = successful_attention[0]
             state = get_state(build_name)
-            qn0, th0 = query_pairs_by_build[build_name][0]
-            S_subspaces = len(state["dim_slices"])
-            th_loose = torch.full(
-                (S_subspaces, H_q), -1e9, device="cuda", dtype=torch.float32
+            first_pairs, first_buffer, first_value_buffer, first_th_dtype = (
+                attention_inputs(first_attn_name, build_name)
             )
-            scores_ref = torch.einsum("hd,hnd->hn", qn0, keys_q) * scale
-            probs_ref = torch.softmax(scores_ref, dim=-1)
-            out_ref = torch.einsum("hn,hnd->hd", probs_ref, values_q)
+            qn0, th0 = first_pairs[0]
+            th_loose = loose_threshold(first_attn_name, state, qn0, first_th_dtype)
+            # Reference: GQA-aware dense attention (no H_q expansion).
+            qn0_ref = qn0.float()
+            if groups == 1:
+                scores_ref = torch.einsum("hd,hnd->hn", qn0_ref, keys_full) * scale
+                probs_ref = torch.softmax(scores_ref, dim=-1)
+                out_ref = torch.einsum("hn,hnd->hd", probs_ref, values_full)
+            else:
+                q0_hg = qn0_ref.view(H_kv, groups, D)
+                scores_ref = torch.einsum("hgd,hnd->hgn", q0_hg, keys_full) * scale
+                probs_ref = torch.softmax(scores_ref, dim=-1)
+                out_ref = torch.einsum("hgn,hnd->hgd", probs_ref, values_full).reshape(
+                    H_q, D_v
+                )
             ref_scale = out_ref.float().abs().max().item() + 1e-9
 
             for tag, th_used in (("tight(pruned)", th0), ("loose(all pass)", th_loose)):
                 out_ours = info.fn(
-                    q=qn0, th_per_subspace=th_used, state=state,
-                    buffer_keys=buffer,
-                    buffer_values=value_buffer,
+                    q=qn0,
+                    th_per_subspace=th_used,
+                    state=state,
+                    buffer_keys=first_buffer,
+                    buffer_values=first_value_buffer,
                     keys_children=keys,
                     q_head_to_kv=q_head_to_kv,
                     scale=scale,
@@ -429,16 +590,18 @@ def main():
             # Additional per-kernel correctness using loose gate, for non-first kernels.
             for attn_name, info_k, build_k in successful_attention[1:]:
                 state_k = get_state(build_k)
-                qn_k, _ = query_pairs_by_build[build_k][0]
-                S_k = len(state_k["dim_slices"])
-                th_loose_k = torch.full(
-                    (S_k, H_q), -1e9, device="cuda", dtype=torch.float32
+                pairs_k, buffer_k, value_buffer_k, th_dtype_k = attention_inputs(
+                    attn_name, build_k
                 )
+                qn_k, _ = pairs_k[0]
+                th_loose_k = loose_threshold(attn_name, state_k, qn_k, th_dtype_k)
                 try:
                     out_k = info_k.fn(
-                        q=qn_k, th_per_subspace=th_loose_k, state=state_k,
-                        buffer_keys=buffer,
-                        buffer_values=value_buffer,
+                        q=qn_k,
+                        th_per_subspace=th_loose_k,
+                        state=state_k,
+                        buffer_keys=buffer_k,
+                        buffer_values=value_buffer_k,
                         keys_children=keys,
                         q_head_to_kv=q_head_to_kv,
                         scale=scale,
@@ -449,7 +612,9 @@ def main():
                         f"rel={diff_k / ref_scale:.4e} ({attn_name})"
                     )
                 except Exception as exc:
-                    print(f"  correctness[{attn_name}] FAILED: {type(exc).__name__}: {exc}")
+                    print(
+                        f"  correctness[{attn_name}] FAILED: {type(exc).__name__}: {exc}"
+                    )
 
     print("-" * 70)
     if results:

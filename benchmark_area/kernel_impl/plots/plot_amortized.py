@@ -1,4 +1,8 @@
-"""Plot amortized search time vs decoding step from a bench CSV.
+"""Plot amortized attention time vs decoding step from a bench CSV.
+
+Compares our fused attention (with amortized update cost) against the two
+dense attention baselines: `baseline_attention` (einsum + softmax) and
+`torch.nn.functional.scaled_dot_product_attention` (SDPA).
 
 Output goes to kernel_impl/reports/<csv_stem>_amortized.png.
 
@@ -70,16 +74,20 @@ def main():
 
     steps = [int(r["step"]) for r in rows]
     amort = [float(r["amortized_ours_ms"]) for r in rows]
-    search = [float(r["search_ours_ms"]) for r in rows]
-    base = [float(r["search_baseline_ms"]) for r in rows]
+    attend = [float(r["attend_ours_ms"]) for r in rows]
+    dense = [float(r["dense_attn_ms"]) for r in rows]
+    sdpa = [float(r["sdpa_ms"]) for r in rows]
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(steps, amort, label="ours (amortized search+update)", linewidth=1.5)
-    ax.plot(steps, search, label="ours (search only)", linestyle="--", alpha=0.7)
-    ax.plot(steps, base, label="baseline (full dot)", linewidth=1.5, alpha=0.7)
+    ax.plot(steps, amort, label="ours (amortized attend+update)", linewidth=1.5)
+    ax.plot(steps, attend, label="ours (attend only)", linestyle="--", alpha=0.7)
+    ax.plot(steps, dense, label="dense attention (einsum + softmax)",
+            linewidth=1.5, alpha=0.7)
+    ax.plot(steps, sdpa, label="SDPA (torch F.scaled_dot_product_attention)",
+            linewidth=1.5, alpha=0.7)
     ax.set_xlabel("decoding step")
     ax.set_ylabel("time (ms)")
-    ax.set_title(f"Amortized search time — {csv_path.name}")
+    ax.set_title(f"Amortized attention time — {csv_path.name}")
     ax.grid(True, alpha=0.3)
     ax.legend()
 
