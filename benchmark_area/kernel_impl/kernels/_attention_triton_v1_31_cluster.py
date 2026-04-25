@@ -1,10 +1,4 @@
-"""v1.5 cluster_pass kernel that consumes raw q (no q_pack).
-
-Same gate logic as `_fused_cluster_pass_kernel` in `_search_triton`, but loads
-each subspace's q slice directly from the raw `(H_q, D)` tensor using per-
-subspace (offset, width) metadata. Computes `qn` (per-group ℓ2 norm) on the
-fly. Avoids the 4-op Python `_pack_q` path (view/transpose/contiguous/norm).
-"""
+"""v1.31 cluster-pass kernel with fp16 q/th/centers/radii/qnorms inputs."""
 
 from __future__ import annotations
 
@@ -22,14 +16,15 @@ except Exception:  # pragma: no cover
 if HAS_TRITON:
 
     @triton.jit
-    def _fused_cluster_pass_rawq_kernel(
-        Q_ptr,             # (H_q, D)             f32
-        DimOffsets_ptr,    # (S,)                 i32
-        DimWidths_ptr,     # (S,)                 i32
-        Th_ptr,            # (S, H_q)             f32
-        Centers_ptr,       # (S, H_kv, K, MAX_D)  f32
-        Radii_ptr,         # (S, H_kv, K)         f32
-        Out_ptr,           # (S, H_q, K)          i8
+    def _fused_cluster_pass_rawq_fp16_v1_31_kernel(
+        Q_ptr,
+        QNorms_ptr,
+        DimOffsets_ptr,
+        DimWidths_ptr,
+        Th_ptr,
+        Centers_ptr,
+        Radii_ptr,
+        Out_ptr,
         H_Q,
         H_KV,
         K,
@@ -56,14 +51,13 @@ if HAS_TRITON:
         width = tl.load(DimWidths_ptr + s)
         d_valid = d_range < width
 
-        # Pull q slice from raw (H_q, D): qp[g, d] = q[hq_vec[g], dim_off + d_range[d]]
         q_load_mask = g_valid[:, None] & d_valid[None, :]
         qp = tl.load(
             Q_ptr + hq_vec[:, None] * D + (dim_off + d_range)[None, :],
             mask=q_load_mask,
             other=0.0,
         )
-        qn = tl.sqrt(tl.sum(qp * qp, axis=1))  # (GROUPS_POW,)
+        qn = tl.load(QNorms_ptr + s * H_Q + hq_vec, mask=g_valid, other=0.0)
 
         th = tl.load(Th_ptr + s * H_Q + hq_vec, mask=g_valid, other=float("inf"))
 
@@ -72,7 +66,7 @@ if HAS_TRITON:
 
         r = tl.load(Radii_ptr + (s * H_KV + kvh) * K + k_range, mask=k_mask, other=0.0)
 
-        cdot = tl.sum(qp[:, None, :] * centers[None, :, :], axis=2)  # (GROUPS_POW, BLOCK_K)
+        cdot = tl.sum(qp[:, None, :] * centers[None, :, :], axis=2)
         ub = cdot + r[None, :] * qn[:, None]
         passed = (ub >= th[:, None]).to(tl.int8)
 
@@ -81,13 +75,14 @@ if HAS_TRITON:
         tl.store(Out_ptr + out_offs, passed, mask=out_mask)
 
 
-def triton_fused_cluster_pass_rawq(
-    q: torch.Tensor,                 # (H_q, D)
-    th: torch.Tensor,                # (S, H_q)
-    dim_offsets: torch.Tensor,       # (S,) int32
-    dim_widths: torch.Tensor,        # (S,) int32
-    centers: torch.Tensor,           # (S, H_kv, K, max_d)
-    radii: torch.Tensor,             # (S, H_kv, K)
+def triton_fused_cluster_pass_rawq_fp16(
+    q: torch.Tensor,
+    q_norms: torch.Tensor,
+    th: torch.Tensor,
+    dim_offsets: torch.Tensor,
+    dim_widths: torch.Tensor,
+    centers: torch.Tensor,
+    radii: torch.Tensor,
     groups: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -97,13 +92,13 @@ def triton_fused_cluster_pass_rawq(
         out = torch.empty(s, h_q, k, device=q.device, dtype=torch.int8)
 
     groups_pow = 1
-    while groups_pow < max(groups, 8):
+    while groups_pow < max(groups, 4):
         groups_pow *= 2
     block_k = 64
 
     grid = (s, h_kv, triton.cdiv(k, block_k))
-    _fused_cluster_pass_rawq_kernel[grid](
-        q, dim_offsets, dim_widths, th, centers, radii, out,
+    _fused_cluster_pass_rawq_fp16_v1_31_kernel[grid](
+        q, q_norms, dim_offsets, dim_widths, th, centers, radii, out,
         h_q, h_kv, k,
         D=d, S=s, GROUPS=groups, GROUPS_POW=groups_pow,
         MAX_D=max_d, BLOCK_K=block_k,

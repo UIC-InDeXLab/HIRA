@@ -55,6 +55,10 @@ SUMMARY_ORDER = (
 )
 
 
+def _amortized_ms(ms: float, B: int) -> float:
+    return ms / max(1, B)
+
+
 def time_call(fn, iters=5, warmup=2):
     for _ in range(warmup):
         fn()
@@ -322,8 +326,9 @@ def _run_for_B(
         build_v2_4(full_keys, args.bf, args.S, args.refine_iter, values=full_values)
 
     ms_fresh = time_call(fresh_build, iters=args.iters, warmup=2)
+    ms_fresh_per_buf = _amortized_ms(ms_fresh, B)
     if verbose:
-        print(f"  {'build_v2_4 (fresh)':<26s} {'ref':<8s}  {ms_fresh:8.2f} ms")
+        print(f"  {'build_v2_4 (fresh)':<26s} {'ref':<8s}  {ms_fresh_per_buf:10.4f} ms/B")
 
     kept_states: dict[str, dict] = {}
     kernel_ms: dict[str, float] = {}
@@ -345,8 +350,9 @@ def _run_for_B(
             if verbose:
                 print(f"  {name:<26s} {info.version:<8s}  FAIL {type(exc).__name__}: {exc}")
             continue
+        ms_per_buf = _amortized_ms(ms, B)
         if verbose:
-            print(f"  {name:<26s} {info.version:<8s}  {ms:8.2f} ms  "
+            print(f"  {name:<26s} {info.version:<8s}  {ms_per_buf:10.4f} ms/B  "
                   f"({ms_fresh / ms:5.1f}x vs fresh)")
         kernel_ms[name] = ms
         new_state, _, _ = fn(
@@ -415,6 +421,7 @@ def _run_for_B(
     out: dict = {
         "fresh (rebuild)": {
             "ms": ms_fresh,
+            "ms_per_buf": ms_fresh_per_buf,
             "kept_frac": stats["fresh (rebuild)"][0],
             "recall": stats["fresh (rebuild)"][1],
             "corr_abs": None,
@@ -423,6 +430,7 @@ def _run_for_B(
     for name in kernel_ms:
         out[name] = {
             "ms": kernel_ms[name],
+            "ms_per_buf": _amortized_ms(kernel_ms[name], B),
             "kept_frac": stats[name][0],
             "recall": stats[name][1],
             "corr_abs": corr_abs.get(name),
@@ -536,7 +544,7 @@ def main():
     print("=" * 78)
     print("Summary")
     header = (
-        f"  {'B':>6s}  {'kernel':<18s}  {'ms':>9s}  "
+        f"  {'B':>6s}  {'kernel':<18s}  {'ms/B':>10s}  "
         f"{'x_fresh':>8s}  {'kept':>7s}  {'recall':>7s}"
     )
     print(header)
@@ -545,13 +553,13 @@ def main():
         res = all_results[B]
         ms_fresh = res["fresh (rebuild)"]["ms"]
         fresh = res["fresh (rebuild)"]
-        print(f"  {B:>6d}  {'fresh (rebuild)':<18s}  {fresh['ms']:>9.2f}  "
+        print(f"  {B:>6d}  {'fresh (rebuild)':<18s}  {fresh['ms_per_buf']:>10.4f}  "
               f"{'1.0x':>8s}  {fresh['kept_frac']:>7.4f}  {fresh['recall']:>7.4f}")
         for name in SUMMARY_ORDER:
             if name not in res:
                 continue
             r = res[name]
-            print(f"  {B:>6d}  {name:<18s}  {r['ms']:>9.2f}  "
+            print(f"  {B:>6d}  {name:<18s}  {r['ms_per_buf']:>10.4f}  "
                   f"{ms_fresh / r['ms']:>7.1f}x  "
                   f"{r['kept_frac']:>7.4f}  {r['recall']:>7.4f}")
         print()

@@ -1,8 +1,7 @@
-"""v1.20 attention index kernel — v1.14 plus all-dead chunk skip.
+"""v1.31 sparse attention index kernel with fp16 query inputs.
 
-The sparse attention path often sees parent chunks where every child is gated
-out after intersecting the subspace cluster-pass masks. In that case there is
-no need to load K/V tiles or run the softmax update for the chunk.
+Same split-parallel sparse path as v1.14/v1.18, but consumes q already in
+fp16 so the timed region does not perform an fp32<->fp16 cast.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ except Exception:  # pragma: no cover
 if HAS_TRITON:
 
     @triton.jit
-    def _fused_attn_index_ns_skipdead_kernel(
+    def _fused_attn_index_fp16q_v1_31_kernel(
         Q_ptr,
         KeysBlocksT_ptr,
         ValuesBlocks_ptr,
@@ -53,12 +52,11 @@ if HAS_TRITON:
         d_range = tl.arange(0, D)
         dv_range = tl.arange(0, D_V)
 
-        q_full_f32 = tl.load(
+        q_f16 = tl.load(
             Q_ptr + hq_vec[:, None] * D + d_range[None, :],
             mask=g_valid[:, None],
             other=0.0,
         )
-        q_f16 = (q_full_f32 * SCALE).to(tl.float16)
 
         m = tl.full([GROUPS_POW], -1.0e30, dtype=tl.float32)
         l_acc = tl.zeros([GROUPS_POW], dtype=tl.float32)
@@ -111,35 +109,34 @@ if HAS_TRITON:
                     survive = survive & (passed != 0)
 
             live_cols = tl.max(survive.to(tl.int32), axis=0) != 0
-            if tl.max(live_cols.to(tl.int32), axis=0) != 0:
-                keys_tile = tl.load(
-                    KeysBlocksT_ptr
-                    + ((kvh * K + parent_idx_safe[None, :]) * D + d_range[:, None]) * BF
-                    + child_rel[None, :],
-                    mask=live_cols[None, :],
-                    other=0.0,
-                )
-                scores = tl.dot(q_f16, keys_tile)
-                scores = tl.where(survive, scores, -1.0e30)
 
-                chunk_max = tl.max(scores, axis=1)
-                m_new = tl.maximum(m, chunk_max)
-                alpha = tl.exp(m - m_new)
-                p = tl.exp(scores - m_new[:, None])
-                p = tl.where(survive, p, 0.0)
-                l_acc = alpha * l_acc + tl.sum(p, axis=1)
+            keys_tile = tl.load(
+                KeysBlocksT_ptr
+                + ((kvh * K + parent_idx_safe[None, :]) * D + d_range[:, None]) * BF
+                + child_rel[None, :],
+                mask=live_cols[None, :],
+                other=0.0,
+            )
+            scores = tl.dot(q_f16, keys_tile) * SCALE
+            scores = tl.where(survive, scores, -1.0e30)
 
-                v_tile = tl.load(
-                    ValuesBlocks_ptr
-                    + ((kvh * K + parent_idx_safe[:, None]) * BF + child_rel[:, None]) * D_V
-                    + dv_range[None, :],
-                    mask=live_cols[:, None],
-                    other=0.0,
-                )
-                p_f16 = p.to(tl.float16)
-                o_acc = alpha[:, None] * o_acc + tl.dot(p_f16, v_tile)
+            chunk_max = tl.max(scores, axis=1)
+            m_new = tl.maximum(m, chunk_max)
+            alpha = tl.exp(m - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            p = tl.where(survive, p, 0.0)
+            l_acc = alpha * l_acc + tl.sum(p, axis=1)
 
-                m = m_new
+            v_tile = tl.load(
+                ValuesBlocks_ptr
+                + ((kvh * K + parent_idx_safe[:, None]) * BF + child_rel[:, None]) * D_V
+                + dv_range[None, :],
+                mask=live_cols[:, None],
+                other=0.0,
+            )
+            o_acc = alpha[:, None] * o_acc + tl.dot(p.to(tl.float16), v_tile)
+
+            m = m_new
 
         tl.store(
             M_out_ptr + hq_vec * NUM_SPLITS + split,
@@ -160,7 +157,7 @@ if HAS_TRITON:
         )
 
 
-def run_fused_attn_index_ns_skipdead(
+def run_fused_attn_index_fp16q(
     q: torch.Tensor,
     keys_blocks_t_f16: torch.Tensor,
     values_blocks_f16: torch.Tensor,
@@ -186,7 +183,7 @@ def run_fused_attn_index_ns_skipdead(
     d = q.shape[1]
     d_v = values_blocks_f16.shape[-1]
     grid = (h_kv_eff, num_splits)
-    _fused_attn_index_ns_skipdead_kernel[grid](
+    _fused_attn_index_fp16q_v1_31_kernel[grid](
         q, keys_blocks_t_f16, values_blocks_f16,
         assigns_blocks, cluster_pass, invalid_blocks_i8,
         out_m, out_l, out_o,
