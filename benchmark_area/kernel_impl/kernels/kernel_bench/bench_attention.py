@@ -90,6 +90,7 @@ ATTENTION_BUILD_KERNELS = {
     "attention_v2_13": "build_v2_7",
     "attention_v2_14": "build_v2_7",
     "attention_v2_15": "build_v2_7",
+    "attention_v5_14": "build_v2_7",
     # "attention_v1_22": "build_v2_4",
     # "attention_v1_23": "build_v2_4",
     # "attention_v1_24": "build_v2_4",
@@ -101,7 +102,7 @@ ATTENTION_BUILD_KERNELS = {
     "attention_v1_30": "build_v2_5",
 }
 
-FP16_ONLY_ATTENTION_KERNELS = {"attention_v1_18_1", "attention_v1_31", "attention_v1_32", "attention_v1_33", "attention_v1_34", "attention_v1_35", "attention_v1_36", "attention_v1_37", "attention_v1_38", "attention_v1_39", "attention_v1_40", "attention_v1_41", "attention_v1_42", "attention_v1_43", "attention_v1_44", "attention_v1_45", "attention_v1_46", "attention_v1_47", "attention_v2_0", "attention_v2_1", "attention_v2_2", "attention_v2_3", "attention_v2_4", "attention_v2_5", "attention_v2_6", "attention_v2_7", "attention_v2_8", "attention_v2_9", "attention_v2_10", "attention_v2_11", "attention_v2_12", "attention_v2_13", "attention_v2_14", "attention_v2_15"}
+FP16_ONLY_ATTENTION_KERNELS = {"attention_v1_18_1", "attention_v1_31", "attention_v1_32", "attention_v1_33", "attention_v1_34", "attention_v1_35", "attention_v1_36", "attention_v1_37", "attention_v1_38", "attention_v1_39", "attention_v1_40", "attention_v1_41", "attention_v1_42", "attention_v1_43", "attention_v1_44", "attention_v1_45", "attention_v1_46", "attention_v1_47", "attention_v2_0", "attention_v2_1", "attention_v2_2", "attention_v2_3", "attention_v2_4", "attention_v2_5", "attention_v2_6", "attention_v2_7", "attention_v2_8", "attention_v2_9", "attention_v2_10", "attention_v2_11", "attention_v2_12", "attention_v2_13", "attention_v2_14", "attention_v2_15", "attention_v5_14"}
 
 BUILD_FNS = {
     "build_v1_0": build_v1,
@@ -142,6 +143,17 @@ def time_call(fn, iters=10, warmup=3):
         fn()
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) / iters * 1000
+
+
+_GREEN = "\033[32m"
+_RESET = "\033[0m"
+
+
+def format_ms(per_q: float, fp16_baseline: float | None = None) -> str:
+    text = f"{per_q:8.3f}"
+    if fp16_baseline is not None and per_q < fp16_baseline:
+        return f"{_GREEN}{text}{_RESET}"
+    return text
 
 
 def main():
@@ -297,6 +309,7 @@ def main():
         return f
 
     results = []
+    attention_results: list[tuple[str, str, float]] = []
     skipped: list[str] = []
 
     def _record_skip(label: str) -> None:
@@ -416,6 +429,7 @@ def main():
         scale = 1.0 / math.sqrt(D)
         values_full_f16 = values_full.half()
         successful_attention: list[tuple[str, object, str]] = []
+        attention_section_rows: list[tuple[str, str, float, str | None]] = []
 
         def attention_inputs(
             attn_name: str,
@@ -499,10 +513,9 @@ def main():
                 continue
             per_q = ms / len(query_pairs)
             results.append((label, per_q))
+            attention_results.append((name, info.version, per_q))
             successful_attention.append((name, info, build_name))
-            print(
-                f"  {name:<24s} {info.version:<6s}  {per_q:8.3f} ms/query  [{build_name}]"
-            )
+            attention_section_rows.append((name, info.version, per_q, build_name))
 
         # Dense attention baseline (fp32 math, matches our fused output dtype).
         # GQA-aware: no H_q expansion on K/V.
@@ -521,7 +534,7 @@ def main():
         ms = time_call(dense_attn_fp32, iters=args.iters, warmup=3)
         per_q = ms / len(baseline_pairs)
         results.append(("dense attn fp32", per_q))
-        print(f"  {'dense attn fp32':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
+        attention_section_rows.append(("dense attn fp32", "-", per_q, None))
 
         # FP16 dense attention.
         def dense_attn_fp16():
@@ -539,7 +552,7 @@ def main():
         ms = time_call(dense_attn_fp16, iters=args.iters, warmup=3)
         per_q = ms / len(baseline_pairs)
         results.append(("dense attn fp16", per_q))
-        print(f"  {'dense attn fp16':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
+        attention_section_rows.append(("dense attn fp16", "-", per_q, None))
 
         # SDPA (flash backend chosen automatically). Uses enable_gqa so K/V stay
         # at H_kv — mirrors baseline_sdpa in index.py.
@@ -560,7 +573,7 @@ def main():
         ms = time_call(sdpa_baseline, iters=args.iters, warmup=3)
         per_q = ms / len(baseline_pairs)
         results.append(("sdpa fp32", per_q))
-        print(f"  {'sdpa fp32':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
+        attention_section_rows.append(("sdpa fp32", "-", per_q, None))
 
         def sdpa_baseline_fp16():
             for qn, _ in baseline_pairs_fp16:
@@ -579,7 +592,18 @@ def main():
         ms = time_call(sdpa_baseline_fp16, iters=args.iters, warmup=3)
         per_q = ms / len(baseline_pairs)
         results.append(("sdpa fp16", per_q))
-        print(f"  {'sdpa fp16':<24s} {'-':<6s}  {per_q:8.3f} ms/query")
+        attention_section_rows.append(("sdpa fp16", "-", per_q, None))
+
+        sdpa_fp16_per_q = per_q
+        for row_name, row_version, row_ms, row_build in attention_section_rows:
+            time_text = format_ms(row_ms, sdpa_fp16_per_q)
+            if row_build is None:
+                print(f"  {row_name:<24s} {row_version:<6s}  {time_text} ms/query")
+            else:
+                print(
+                    f"  {row_name:<24s} {row_version:<6s}  "
+                    f"{time_text} ms/query  [{row_build}]"
+                )
 
         # Correctness checks: compare fused attention to dense attention.
         #   - tight gate (as timed): expected sparse-approximation error.
@@ -659,6 +683,14 @@ def main():
         print(f"Fastest: {best[0]} at {best[1]:.3f} ms/query")
     else:
         print("Fastest: none (all kernels failed or were skipped)")
+    if attention_results:
+        best_attention = min(attention_results, key=lambda r: r[2])
+        print(
+            f"Fastest attention kernel: {best_attention[0]} "
+            f"({best_attention[1]}) at {best_attention[2]:.3f} ms/query"
+        )
+    else:
+        print("Fastest attention kernel: none (all attention kernels failed or were skipped)")
     if skipped:
         print("Skipped kernels:")
         for label in skipped:
