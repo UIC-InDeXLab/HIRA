@@ -160,12 +160,23 @@ def parse_args():
                         f"{_ATTN_BUCKETS} minimize CUDA-graph captures).")
 
     # ── Kernel selection (defaults = fused attention path) ──
-    p.add_argument("--build-kernel", default="build_v2_4",
+    p.add_argument("--build-kernel", default="build_v2_7",
                    help="Module name under kernels/ for build (auto-discovered).")
-    p.add_argument("--update-kernel", default="update_v2_1",
-                   help="Module name under kernels/ for update (auto-discovered).")
+    p.add_argument("--update-kernel", default=None,
+                   help="Module name under kernels/ for update (auto-discovered). "
+                        "Defaults to update_v4_0 with --parallel-update, otherwise "
+                        "update_v2_1.")
     p.add_argument("--attention-kernel", default="attention_v2_6",
                    help="Module name under kernels/ for fused attention.")
+    p.add_argument("--parallel-update", action="store_true",
+                   help="Run update on a side CUDA stream concurrent with "
+                        "attention. Requires an overlap-aware update kernel "
+                        "(default: update_v4_0). Adds step_wall_ms / overlap "
+                        "telemetry columns to the CSV.")
+    p.add_argument("--update-stream-priority", type=int, default=-1,
+                   help="CUDA stream priority for the update stream when "
+                        "--parallel-update is set. Lower = lower priority. "
+                        "Default -1 lets attention preempt SMs.")
 
     # ── Output ──
     p.add_argument("--output-csv", type=Path, default=None,
@@ -208,9 +219,18 @@ def _validate_args(args):
         )
 
 
+def _bucket_for_buffer(l_buf: int) -> int:
+    for b in _ATTN_BUCKETS:
+        if l_buf <= b:
+            return b
+    return _ATTN_BUCKETS[-1]
+
+
 def main():
     args = parse_args()
     _validate_args(args)
+    if args.update_kernel is None:
+        args.update_kernel = "update_v4_0" if args.parallel_update else "update_v2_1"
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required.")
     torch.manual_seed(args.seed)
@@ -243,6 +263,8 @@ def main():
         build_kernel=args.build_kernel,
         update_kernel=args.update_kernel,
         attention_kernel=args.attention_kernel,
+        parallel_update=args.parallel_update,
+        update_stream_priority=args.update_stream_priority,
     )
     index = SubspaceKCenterIndex(cfg)
     prefill_keys = keys[:, :n_prefill, :].contiguous()
@@ -282,22 +304,68 @@ def main():
     )
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
-        "step", "n_keys", "attend_ours_ms", "dense_attn_ms", "sdpa_ms",
+        "step", "n_keys", "k_used", "k_cap",
+        "attend_ours_ms", "dense_attn_ms", "sdpa_ms",
         "update_ms", "amortized_ours_ms", "memory_bytes",
         "scanned_parent_frac", "scanned_key_frac",
+        # Parallel-update telemetry (zeros when --parallel-update is off).
+        "step_wall_ms",          # total wall-clock for the step (event-based)
+        "update_kernel_ms",      # GPU kernel time on update_stream (committed at publish step)
+        "update_wait_ms",        # host stall when next fire saw a still-pending update
+        "update_inflight",       # 1 if a prior update was still pending at start of this step
+        "buffer_bucket",         # attention buffer bucket size used (64/128/256/512/0)
     ]
     with out_csv.open("w", newline="") as f:
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
     rows: list[dict] = []
-    update_costs: list[float] = []
+    update_costs: list[float] = []          # per-step update GPU time (kernel_ms in async, blocking ms in sync)
+    update_fire_steps: list[int] = []
+    update_wait_costs: list[float] = []
+    update_kernel_costs: list[float] = []
     last_update_ms = 0.0
 
+    # Per-bucket bookkeeping for the end-of-run summary (async path only).
+    bucket_stats: dict[int, dict[str, float]] = {}
+    # Attend timing split (idle vs during-update) — async only.
+    attend_idle_sum = attend_idle_n = 0.0, 0
+    attend_busy_sum = attend_busy_n = 0.0, 0
+    # Use mutable accumulators because we set them via `+=`.
+    attend_idle_sum = 0.0; attend_idle_n = 0
+    attend_busy_sum = 0.0; attend_busy_n = 0
+
+    parallel = args.parallel_update
     sim_start = time.perf_counter()
+
+    # Aggregates for end-of-run wall vs serial summary.
+    sum_wall_ms = 0.0
+    sum_attend_ms = 0.0
+    sum_dense_ms = 0.0
+    sum_sdpa_ms = 0.0
+    sum_attend_after_fire_ms = 0.0   # attend during steps where publish happened mid-loop
+
     for step in range(n_decode):
         token_idx = n_prefill + step
         q = queries[:, token_idx, :]
         qn = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        # Step start: was a prior update still in flight when this step began?
+        update_inflight_at_start = bool(parallel and index.has_pending_update)
+
+        # Lazy publish: if the prior update is finished on the GPU, publish it
+        # now (cheap, no host stall). Without this every subsequent fire would
+        # see _pending_update=True even when the GPU has long since finished.
+        publish_this_step_metrics = None
+        if parallel:
+            pre_log_n = len(index.update_metrics_log)
+            if index.try_publish() and len(index.update_metrics_log) > pre_log_n:
+                m = index.update_metrics_log[-1]
+                publish_this_step_metrics = m
+
+        # Step-level wall-clock event (event-based to avoid per-step host syncs).
+        step_start_evt = torch.cuda.Event(enable_timing=True)
+        step_end_evt = torch.cuda.Event(enable_timing=True)
+        step_start_evt.record()
 
         # ── Threshold computation (NOT timed) ──
         all_keys_so_far = keys[:, : token_idx + 1, :]
@@ -308,29 +376,31 @@ def main():
         )
 
         # ── Timed: our fused attention ──
-        # Pass fp16 Q and packed fp16 thresholds directly. Both are prepared
-        # outside timing so the timed region only measures the attention path.
-        # Amortized timing: runs warmup+iters calls with one sync per batch so
-        # per-call sync overhead doesn't dominate fast kernels. last_cluster_pass
-        # reflects the final call, which is what we want for pruning stats.
         attend_ours_ms = _time_repeated(
             lambda: index.attend(qn, th, q_head_to_kv=q_head_to_kv)
         )
+        if parallel:
+            if update_inflight_at_start:
+                attend_busy_sum += attend_ours_ms
+                attend_busy_n += 1
+            else:
+                attend_idle_sum += attend_ours_ms
+                attend_idle_n += 1
+
+        # Track the buffer-bucket attention actually used this step
+        # (covers active + inflight during overlap).
+        l_buf_eff = int(index.n_buffered)
+        bucket = _bucket_for_buffer(l_buf_eff) if l_buf_eff > 0 else 0
+        k_used = int(index.state.get("K_used", index.state["K"]))
+        k_cap = int(index.state.get("K_cap", index.state["K"]))
 
         # ── Pruning measurement (NOT timed) ──
-        # After _time_gpu(attend) the cluster_pass mask is populated and
-        # sync'd. Reduce + .item() happens here, outside any timed region.
         cp = index.last_cluster_pass()
         if cp is not None:
-            # AND across subspaces: parents that pass every threshold.
-            parent_alive = cp.all(dim=0)               # (H_q, K)
+            parent_alive = cp.all(dim=0)[:, :k_used]   # (H_q, K_used)
             scanned_parent_frac = parent_alive.float().mean().item()
-            # With BF=4 block layout every surviving parent scans BF children,
-            # and the buffer keys are always scanned, so the fraction of
-            # raw keys touched is:
             bf = int(index.state["bf"])
-            k = int(index.state["K"])
-            n_idx = k * bf                             # indexed-keys count (padded)
+            n_idx = k_used * bf
             n_buf = int(index.n_buffered)
             scanned_key_frac = (
                 (scanned_parent_frac * n_idx + n_buf) / max(n_idx + n_buf, 1)
@@ -338,6 +408,7 @@ def main():
         else:
             scanned_parent_frac = float("nan")
             scanned_key_frac = float("nan")
+
         # ── Timed: dense attention baseline ──
         dense_attn_ms = _time_repeated(
             lambda: baseline_attention(
@@ -356,18 +427,66 @@ def main():
         new_val = values[:, token_idx : token_idx + 1, :]
         index.append_decoding_kv(new_key, new_val)
 
-        # ── Timed: update every update_interval steps ──
+        # ── Update every update_interval steps ──
         update_ms = 0.0
+        update_kernel_ms_col = 0.0
+        update_wait_ms_col = 0.0
+        if publish_this_step_metrics is not None:
+            # Publish was lazy / non-blocking. Surface the kernel time on this row.
+            update_kernel_ms_col = publish_this_step_metrics.kernel_ms
+            update_wait_ms_col = publish_this_step_metrics.host_wait_ms
+            update_kernel_costs.append(publish_this_step_metrics.kernel_ms)
+            update_wait_costs.append(publish_this_step_metrics.host_wait_ms)
+            last_update_ms = publish_this_step_metrics.kernel_ms
+
         if index.needs_update(args.update_interval):
-            _, update_ms = _time_gpu(index.update)
-            last_update_ms = update_ms
+            if parallel:
+                pre_log_n = len(index.update_metrics_log)
+                index.update_async(fire_step=step)
+                update_fire_steps.append(step)
+                if len(index.update_metrics_log) > pre_log_n:
+                    # Forced publish inside update_async because prior update
+                    # wasn't done — host actually waited.
+                    m = index.update_metrics_log[-1]
+                    if publish_this_step_metrics is None:
+                        # Distinct from the lazy publish above.
+                        update_kernel_ms_col = m.kernel_ms
+                        update_wait_ms_col = m.host_wait_ms
+                        update_kernel_costs.append(m.kernel_ms)
+                        update_wait_costs.append(m.host_wait_ms)
+                    last_update_ms = m.kernel_ms
+                    if bucket not in bucket_stats:
+                        bucket_stats[bucket] = {"n": 0, "kernel_ms": 0.0, "wait_ms": 0.0}
+                    bucket_stats[bucket]["n"] += 1
+                    bucket_stats[bucket]["kernel_ms"] += m.kernel_ms
+                    bucket_stats[bucket]["wait_ms"] += m.host_wait_ms
+                update_ms = update_kernel_ms_col
+            else:
+                _, update_ms = _time_gpu(index.update)
+                last_update_ms = update_ms
+                update_kernel_ms_col = update_ms
+                update_kernel_costs.append(update_ms)
+                update_fire_steps.append(step)
         update_costs.append(update_ms)
+
+        # End-of-step event + sync (only sync if needed for wall measurement).
+        step_end_evt.record()
+        step_end_evt.synchronize()
+        step_wall_ms = step_start_evt.elapsed_time(step_end_evt)
+        sum_wall_ms += step_wall_ms
+        sum_attend_ms += attend_ours_ms
+        sum_dense_ms += dense_attn_ms
+        sum_sdpa_ms += sdpa_ms
+
+        # Amortized: serial cost includes update kernel time amortized over all steps.
         amort_update_ms = sum(update_costs) / len(update_costs)
         amort_ours = attend_ours_ms + amort_update_ms
 
         rows.append({
             "step": step,
             "n_keys": int(all_keys_so_far.shape[1]),
+            "k_used": k_used,
+            "k_cap": k_cap,
             "attend_ours_ms": round(attend_ours_ms, 4),
             "dense_attn_ms": round(dense_attn_ms, 4),
             "sdpa_ms": round(sdpa_ms, 4),
@@ -376,6 +495,11 @@ def main():
             "memory_bytes": index.memory_bytes(),
             "scanned_parent_frac": round(scanned_parent_frac, 5),
             "scanned_key_frac": round(scanned_key_frac, 5),
+            "step_wall_ms": round(step_wall_ms, 4),
+            "update_kernel_ms": round(update_kernel_ms_col, 4),
+            "update_wait_ms": round(update_wait_ms_col, 4),
+            "update_inflight": int(update_inflight_at_start),
+            "buffer_bucket": bucket,
         })
 
         if (step + 1) % args.flush_every == 0 or step == n_decode - 1:
@@ -385,22 +509,113 @@ def main():
             elapsed = time.perf_counter() - sim_start
             print(
                 f"step {step+1}/{n_decode}  "
-                f"attend={attend_ours_ms:.3f}ms  dense={dense_attn_ms:.3f}ms  "
-                f"sdpa={sdpa_ms:.3f}ms  last_upd={last_update_ms:.2f}ms  "
+                f"attend={attend_ours_ms:.3f}ms  wall={step_wall_ms:.3f}ms  "
+                f"dense={dense_attn_ms:.3f}ms  sdpa={sdpa_ms:.3f}ms  "
+                f"last_upd={last_update_ms:.2f}ms  "
+                f"K={k_used}/{k_cap}  "
                 f"scan[parents]={scanned_parent_frac:.3f} "
                 f"scan[keys]={scanned_key_frac:.3f}  [{elapsed:.1f}s]"
             )
 
+    # ── Drain any in-flight update so its metrics are committed ──
+    if parallel and index.has_pending_update:
+        index.wait_for_update()
+        # If publish committed metrics, attribute them to a synthetic post-loop entry.
+        if len(index.update_metrics_log) > len(update_kernel_costs):
+            m = index.update_metrics_log[-1]
+            update_kernel_costs.append(m.kernel_ms)
+            update_wait_costs.append(m.host_wait_ms)
+
     # ── End-of-run summary ──
-    n_upd = sum(1 for u in update_costs if u > 0)
-    total_upd_ms = sum(update_costs)
-    mean_upd_ms = total_upd_ms / n_upd if n_upd else 0.0
+    n_upd = len(update_fire_steps)
+    total_kernel_ms = sum(update_kernel_costs)
+    mean_kernel_ms = total_kernel_ms / max(n_upd, 1)
+    total_wait_ms = sum(update_wait_costs)
+    max_wait_ms = max(update_wait_costs) if update_wait_costs else 0.0
+    mean_attend_ms = sum_attend_ms / max(n_decode, 1)
+    mean_dense_ms = sum_dense_ms / max(n_decode, 1)
+    mean_sdpa_ms = sum_sdpa_ms / max(n_decode, 1)
+    mean_baselines_ms = mean_dense_ms + mean_sdpa_ms
+
     print(
+        f"\n──── Summary ────"
         f"\nUpdates: {n_upd} fired over {n_decode} steps "
-        f"(interval={args.update_interval}, mode={args.update_mode}) "
-        f"— total={total_upd_ms:.1f}ms  mean={mean_upd_ms:.2f}ms/update  "
-        f"amortized={total_upd_ms / max(n_decode, 1):.3f}ms/step"
+        f"(interval={args.update_interval}, mode={args.update_mode}, "
+        f"parallel={parallel})"
     )
+    print(f"  avg attention time: {mean_attend_ms:.4f}ms/step")
+    print(
+        f"  avg baselines time: {mean_baselines_ms:.4f}ms/step "
+        f"(dense={mean_dense_ms:.4f}, sdpa={mean_sdpa_ms:.4f})"
+    )
+    print(
+        f"  update kernel time:  total={total_kernel_ms:.1f}ms  "
+        f"mean={mean_kernel_ms:.2f}ms/update  "
+        f"amortized={total_kernel_ms / max(n_decode, 1):.4f}ms/step"
+    )
+
+    if parallel:
+        print(
+            f"  overlap misses:      {index.n_overlap_misses}/{n_upd}  "
+            f"(updates that forced a host stall on the next fire)"
+        )
+        print(
+            f"  host stall:          total={total_wait_ms:.1f}ms  "
+            f"mean={total_wait_ms / max(n_upd, 1):.2f}ms/update  "
+            f"max={max_wait_ms:.2f}ms"
+        )
+        # Headline: amortized cost of (attend + update) under serial vs overlap.
+        # Serial cost we can construct from the same data: mean attend + mean
+        # update kernel time amortized over decode steps (this is what the
+        # serial bench's --update-mode=inc would charge per step).
+        mean_wall_ms = sum_wall_ms / max(n_decode, 1)
+        amort_kernel_ms = total_kernel_ms / max(n_decode, 1)
+        serial_cost = mean_attend_ms + amort_kernel_ms
+        # Overlap cost ≈ mean wall - dense - sdpa - threshold work (we can't
+        # decompose all of it cheaply). Report mean wall directly; the
+        # interesting comparison is per-step "how much of update_kernel_ms is
+        # hidden by attend".
+        hide_ms = max(0.0, amort_kernel_ms - max(0.0, mean_wall_ms - mean_attend_ms))
+        # Cleaner derivation: hide ratio = 1 - host_stall_amortized / kernel_amortized
+        amort_wait_ms = total_wait_ms / max(n_decode, 1)
+        denom = amort_kernel_ms if amort_kernel_ms > 0 else 1.0
+        hide_ratio = 1.0 - amort_wait_ms / denom
+        hide_ratio = max(0.0, min(1.0, hide_ratio))
+        print(
+            f"  serial cost (proxy): attend({mean_attend_ms*1000:.1f}us) + "
+            f"update_amortized({amort_kernel_ms*1000:.1f}us) = "
+            f"{serial_cost*1000:.1f}us/step"
+        )
+        print(
+            f"  hide ratio:          {hide_ratio*100:.1f}%  "
+            f"(of update kernel time hidden behind attend; "
+            f"100% = no host stall, 0% = fully serialized)"
+        )
+        print(
+            f"  mean step wall:      {mean_wall_ms:.3f}ms  "
+            f"(includes dense + sdpa baselines, not just our attend)"
+        )
+        if attend_idle_n and attend_busy_n:
+            mean_idle = attend_idle_sum / attend_idle_n
+            mean_busy = attend_busy_sum / attend_busy_n
+            ratio = mean_busy / mean_idle if mean_idle > 0 else float("nan")
+            print(
+                f"  attend contention:   idle={mean_idle:.4f}ms ({attend_idle_n} steps)  "
+                f"during_update={mean_busy:.4f}ms ({attend_busy_n} steps)  "
+                f"ratio={ratio:.3f}x"
+            )
+        if bucket_stats:
+            print("  per-bucket update kernel time:")
+            for b in sorted(bucket_stats):
+                bs = bucket_stats[b]
+                if bs["n"] == 0:
+                    continue
+                print(
+                    f"    B<={b:>4d}: n={int(bs['n']):3d}  "
+                    f"mean_kernel={bs['kernel_ms']/bs['n']:.2f}ms  "
+                    f"mean_wait={bs['wait_ms']/bs['n']:.2f}ms"
+                )
+
     print(f"Done. CSV -> {out_csv}")
 
 

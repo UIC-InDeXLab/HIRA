@@ -35,6 +35,7 @@ if HAS_TRITON:
         O_out_ptr,
         H_Q,
         K,
+        K_STRIDE,
         DIM_OFFSET: tl.constexpr,
         WIDTH: tl.constexpr,
         D: tl.constexpr,
@@ -94,13 +95,13 @@ if HAS_TRITON:
 
             centers = tl.load(
                 CentersAnchor_ptr
-                + (kvh * K + parent_idx_p_safe[:, None]) * WIDTH
+                + (kvh * K_STRIDE + parent_idx_p_safe[:, None]) * WIDTH
                 + width_range[None, :],
                 mask=col_valid_p[:, None],
                 other=0.0,
             )
             radii = tl.load(
-                RadiiAnchor_ptr + kvh * K + parent_idx_p_safe,
+                RadiiAnchor_ptr + kvh * K_STRIDE + parent_idx_p_safe,
                 mask=col_valid_p,
                 other=0.0,
             ).to(tl.float32)
@@ -119,7 +120,7 @@ if HAS_TRITON:
             anchor_pass_cols = tl.reshape(pp_exp, [GROUPS_POW, PARENTS_PER_PROG * BF])
 
             inv = tl.load(
-                InvalidBlocks_ptr + ((kvh * K + parent_idx_safe) * BF + child_rel),
+                InvalidBlocks_ptr + ((kvh * K_STRIDE + parent_idx_safe) * BF + child_rel),
                 mask=col_valid,
                 other=1,
             )
@@ -129,7 +130,7 @@ if HAS_TRITON:
             if tl.max(live_cols.to(tl.int32), axis=0) != 0:
                 keys_tile = tl.load(
                     KeysBlocksT_ptr
-                    + ((kvh * K + parent_idx_safe[None, :]) * D + d_range[:, None]) * BF
+                    + ((kvh * K_STRIDE + parent_idx_safe[None, :]) * D + d_range[:, None]) * BF
                     + child_rel[None, :],
                     mask=live_cols[None, :],
                     other=0.0,
@@ -146,7 +147,7 @@ if HAS_TRITON:
 
                 v_tile = tl.load(
                     ValuesBlocks_ptr
-                    + ((kvh * K + parent_idx_safe[:, None]) * BF + child_rel[:, None]) * D_V
+                    + ((kvh * K_STRIDE + parent_idx_safe[:, None]) * BF + child_rel[:, None]) * D_V
                     + dv_range[None, :],
                     mask=live_cols[:, None],
                     other=0.0,
@@ -194,6 +195,7 @@ def run_fused_attn_index_v2_0(
     out_m: torch.Tensor,
     out_l: torch.Tensor,
     out_o: torch.Tensor,
+    k_stride: int | None = None,
     num_warps: int = 4,
     num_stages: int = 3,
 ) -> None:
@@ -201,6 +203,7 @@ def run_fused_attn_index_v2_0(
     d_v = values_blocks_f16.shape[-1]
     width = centers_anchor.shape[-1]
     grid = (h_kv_eff, num_splits)
+    k_stride = k if k_stride is None else int(k_stride)
     _fused_attn_index_v2_0_kernel[grid](
         q,
         keys_blocks_t_f16,
@@ -215,6 +218,7 @@ def run_fused_attn_index_v2_0(
         out_o,
         h_q,
         k,
+        k_stride,
         DIM_OFFSET=int(dim_offset),
         WIDTH=int(width),
         D=d,

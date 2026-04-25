@@ -44,6 +44,10 @@ UPDATE_WHITELIST = {
     "update_v2_3",
     "update_v2_4",
     "update_v2_5",
+    "update_v3_0",
+    "update_v3_1",
+    "update_v3_2",
+    "update_v3_3",
 }
 SUMMARY_ORDER = (
     "update_v2_0",
@@ -52,6 +56,10 @@ SUMMARY_ORDER = (
     "update_v2_3",
     "update_v2_4",
     "update_v2_5",
+    "update_v3_0",
+    "update_v3_1",
+    "update_v3_2",
+    "update_v3_3",
 )
 
 
@@ -155,9 +163,13 @@ def _pruning_stats(state, q, keys_q_expanded, full_keys, topk, q_head_to_kv):
     # reorder_perm[h, j] gives the original index (into merged keys) for physical j.
     perm = state["reorder_perm"].index_select(0, q_head_to_kv).long()  # (H_q, N_pad)
     # For invalid slots, perm may be arbitrary; mask them out.
-    n_real = int(state["N"])
+    n_real = int(state.get("N_used", state["N"]))
+    valid_phys = ~invalid_mask
 
-    kept_frac = survive.float().mean(dim=-1).mean().item()
+    kept_frac = (
+        survive.float().sum(dim=-1)
+        / valid_phys.float().sum(dim=-1).clamp_min(1.0)
+    ).mean().item()
 
     # Recall: are the true top-k original indices surviving?
     # topk_idx_merged is per-head in merged-key space, shape (H_q, topk).
@@ -165,7 +177,6 @@ def _pruning_stats(state, q, keys_q_expanded, full_keys, topk, q_head_to_kv):
     # We do it per head via scatter.
     n_pad = perm.shape[-1]
     inv_perm = torch.full((h_q, n_real), -1, device=q.device, dtype=torch.long)
-    valid_phys = ~invalid_mask
     for h in range(h_q):
         valid_j = valid_phys[h].nonzero(as_tuple=True)[0]
         orig_idx = perm[h, valid_j]

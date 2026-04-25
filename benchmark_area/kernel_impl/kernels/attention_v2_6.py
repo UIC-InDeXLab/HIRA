@@ -42,7 +42,7 @@ _INDEX_NUM_STAGES = 3
 _NUM_SPLITS = 85
 
 
-def _launch_no_buffer(shared, layout, h_q, k, groups, groups_pow,
+def _launch_no_buffer(shared, layout, h_q, k, k_stride, groups, groups_pow,
                       num_splits, anchor_s, scale_log2e, parents_per_prog, anchor):
     run_fused_attn_index_v2_0(
         q=shared["static_q"],
@@ -53,7 +53,7 @@ def _launch_no_buffer(shared, layout, h_q, k, groups, groups_pow,
         q_norm_anchor=shared["static_q_norms"][anchor_s],
         invalid_blocks_i8=layout["invalid_blocks_i8"],
         dim_offset=anchor["dim_offset"],
-        h_q=h_q, h_kv_eff=layout["base_heads"], k=k,
+        h_q=h_q, h_kv_eff=layout["base_heads"], k=k, k_stride=k_stride,
         groups=groups, groups_pow=groups_pow,
         parents_per_prog=parents_per_prog,
         num_splits=num_splits, scale_log2e=scale_log2e,
@@ -66,7 +66,7 @@ def _launch_no_buffer(shared, layout, h_q, k, groups, groups_pow,
     )
 
 
-def _launch_with_buffer(shared, stage, layout, h_q, k, groups, groups_pow,
+def _launch_with_buffer(shared, stage, layout, h_q, k, k_stride, groups, groups_pow,
                         num_splits, anchor_s, scale_log2e, parents_per_prog,
                         bucket, anchor):
     run_fused_attn_index_buf_v2_6(
@@ -81,7 +81,7 @@ def _launch_with_buffer(shared, stage, layout, h_q, k, groups, groups_pow,
         buf_values_f16=stage["buf_values"],
         buf_invalid_i8=stage["buf_invalid"],
         dim_offset=anchor["dim_offset"],
-        h_q=h_q, h_kv_eff=layout["base_heads"], k=k,
+        h_q=h_q, h_kv_eff=layout["base_heads"], k=k, k_stride=k_stride,
         groups=groups, groups_pow=groups_pow,
         parents_per_prog=parents_per_prog,
         num_splits=num_splits, scale_log2e=scale_log2e,
@@ -169,7 +169,8 @@ def attend(
     groups_pow = fixed["groups_pow"]
     anchor_s = fixed["anchor_s"]
     parents_per_prog = fixed["parents_per_prog"]
-    k = int(layout["K"])
+    k = int(layout.get("K_used", layout["K"]))
+    k_stride = int(layout.get("K_stride", layout["K"]))
     anchor = _anchor_layout(layout)
 
     if scale is None:
@@ -184,12 +185,12 @@ def attend(
             stage = {"graph": None, "capture_failed": False}
             fixed["no_buffer_stage"] = stage
         _capture_graph(state, stage, _launch_no_buffer,
-                       (shared, layout, h_q, k, groups, groups_pow,
+                       (shared, layout, h_q, k, k_stride, groups, groups_pow,
                         num_splits, anchor_s, scale_log2e, parents_per_prog, anchor))
         if stage["graph"] is not None:
             stage["graph"].replay()
         else:
-            _launch_no_buffer(shared, layout, h_q, k, groups, groups_pow,
+            _launch_no_buffer(shared, layout, h_q, k, k_stride, groups, groups_pow,
                               num_splits, anchor_s, scale_log2e, parents_per_prog, anchor)
         return shared["out"]
 
@@ -205,13 +206,13 @@ def attend(
     _v31._copy_buffer_into_stage_incremental(stage, buf_keys_eff, buf_values_eff)
 
     _capture_graph(state, stage, _launch_with_buffer,
-                   (shared, stage, layout, h_q, k, groups, groups_pow,
+                   (shared, stage, layout, h_q, k, k_stride, groups, groups_pow,
                     num_splits, anchor_s, scale_log2e, parents_per_prog,
                     bucket, anchor))
     if stage["graph"] is not None:
         stage["graph"].replay()
     else:
-        _launch_with_buffer(shared, stage, layout, h_q, k, groups, groups_pow,
+        _launch_with_buffer(shared, stage, layout, h_q, k, k_stride, groups, groups_pow,
                             num_splits, anchor_s, scale_log2e, parents_per_prog,
                             bucket, anchor)
     return shared["out"]

@@ -35,10 +35,13 @@ def get_layout_attn_rawq(
 
     cache_src = state.setdefault("_attn_v1_key_pack", {})
     keys_reord_ptr = keys_reord.data_ptr()
+    k = int(state["K"])
+    k_used = int(state.get("K_used", k))
+    k_stride = int(state.get("K_cap", k))
     key_cache_key = (
         keys_reord_ptr,
         tuple(keys_reord.shape),
-        state["K"],
+        k,
         state["bf"],
         len(state["assigns_reord"]),
     )
@@ -48,7 +51,6 @@ def get_layout_attn_rawq(
         invalid_blocks = cache_src["invalid_blocks"]
     else:
         h_kv_, _, d = keys_reord.shape
-        k = state["K"]
         bf = state["bf"]
         s = len(state["assigns_reord"])
         keys_f16 = (
@@ -81,6 +83,8 @@ def get_layout_attn_rawq(
         keys_f16.data_ptr(),
         values_f16.data_ptr(),
         tuple(keys_f16.shape),
+        k_used,
+        k_stride,
     )
     if cache.get("key") == cache_key:
         return cache["layout"]
@@ -90,7 +94,6 @@ def get_layout_attn_rawq(
     offsets = [start for start, end in dim_slices]
     max_d = max(widths)
     s = len(dim_slices)
-    k = state["K"]
     bf = state["bf"]
     n_pad = state["N_pad"]
     centers_src = state["centers"]
@@ -135,6 +138,8 @@ def get_layout_attn_rawq(
         "assigns_blocks": assigns_blocks_eff,
         "invalid_blocks_i8": invalid_blocks_eff,
         "K": k,
+        "K_used": k_used,
+        "K_stride": k_stride,
         "bf": bf,
         "N_pad": n_pad,
         "anchor_subspace": state.get("anchor_subspace", 0),
