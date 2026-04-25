@@ -1,7 +1,7 @@
 """Subspace k-center + ball_centroid index — fused-attention path only.
 
 Per subspace the index stores parents (centers/radii) and a parent-major,
-block-packed child layout produced by build_v2_4. At attention time a fused
+block-packed child layout produced by build_v2_7. At attention time a fused
 Triton pipeline gates parents against per-subspace thresholds, evaluates the
 online softmax over survivors and the decoding buffer, and merges the result.
 
@@ -31,9 +31,9 @@ class IndexConfig:
     bf: int = 4
     refine_iter: int = 5
     update_mode: str = "inc"                        # "full" | "inc"
-    build_kernel: str = "build_v2_4"
-    update_kernel: str = "update_v2_1"
-    attention_kernel: str = "attention_v2_6"
+    build_kernel: str = "build_v2_7"
+    update_kernel: str = "update_v4_0"
+    attention_kernel: str = "attention_v5_14"
     # Parallel-update toggles. Async path requires an update kernel that
     # returns a 4-tuple (state, keys, values, pending_publish).
     parallel_update: bool = False

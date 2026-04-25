@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from .build_v2_5 import build as build_v2_5
+from ._build_update_active import build as build_active
 
 KERNEL_VERSION = "v2.7"
 
@@ -24,7 +24,7 @@ def build(
 ):
     if anchor_subspace is None:
         anchor_subspace = n_subspaces - 1
-    state = build_v2_5(
+    state = build_active(
         keys=keys,
         bf=bf,
         n_subspaces=n_subspaces,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .attention_v5_base import attend_v5
+from ._attention_v5_14_helper import attend_v5
 
 KERNEL_VERSION = "v5.14"
 

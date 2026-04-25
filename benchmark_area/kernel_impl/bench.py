@@ -39,7 +39,6 @@ from hira.benchmark_area.kernel_impl.index import (
     baseline_attention,
     baseline_sdpa,
 )
-from hira.benchmark_area.kernel_impl.kernels.attention_v1_17 import _BUCKETS as _ATTN_BUCKETS
 from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
     CaptureState,
     _capture_qkv,
@@ -47,6 +46,7 @@ from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
 )
 
 DEFAULT_PROMPT = "Benchmark the index over a long decoding trace."
+_ATTN_BUCKETS = (64, 128, 256, 512)
 
 # attend() runs before the buffer append in the decode loop, so buffer size
 # reaches `update_interval - 1` right before the flush. The attention kernels
@@ -164,9 +164,8 @@ def parse_args():
                    help="Module name under kernels/ for build (auto-discovered).")
     p.add_argument("--update-kernel", default=None,
                    help="Module name under kernels/ for update (auto-discovered). "
-                        "Defaults to update_v4_0 with --parallel-update, otherwise "
-                        "update_v2_1.")
-    p.add_argument("--attention-kernel", default="attention_v2_6",
+                        "Defaults to update_v4_0.")
+    p.add_argument("--attention-kernel", default="attention_v5_14",
                    help="Module name under kernels/ for fused attention.")
     p.add_argument("--parallel-update", action="store_true",
                    help="Run update on a side CUDA stream concurrent with "
@@ -230,7 +229,7 @@ def main():
     args = parse_args()
     _validate_args(args)
     if args.update_kernel is None:
-        args.update_kernel = "update_v4_0" if args.parallel_update else "update_v2_1"
+        args.update_kernel = "update_v4_0"
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required.")
     torch.manual_seed(args.seed)

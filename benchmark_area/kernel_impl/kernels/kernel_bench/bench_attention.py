@@ -22,20 +22,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from hira.benchmark_area.kernel_impl.kernels import attention_kernels, search_kernels
-from hira.benchmark_area.kernel_impl.kernels.build_v1_0 import build as build_v1
-from hira.benchmark_area.kernel_impl.kernels.build_v2_0 import build as build_v2
-from hira.benchmark_area.kernel_impl.kernels.build_v2_1 import build as build_v2_1
-from hira.benchmark_area.kernel_impl.kernels.build_v2_1_fp16 import (
-    build as build_v2_1_fp16,
-)
-from hira.benchmark_area.kernel_impl.kernels.build_v2_2 import build as build_v2_2
-from hira.benchmark_area.kernel_impl.kernels.build_v2_2_fp16 import (
-    build as build_v2_2_fp16,
-)
-from hira.benchmark_area.kernel_impl.kernels.build_v2_3 import build as build_v2_3
-from hira.benchmark_area.kernel_impl.kernels.build_v2_4 import build as build_v2_4
-from hira.benchmark_area.kernel_impl.kernels.build_v2_5 import build as build_v2_5
-from hira.benchmark_area.kernel_impl.kernels.build_v2_6 import build as build_v2_6
 from hira.benchmark_area.kernel_impl.kernels.build_v2_7 import build as build_v2_7
 from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
     CaptureState,
@@ -43,78 +29,13 @@ from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
     _q_to_kv_map,
 )
 
-# Only the winners are benched. Non-winners remain on disk but are filtered out
-# in the attention loop below (see `name not in ATTENTION_BUILD_KERNELS`).
-#   - v1.5         : generic fallback (any BF/S, handles non-empty buffer)
-#   - v1.15        : BF=4/S=8  specialist (empty buffer only)
-#   - v1.15_s16    : BF=16/S=16 specialist (empty buffer only)
 ATTENTION_BUILD_KERNELS = {
-    "attention_v1_5": "build_v2_4",
-    "attention_v1_15": "build_v2_4",
-    "attention_v1_15_s16": "build_v2_4",
-    "attention_v1_16": "build_v2_4",
-    "attention_v1_17": "build_v2_4",
-    "attention_v1_18": "build_v2_4",
-    "attention_v1_18_1": "build_v2_4",
-    "attention_v1_20": "build_v2_4",
-    "attention_v1_31": "build_v2_4",
-    "attention_v1_32": "build_v2_5",
-    "attention_v1_33": "build_v2_5",
-    "attention_v1_34": "build_v2_5",
-    "attention_v1_35": "build_v2_5",
-    "attention_v1_36": "build_v2_5",
-    "attention_v1_37": "build_v2_5",
-    "attention_v1_38": "build_v2_6",
-    "attention_v1_39": "build_v2_7",
-    "attention_v1_40": "build_v2_7",
-    "attention_v1_41": "build_v2_7",
-    "attention_v1_42": "build_v2_7",
-    "attention_v1_43": "build_v2_7",
-    "attention_v1_44": "build_v2_7",
-    "attention_v1_45": "build_v2_7",
-    "attention_v1_46": "build_v2_7",
-    "attention_v1_47": "build_v2_7",
-    "attention_v2_0": "build_v2_7",
-    "attention_v2_1": "build_v2_7",
-    "attention_v2_2": "build_v2_7",
-    "attention_v2_3": "build_v2_7",
-    "attention_v2_4": "build_v2_7",
-    "attention_v2_5": "build_v2_7",
-    "attention_v2_6": "build_v2_7",
-    "attention_v2_7": "build_v2_7",
-    "attention_v2_8": "build_v2_7",
-    "attention_v2_9": "build_v2_7",
-    "attention_v2_10": "build_v2_7",
-    "attention_v2_11": "build_v2_7",
-    "attention_v2_12": "build_v2_7",
-    "attention_v2_13": "build_v2_7",
-    "attention_v2_14": "build_v2_7",
-    "attention_v2_15": "build_v2_7",
     "attention_v5_14": "build_v2_7",
-    # "attention_v1_22": "build_v2_4",
-    # "attention_v1_23": "build_v2_4",
-    # "attention_v1_24": "build_v2_4",
-    "attention_v1_25": "build_v2_4",
-    "attention_v1_26": "build_v2_4",
-    "attention_v1_27": "build_v2_4",
-    "attention_v1_28": "build_v2_5",
-    "attention_v1_29": "build_v2_5",
-    "attention_v1_30": "build_v2_5",
 }
 
-FP16_ONLY_ATTENTION_KERNELS = {"attention_v1_18_1", "attention_v1_31", "attention_v1_32", "attention_v1_33", "attention_v1_34", "attention_v1_35", "attention_v1_36", "attention_v1_37", "attention_v1_38", "attention_v1_39", "attention_v1_40", "attention_v1_41", "attention_v1_42", "attention_v1_43", "attention_v1_44", "attention_v1_45", "attention_v1_46", "attention_v1_47", "attention_v2_0", "attention_v2_1", "attention_v2_2", "attention_v2_3", "attention_v2_4", "attention_v2_5", "attention_v2_6", "attention_v2_7", "attention_v2_8", "attention_v2_9", "attention_v2_10", "attention_v2_11", "attention_v2_12", "attention_v2_13", "attention_v2_14", "attention_v2_15", "attention_v5_14"}
+FP16_ONLY_ATTENTION_KERNELS = {"attention_v5_14"}
 
 BUILD_FNS = {
-    "build_v1_0": build_v1,
-    "build_v2_0": build_v2,
-    "build_v2_1": build_v2_1,
-    "build_v2_1_fp16": build_v2_1_fp16,
-    "build_v2_2": build_v2_2,
-    "build_v2_2_fp16": build_v2_2_fp16,
-    "build_v2_3": build_v2_3,
-    "build_v2_4": build_v2_4,
-    "build_v2_5": build_v2_5,
-    "build_v2_6": build_v2_6,
     "build_v2_7": build_v2_7,
 }
 
@@ -241,7 +162,7 @@ def main():
     def get_state(build_name: str) -> dict:
         state = state_cache.get(build_name)
         if state is None:
-            if build_name in {"build_v2_4", "build_v2_5", "build_v2_6", "build_v2_7"}:
+            if build_name == "build_v2_7":
                 state = BUILD_FNS[build_name](
                     keys, args.bf, args.S, args.refine_iter, values=values
                 )

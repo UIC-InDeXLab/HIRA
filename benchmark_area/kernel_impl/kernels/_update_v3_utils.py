@@ -12,8 +12,7 @@ try:
 except Exception:  # pragma: no cover
     HAS_TRITON = False
 
-from .build_v2_4 import build as build_v2_4
-from ._build_warm_utils import build_v2_0_seeded_state
+from ._build_update_active import build_v2_0_seeded_state, build_v2_4_state
 
 K_CAP_CHUNK = 1024
 
@@ -99,7 +98,7 @@ def build_sub_cpu(
     *,
     with_values: bool = True,
 ) -> dict:
-    state = build_v2_4(
+    state = build_v2_4_state(
         keys=buffer_keys,
         bf=bf,
         n_subspaces=n_subspaces,

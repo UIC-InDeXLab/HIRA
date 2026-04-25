@@ -4,14 +4,32 @@ from __future__ import annotations
 
 import torch
 
-from ._search_utils import _mapping_mode
-
 
 def next_pow2(x: int) -> int:
     p = 1
     while p < x:
         p *= 2
     return p
+
+
+def _mapping_mode(
+    q_head_to_kv: torch.Tensor | None,
+    h_q: int,
+    h_kv: int,
+) -> tuple[str, int, tuple[int, ...] | None]:
+    if q_head_to_kv is None:
+        return "identity", 1, None
+
+    if h_q % h_kv == 0:
+        groups = h_q // h_kv
+        expected = (
+            torch.arange(h_q, device=q_head_to_kv.device, dtype=q_head_to_kv.dtype)
+            // groups
+        )
+        if torch.equal(q_head_to_kv, expected):
+            return "grouped", groups, None
+
+    return "expanded", 1, tuple(int(x) for x in q_head_to_kv.tolist())
 
 
 def get_layout_attn_rawq(

@@ -1,4 +1,4 @@
-"""Micro-benchmark: compare update_v2_* kernels (all operate on build_v2_4 state).
+"""Micro-benchmark: compare kept update kernels.
 
 Measures how long it takes to fold a small buffer of new (key, value) rows
 into an existing v2_4 index, and verifies that the attention kernel
@@ -26,40 +26,19 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from hira.benchmark_area.kernel_impl.kernels.build_v2_4 import build as build_v2_4
+from hira.benchmark_area.kernel_impl.kernels.build_v2_7 import build as build_v2_7
 from hira.benchmark_area.kernel_impl.kernels import update_kernels, attention_kernels
-from hira.benchmark_area.kernel_impl.kernels._attention_triton_v1_5 import (
-    triton_fused_cluster_pass_rawq,
-)
+from hira.benchmark_area.kernel_impl.kernels._update_v3_utils import apply_pending_publish
 from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
     CaptureState,
     _q_to_kv_map,
 )
 
-# Only include the v2.4-compatible updates.
 UPDATE_WHITELIST = {
-    "update_v2_0",
-    "update_v2_1",
-    "update_v2_2",
-    "update_v2_3",
-    "update_v2_4",
-    "update_v2_5",
-    "update_v3_0",
-    "update_v3_1",
-    "update_v3_2",
-    "update_v3_3",
+    "update_v4_0",
 }
 SUMMARY_ORDER = (
-    "update_v2_0",
-    "update_v2_1",
-    "update_v2_2",
-    "update_v2_3",
-    "update_v2_4",
-    "update_v2_5",
-    "update_v3_0",
-    "update_v3_1",
-    "update_v3_2",
-    "update_v3_3",
+    "update_v4_0",
 )
 
 
@@ -91,7 +70,7 @@ def _rebuild_reference(
     full_values = None
     if old_values is not None and buffer_values is not None:
         full_values = torch.cat([old_values, buffer_values], dim=1).contiguous()
-    return build_v2_4(full_keys, bf, S, refine_iter, values=full_values), full_keys, full_values
+    return build_v2_7(full_keys, bf, S, refine_iter, values=full_values), full_keys, full_values
 
 
 def _dense_attention(q, keys_q, values_q, scale):
@@ -130,24 +109,16 @@ def _pruning_stats(state, q, keys_q_expanded, full_keys, topk, q_head_to_kv):
     # Tight thresholds from the dense reference top-k over the expanded K keys.
     th, topk_idx_merged = _subspace_topk_thresholds(q, keys_q_expanded, topk, dim_slices)
 
-    # Pack centers into (S, H_kv, K, max_d) padded tensor.
-    widths = [e - s for s, e in dim_slices]
-    max_d = max(widths)
     s_dim = len(dim_slices)
-    centers = torch.zeros(s_dim, h_kv, k_parents, max_d, device=q.device, dtype=torch.float32)
-    for idx, c in enumerate(state["centers"]):
-        centers[idx, :, :, : c.shape[-1]] = c
-    radii = torch.stack(state["radii"], dim=0).contiguous()
-
-    dim_offsets_t = torch.tensor([s for s, _ in dim_slices], device=q.device, dtype=torch.int32)
-    dim_widths_t = torch.tensor(widths, device=q.device, dtype=torch.int32)
-
-    cluster_pass = triton_fused_cluster_pass_rawq(
-        q=q.contiguous(), th=th.contiguous(),
-        dim_offsets=dim_offsets_t, dim_widths=dim_widths_t,
-        centers=centers.contiguous(), radii=radii,
-        groups=groups,
-    )  # (S, H_q, K) int8
+    cluster_pass_list = []
+    for s_idx, (start, end) in enumerate(dim_slices):
+        q_sub = q[:, start:end]
+        centers = state["centers"][s_idx].index_select(0, q_head_to_kv)
+        radii = state["radii"][s_idx].index_select(0, q_head_to_kv)
+        scores = torch.einsum("hd,hkd->hk", q_sub, centers)
+        scores = scores + q_sub.norm(dim=-1, keepdim=True) * radii
+        cluster_pass_list.append(scores >= th[s_idx].unsqueeze(-1))
+    cluster_pass = torch.stack(cluster_pass_list, dim=0)
 
     # Per-child survival: AND across subspaces of cluster_pass at that child's
     # per-subspace assigned cluster. assigns_reord[s] is (H_kv, N_pad) int.
@@ -334,12 +305,12 @@ def _run_for_B(
         full_values = None
         if values is not None and buffer_values is not None:
             full_values = torch.cat([values, buffer_values], dim=1).contiguous()
-        build_v2_4(full_keys, args.bf, args.S, args.refine_iter, values=full_values)
+        build_v2_7(full_keys, args.bf, args.S, args.refine_iter, values=full_values)
 
     ms_fresh = time_call(fresh_build, iters=args.iters, warmup=2)
     ms_fresh_per_buf = _amortized_ms(ms_fresh, B)
     if verbose:
-        print(f"  {'build_v2_4 (fresh)':<26s} {'ref':<8s}  {ms_fresh_per_buf:10.4f} ms/B")
+        print(f"  {'build_v2_7 (fresh)':<26s} {'ref':<8s}  {ms_fresh_per_buf:10.4f} ms/B")
 
     kept_states: dict[str, dict] = {}
     kernel_ms: dict[str, float] = {}
@@ -366,11 +337,14 @@ def _run_for_B(
             print(f"  {name:<26s} {info.version:<8s}  {ms_per_buf:10.4f} ms/B  "
                   f"({ms_fresh / ms:5.1f}x vs fresh)")
         kernel_ms[name] = ms
-        new_state, _, _ = fn(
+        ret = fn(
             base_state, keys, buffer_keys,
             args.bf, args.S, args.refine_iter,
             old_values=values, buffer_values=buffer_values,
         )
+        new_state = ret[0]
+        if len(ret) >= 4 and ret[3] is not None:
+            new_state = apply_pending_publish(ret[3])
         kept_states[name] = new_state
 
     # Fresh rebuild state for pruning reference.
@@ -380,8 +354,8 @@ def _run_for_B(
     )
     stats_states = {"fresh (rebuild)": fresh_state, **kept_states}
 
-    # Correctness (attention_v1_5, loose gate vs dense).
-    attn = attention_kernels().get("attention_v1_5")
+    # Correctness (attention_v5_14, loose gate vs dense).
+    attn = attention_kernels().get("attention_v5_14")
     full_keys = torch.cat([keys, buffer_keys], dim=1)
     keys_expanded = full_keys.index_select(0, q_head_to_kv)
     full_values = None
@@ -398,11 +372,24 @@ def _run_for_B(
         empty_val = torch.empty(h_kv, 0, d_v, device=device, dtype=torch.float32)
         for name, st in kept_states.items():
             s_eff = len(st["assigns_reord"])
-            th_loose = torch.full((s_eff, q_batch.shape[1]), -1e9,
-                                  device=device, dtype=torch.float32)
+            th_loose = torch.full(
+                (s_eff, q_batch.shape[1]),
+                float(torch.finfo(torch.float16).min),
+                device=device,
+                dtype=torch.float16,
+            )
+            q_norms = torch.stack(
+                [
+                    q0[:, start:end].norm(dim=-1)
+                    for start, end in st["dim_slices"]
+                ],
+                dim=0,
+            ).to(torch.float16)
+            th_packed = torch.cat([th_loose, q_norms], dim=0)
             out_ours = attn.fn(
-                q=q0, th_per_subspace=th_loose, state=st,
-                buffer_keys=empty_buf, buffer_values=empty_val,
+                q=q0.to(torch.float16), th_per_subspace=th_packed, state=st,
+                buffer_keys=empty_buf.to(torch.float16),
+                buffer_values=empty_val.to(torch.float16),
                 keys_children=full_keys, q_head_to_kv=q_head_to_kv, scale=scale,
             )
             corr_abs[name] = (out_ours.float() - out_ref.float()).abs().max().item()
@@ -507,7 +494,7 @@ def main():
         q_head_to_kv = real_data["q_head_to_kv"]
         q_batch = None
 
-    base_state = build_v2_4(keys, args.bf, args.S, args.refine_iter, values=values)
+    base_state = build_v2_7(keys, args.bf, args.S, args.refine_iter, values=values)
 
     h_q = int(q_head_to_kv.shape[0])
     h_kv = int(keys.shape[0])
