@@ -46,6 +46,8 @@ from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
 )
 
 DEFAULT_PROMPT = "Benchmark the index over a long decoding trace."
+_GREEN = "\033[32m"
+_RESET = "\033[0m"
 _ATTN_BUCKETS = (64, 128, 256, 512)
 
 # attend() runs before the buffer append in the decode loop, so buffer size
@@ -109,6 +111,13 @@ def _time_repeated(fn, iters=10, warmup=3):
         fn()
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) / iters * 1000
+
+
+def _format_step_ms(value: float, fastest: float) -> str:
+    text = f"{value:.3f}ms"
+    if value == fastest:
+        return f"{_GREEN}{text}{_RESET}"
+    return text
 
 
 def parse_args():
@@ -506,10 +515,13 @@ def main():
                 csv.DictWriter(f, fieldnames=fieldnames).writerows(rows)
             rows.clear()
             elapsed = time.perf_counter() - sim_start
+            fastest_step_ms = min(attend_ours_ms, dense_attn_ms, sdpa_ms)
             print(
                 f"step {step+1}/{n_decode}  "
-                f"attend={attend_ours_ms:.3f}ms  wall={step_wall_ms:.3f}ms  "
-                f"dense={dense_attn_ms:.3f}ms  sdpa={sdpa_ms:.3f}ms  "
+                f"attend={_format_step_ms(attend_ours_ms, fastest_step_ms)}  "
+                f"wall={step_wall_ms:.3f}ms  "
+                f"dense={_format_step_ms(dense_attn_ms, fastest_step_ms)}  "
+                f"sdpa={_format_step_ms(sdpa_ms, fastest_step_ms)}  "
                 f"last_upd={last_update_ms:.2f}ms  "
                 f"K={k_used}/{k_cap}  "
                 f"scan[parents]={scanned_parent_frac:.3f} "
