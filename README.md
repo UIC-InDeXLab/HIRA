@@ -1,9 +1,11 @@
-<h1>
-  <img src="louver.png" width="80" align="absmiddle" alt="Louver logo">
+<p align="center">
+  <img src="louver.png" width="120" alt="Louver logo">
+</p>
+
+<h1 align="center">
   Louver: Sparse Attention with Range Searching Index
 </h1>
 
-Coming soon...
-
-## Updates
-- [TBD] First release
+<p align="center">
+  Coming soon...
+</p>
