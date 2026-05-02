@@ -1,0 +1,18 @@
+Hq=24 Hkv=8 N=8461 D=128 queries=50
+
+fraction=1 actual=1.0000
+  cuda_atomic           0.034769 ms/query
+  cuda_sparse_v1_6      0.043219 ms/query
+  cuda_sparse_v1_20     0.026859 ms/query
+
+fraction=0.2 actual=0.2000
+  cuda_atomic           0.030625 ms/query
+  cuda_sparse_v1_6      0.020520 ms/query
+  cuda_sparse_v1_20     0.020851 ms/query
+
+Speedup vs fraction=1.0 (speedup = t@1.0 / t@fraction)
+------------------------------------------------------------------------
+  baseline        f=1             f=0.2         
+  cuda_atomic     1.000x          1.135x        
+  cuda_sparse_v1_6  1.000x          2.106x        
+  cuda_sparse_v1_20  1.000x          1.288x        

@@ -37,8 +37,11 @@ from hira.benchmark_area.kernel_impl.TA_filter_alg import attention_kernels, bui
 from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.baselines._sdpa_cuda_atomic_fp16 import (
     sdpa_cuda_atomic_fp16,
 )
-from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.baselines._sdpa_cuda_sparse_v1_1_fp16 import (
-    sdpa_cuda_sparse_v1_1_fp16,
+from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.baselines._sdpa_cuda_sparse_v1_6_fp16 import (
+    sdpa_cuda_sparse_v1_6_fp16,
+)
+from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.baselines._sdpa_cuda_sparse_v1_20_fp16 import (
+    sdpa_cuda_sparse_v1_20_fp16,
 )
 from hira.benchmark_area.quick_pruning.pruning_bench_utils import (
     CaptureState,
@@ -77,7 +80,7 @@ def reference_attention(
     scale: float,
 ) -> torch.Tensor:
     """fp32 reference: TA-filter sweep, scalar T survival, buffer fold, softmax @V."""
-    from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels._TA_common import (
+    from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.commons._TA_common import (
         build_selected_clusters,
         compute_centroid_scores,
         expand_for_query,
@@ -340,9 +343,9 @@ def _run_once(args) -> None:
             raise
         print(f"  {'sdpa_cuda_atomic_fp16':<28s} {'-':<6s}  skipped: {type(exc).__name__}: {exc}")
 
-    def sdpa_cuda_sparse_v1_1_fp16_loop():
+    def sdpa_cuda_sparse_v1_6_fp16_loop():
         for qn, _ in pairs:
-            _ = sdpa_cuda_sparse_v1_1_fp16(
+            _ = sdpa_cuda_sparse_v1_6_fp16(
                 q=qn,
                 keys_f16=keys_full_f16,
                 values_f16=values_full_f16,
@@ -352,27 +355,52 @@ def _run_once(args) -> None:
             )
 
     try:
-        sdpa_cuda_sparse_ms = time_call(sdpa_cuda_sparse_v1_1_fp16_loop, iters=args.iters)
+        sdpa_cuda_sparse_ms = time_call(sdpa_cuda_sparse_v1_6_fp16_loop, iters=args.iters)
         sdpa_cuda_sparse_per_q = sdpa_cuda_sparse_ms / len(pairs)
         print(
-            f"  {'sdpa_cuda_sparse_v1_1_fp16':<28s} {'-':<6s}  "
+            f"  {'sdpa_cuda_sparse_v1_6_fp16':<28s} {'-':<6s}  "
             f"{sdpa_cuda_sparse_per_q:8.3f} ms/query"
         )
     except Exception as exc:
         torch.cuda.synchronize()
         if args.strict:
             raise
-        print(f"  {'sdpa_cuda_sparse_v1_1_fp16':<28s} {'-':<6s}  skipped: {type(exc).__name__}: {exc}")
+        print(f"  {'sdpa_cuda_sparse_v1_6_fp16':<28s} {'-':<6s}  skipped: {type(exc).__name__}: {exc}")
+
+    def sdpa_cuda_sparse_v1_20_fp16_loop():
+        for qn, _ in pairs:
+            _ = sdpa_cuda_sparse_v1_20_fp16(
+                q=qn,
+                keys_f16=keys_full_f16,
+                values_f16=values_full_f16,
+                mask_i8=mask_all_true,
+                q_head_to_kv=q_head_to_kv,
+                scale=scale,
+            )
+
+    try:
+        sdpa_cuda_sparse_v1_20_ms = time_call(sdpa_cuda_sparse_v1_20_fp16_loop, iters=args.iters)
+        sdpa_cuda_sparse_v1_20_per_q = sdpa_cuda_sparse_v1_20_ms / len(pairs)
+        print(
+            f"  {'sdpa_cuda_sparse_v1_20_fp16':<28s} {'-':<6s}  "
+            f"{sdpa_cuda_sparse_v1_20_per_q:8.3f} ms/query"
+        )
+    except Exception as exc:
+        torch.cuda.synchronize()
+        if args.strict:
+            raise
+        print(f"  {'sdpa_cuda_sparse_v1_20_fp16':<28s} {'-':<6s}  skipped: {type(exc).__name__}: {exc}")
 
     # ── TA kernels ──
     print("-" * 70)
-    print(f"TA-filter attention (T = {args.topk}-th largest exact dot per head)")
+    # print(f"TA-filter attention (T = {args.topk}-th largest exact dot per head)")
     results: list[tuple[str, float]] = []
     skipped: list[str] = []
 
     for name, info in sorted(attention_kernels().items()):
         label = f"{name} ({info.version})"
         build_name = _build_for_attention(name, build_registry)
+        build_ver = build_registry[build_name].version
         if build_name not in built_states:
             build_info = build_registry[build_name]
             # print(
@@ -389,7 +417,7 @@ def _run_once(args) -> None:
                 values=values_index,
             )
             torch.cuda.synchronize()
-            print(f"TA index build ({build_name}): {(time.perf_counter() - t0) * 1000:.1f} ms")
+            # print(f"TA index build ({build_name}): {(time.perf_counter() - t0) * 1000:.1f} ms")
         state = built_states[build_name]
         try:
             qn, th = pairs[0]
@@ -407,7 +435,10 @@ def _run_once(args) -> None:
             if args.strict:
                 raise
             skipped.append(label)
-            print(f"  {label:<28s} skipped: {type(exc).__name__}: {exc}")
+            print(
+                f"  {name:<28s} {info.version:<6s}  {build_ver:<8s}  "
+                f"skipped: {type(exc).__name__}: {exc}"
+            )
             continue
 
         def attend_loop():
@@ -429,12 +460,15 @@ def _run_once(args) -> None:
             if args.strict:
                 raise
             skipped.append(label)
-            print(f"  {label:<28s} skipped (timing): {type(exc).__name__}: {exc}")
+            print(
+                f"  {name:<28s} {info.version:<6s}  {build_ver:<8s}  "
+                f"skipped (timing): {type(exc).__name__}: {exc}"
+            )
             continue
         per_q = ms / len(pairs)
         results.append((name, per_q))
         ms_text = format_ms(per_q, sdpa_per_q)
-        print(f"  {name:<28s} {info.version:<6s}  {ms_text} ms/query")
+        print(f"  {name:<28s} {info.version:<6s}  {build_ver:<8s}  {ms_text} ms/query")
 
     print("-" * 70)
     if results:

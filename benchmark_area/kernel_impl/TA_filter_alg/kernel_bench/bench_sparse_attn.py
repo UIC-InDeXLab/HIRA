@@ -1,12 +1,4 @@
 """Benchmark masked attention baselines across sparse top-k mask fractions.
-
-Example:
-    ~/venv/bin/python benchmark_area/kernel_impl/TA_filter_alg/kernel_bench/bench_sparse_attention_baselines.py \
-        --input-qkv benchmark_area/quick_pruning/capture_qkv_8000_meta-llama_Llama-3.2-3B-Instruct.pt \
-        --fractions 1.0 0.2 0.1 0.05 --n-queries 20 --iters 10
-
-Masks are built before timing.  For each query/head, the mask keeps the top-k
-keys by exact full dot product, where k = fraction * N.
 """
 
 from __future__ import annotations
@@ -23,17 +15,14 @@ REPO_ROOT = Path(__file__).resolve().parents[5]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.baselines._sdpa_cuda_atomic_fp16 import (
+from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.sparse_attn._sdpa_cuda_atomic_fp16 import (
     sdpa_cuda_atomic_fp16,
 )
-from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.baselines._sdpa_cuda_sparse_v1_0_fp16 import (
-    sdpa_cuda_sparse_v1_0_fp16,
+from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.sparse_attn._sdpa_cuda_sparse_v1_6_fp16 import (
+    sdpa_cuda_sparse_v1_6_fp16,
 )
-from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.baselines._sdpa_cuda_sparse_v1_1_fp16 import (
-    sdpa_cuda_sparse_v1_1_fp16,
-)
-from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.baselines._sdpa_flex_attention_fp16 import (
-    sdpa_flex_attention_fp16,
+from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.sparse_attn._sdpa_cuda_sparse_v1_20_fp16 import (
+    sdpa_cuda_sparse_v1_20_fp16,
 )
 from hira.benchmark_area.quick_pruning.pruning_bench_utils import CaptureState, _q_to_kv_map
 
@@ -76,7 +65,6 @@ def main() -> None:
     p.add_argument("--n-queries", type=int, default=50)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--warmup", type=int, default=4)
-    p.add_argument("--skip-flex", action="store_true")
     args = p.parse_args()
 
     cap = CaptureState.load(args.input_qkv)
@@ -106,27 +94,18 @@ def main() -> None:
 
     baselines = [
         ("cuda_atomic", sdpa_cuda_atomic_fp16, {}),
-        ("cuda_sparse_v1_0", sdpa_cuda_sparse_v1_0_fp16, {}),
-        ("cuda_sparse_v1_1", sdpa_cuda_sparse_v1_1_fp16, {}),
+        ("cuda_sparse_v1_6", sdpa_cuda_sparse_v1_6_fp16, {}),
+        ("cuda_sparse_v1_20", sdpa_cuda_sparse_v1_20_fp16, {}),
     ]
-    if not args.skip_flex:
-        baselines.extend(
-            [
-                (
-                    "flex_16x128_w8",
-                    sdpa_flex_attention_fp16,
-                    {"block_size": (16, 128), "num_warps": 8, "prescale_qk": False},
-                ),
-                (
-                    "flex_16x64_w4",
-                    sdpa_flex_attention_fp16,
-                    {"block_size": (16, 64), "num_warps": 4, "prescale_qk": False},
-                ),
-            ]
-        )
+
+    fractions = [float(f) for f in args.fractions]
+    if all(abs(f - 1.0) > 1e-8 for f in fractions):
+        fractions = [1.0] + fractions
+    fractions = sorted(set(fractions), reverse=True)
 
     print(f"Hq={h_q} Hkv={h_kv} N={n_ctx} D={d} queries={len(queries)}")
-    for frac in args.fractions:
+    results_by_baseline: dict[str, dict[float, float]] = {name: {} for name, _, _ in baselines}
+    for frac in fractions:
         masks = [topk_dot_mask(q, keys, q_head_to_kv, frac) for q in queries_f32]
         torch.cuda.synchronize()
         actual = sum(float(m.float().mean().item()) for m in masks) / len(masks)
@@ -138,10 +117,28 @@ def main() -> None:
 
             try:
                 ms = time_call(run, args.iters, args.warmup) / len(queries)
+                results_by_baseline[name][frac] = ms
                 print(f"  {name:<20s} {ms:9.6f} ms/query")
             except Exception as exc:
                 torch.cuda.synchronize()
                 print(f"  {name:<20s} skipped: {type(exc).__name__}: {str(exc).splitlines()[0]}")
+
+    print("\nSpeedup vs fraction=1.0 (speedup = t@1.0 / t@fraction)")
+    print("-" * 72)
+    header = ["baseline"] + [f"f={f:g}" for f in fractions]
+    print("  " + "  ".join(f"{h:<14s}" for h in header))
+    for name, _, _ in baselines:
+        base = results_by_baseline[name].get(1.0)
+        row = [f"{name:<14s}"]
+        for frac in fractions:
+            t = results_by_baseline[name].get(frac)
+            if base is None or t is None:
+                cell = "n/a"
+            else:
+                speedup = base / t if t > 0.0 else float("inf")
+                cell = f"{speedup:.3f}x"
+            row.append(f"{cell:<14s}")
+        print("  " + "  ".join(row))
 
 
 if __name__ == "__main__":
