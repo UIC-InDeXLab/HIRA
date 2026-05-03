@@ -178,36 +178,27 @@ def build_v1_1_state(
     offsets = [start for start, _ in slices]
     max_w = max(widths)
 
-    centers_per_sub: list[torch.Tensor] = []
+    # Slim build: only the artefacts that ta_filter v8 + sparse_attn v2.4 +
+    # the incremental update kernel actually read.  Dropped:
+    #   children_padded_i32, cluster_counts_i16, centers_per_sub,
+    #   keys_padded_t_f16  (unused by the live pipeline; archived TA
+    #   attention kernels referenced them).
     assigns_padded_list: list[torch.Tensor] = []
-    children_list: list[torch.Tensor] = []
-    counts_list: list[torch.Tensor] = []
-
-    for start, end in slices:
+    centers_padded = torch.zeros(
+        n_subspaces, h_kv, k, max_w, device=device, dtype=torch.float16
+    )
+    for s_idx, (start, end) in enumerate(slices):
         keys_sub = keys[:, :, start:end].contiguous()
         assign, centers = _balanced_pca_tree_subspace(keys_sub, bf)
-        centers_per_sub.append(centers.contiguous())
+        centers_padded[s_idx, :, :, : centers.shape[-1]] = centers.to(torch.float16)
 
         ap = torch.zeros(h_kv, n_pad, dtype=torch.long, device=device)
         ap[:, :n_real] = assign
         assigns_padded_list.append(ap.to(assigns_dtype(k)).contiguous())
 
-        children_hkb, counts_hk = _children_from_assign(assign, k=k, bf=bf)
-        children_list.append(children_hkb)
-        counts_list.append(counts_hk)
-
-    centers_padded = torch.zeros(
-        n_subspaces, h_kv, k, max_w, device=device, dtype=torch.float16
-    )
-    for s_idx, centers in enumerate(centers_per_sub):
-        centers_padded[s_idx, :, :, : centers.shape[-1]] = centers.to(torch.float16)
     centers_padded = centers_padded.contiguous()
-
     keys_padded_f16 = keys_padded.to(torch.float16).contiguous()
-    keys_padded_t_f16 = keys_padded_f16.transpose(-1, -2).contiguous()
     assigns_stack = torch.stack(assigns_padded_list, dim=0).contiguous()
-    children_stack = torch.stack(children_list, dim=0).contiguous()
-    counts_stack = torch.stack(counts_list, dim=0).contiguous()
 
     state = {
         "version": "v1.1",
@@ -216,12 +207,8 @@ def build_v1_1_state(
         "dim_widths": torch.tensor(widths, dtype=torch.int32, device=device),
         "max_width": int(max_w),
         "centers_padded_f16": centers_padded,
-        "centers_per_sub": centers_per_sub,
         "assigns_padded": assigns_stack,
-        "children_padded_i32": children_stack,
-        "cluster_counts_i16": counts_stack,
         "keys_padded_f16": keys_padded_f16,
-        "keys_padded_t_f16": keys_padded_t_f16,
         "invalid_mask": invalid_mask.contiguous(),
         "K": k,
         "N": n_real,
@@ -252,43 +239,8 @@ def build_v1_1_state(
 
 
 def add_v10_layouts(state: dict) -> None:
-    children = state["children_padded_i32"].contiguous()
-    keys = state["keys_padded_f16"]
-    values = state.get("values_padded_f16")
-
-    s_sub, h_kv, k_clusters, bf = children.shape
-    _h, _n_pad, d = keys.shape
-    if s_sub != 4 or bf != 4:
-        raise ValueError(f"v10 layout requires S=4 and bf=4, got S={s_sub}, bf={bf}")
-
-    valid = children >= 0
-    safe_ids = children.clamp_min(0).to(torch.long)
-    cluster_keys = torch.empty(
-        s_sub, h_kv, k_clusters, bf, d, device=keys.device, dtype=torch.float16
-    )
-
-    for h_idx in range(h_kv):
-        gathered = keys[h_idx].index_select(0, safe_ids[:, h_idx].reshape(-1))
-        gathered = gathered.view(s_sub, k_clusters, bf, d)
-        cluster_keys[:, h_idx] = gathered.masked_fill(~valid[:, h_idx, :, :, None], 0.0)
-
-    state["cluster_key_ids_i32"] = children
-    state["cluster_keys_t_f16"] = cluster_keys.permute(0, 1, 2, 4, 3).contiguous()
-
-    if values is not None:
-        d_v = int(values.shape[-1])
-        cluster_values = torch.empty(
-            s_sub, h_kv, k_clusters, bf, d_v,
-            device=values.device,
-            dtype=torch.float16,
-        )
-        for h_idx in range(h_kv):
-            gathered = values[h_idx].index_select(0, safe_ids[:, h_idx].reshape(-1))
-            gathered = gathered.view(s_sub, k_clusters, bf, d_v)
-            cluster_values[:, h_idx] = gathered.masked_fill(
-                ~valid[:, h_idx, :, :, None], 0.0
-            )
-        state["cluster_values_f16"] = cluster_values.contiguous()
+    """Deprecated — kept as a no-op for archived TA attention kernels."""
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -423,12 +375,9 @@ def _build_v11(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _add_v13_layouts(state: dict) -> None:
-    children = state["children_padded_i32"].contiguous()
-    state["parent_children_i32"] = children.view(
-        int(children.shape[0]),
-        int(children.shape[1]),
-        int(children.shape[2]) * int(children.shape[3]),
-    ).contiguous()
+    """Deprecated — no longer needed (parent_children_i32 was used by archived
+    TA attention kernels only). Kept as no-op for compatibility."""
+    return None
 
 
 def build(
