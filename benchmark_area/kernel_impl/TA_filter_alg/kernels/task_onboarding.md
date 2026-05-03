@@ -31,4 +31,4 @@ These are major algorithm steps, given query `q` and threshold `T`:
 
 - Steps 1 and 2 should be in a separate kernel: **filtering kernels**. They should be implemented in `kernels/filtering/` directory.
 
-- Kernels are benchmarked with simple scripts in `kernel_impl/TA_filter_alg/kernel_bench/*`. For benchmarking we use capture files in `benchmark_area/quick_pruning/capture*.pt`, as default we use 8k llama capture. We also use `~/venv/bin/python`.
+- Kernels are benchmarked with simple scripts in `kernel_impl/TA_filter_alg/kernel_bench/*`. For benchmarking we use capture files in `benchmark_area/quick_pruning/capture*.pt`. We also use `~/venv/bin/python`.

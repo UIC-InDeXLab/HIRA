@@ -1,11 +1,29 @@
-"""Shared legacy TA build helpers for v11+/v13+ builders."""
+"""TA_build — single-file build pipeline (v13.0) and shared query helpers.
 
+Inlines (in order):
+  commons/_TA_build_legacy.py  — clustering / layout builders
+  commons/_TA_common.py        — centroid scoring, depth, candidate mask
+  v11/TA_build_v_11_0.py      — v11 builder (cluster-streaming layouts)
+  v13/TA_build_v_13_0.py      — v13 builder (parent_children layout, top-level)
+
+Public API used by bench_ta_filtering.py:
+  build(keys, bf, n_subspaces, ...) -> state dict   (was TA_build_v_13_0.build)
+  compute_centroid_scores(...)
+  stop_depth_per_head(...)
+  build_selected_clusters(...)
+  per_key_candidate_mask(...)
+"""
 from __future__ import annotations
 
 import math
 
 import torch
 
+KERNEL_VERSION = "v13.0"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Clustering / layout helpers (inlined from commons/_TA_build_legacy.py)
+# ──────────────────────────────────────────────────────────────────────────────
 
 def split_contiguous(d: int, s_count: int) -> list[tuple[int, int]]:
     sub = d // s_count
@@ -56,18 +74,15 @@ def _assign_balanced_tree_h(
     if int(leaf_sizes.numel()) == 1:
         assign[indices] = cluster_offset
         return
-
     mid = int(leaf_sizes.numel()) // 2
     left_sizes = leaf_sizes[:mid]
     right_sizes = leaf_sizes[mid:]
     left_count = int(left_sizes.sum().item())
-
     subset = points.index_select(0, indices)
     axis = _dominant_axis(subset)
     order = torch.argsort(subset @ axis)
     left_idx = indices.index_select(0, order[:left_count])
     right_idx = indices.index_select(0, order[left_count:])
-
     _assign_balanced_tree_h(points, left_idx, left_sizes, assign, cluster_offset)
     _assign_balanced_tree_h(points, right_idx, right_sizes, assign, cluster_offset + mid)
 
@@ -80,12 +95,13 @@ def _recompute_centers(keys_h: torch.Tensor, assign_h: torch.Tensor, k: int) -> 
     return centers / counts[:, None]
 
 
-def _balanced_pca_tree_subspace(keys_sub: torch.Tensor, bf: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _balanced_pca_tree_subspace(
+    keys_sub: torch.Tensor, bf: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     h, n, _d = keys_sub.shape
     device = keys_sub.device
     k = max(1, math.ceil(n / bf))
     target_sizes = _target_cluster_sizes(n, bf, device)
-
     assign = torch.empty(h, n, device=device, dtype=torch.long)
     centers = torch.empty(h, k, keys_sub.shape[-1], device=device, dtype=keys_sub.dtype)
     all_idx = torch.arange(n, device=device)
@@ -107,7 +123,6 @@ def _children_from_assign(
     device = assign.device
     children = torch.full((h, k, bf), -1, device=device, dtype=torch.int32)
     counts_out = torch.zeros(h, k, device=device, dtype=torch.int16)
-
     for head in range(h):
         assign_h = assign[head].to(torch.long)
         counts = torch.bincount(assign_h, minlength=k)
@@ -115,7 +130,6 @@ def _children_from_assign(
             max_count = int(counts.max().item())
             raise RuntimeError(f"capacity violation: max cluster size {max_count} > bf={bf}")
         counts_out[head] = counts.to(torch.int16)
-
         order = torch.argsort(assign_h, stable=True)
         offsets = torch.cat(
             [torch.zeros(1, device=device, dtype=torch.long), counts.cumsum(dim=0)]
@@ -125,7 +139,6 @@ def _children_from_assign(
             if count:
                 start = int(offsets[cluster].item())
                 children[head, cluster, :count] = order[start : start + count].to(torch.int32)
-
     return children.contiguous(), counts_out.contiguous()
 
 
@@ -226,10 +239,7 @@ def build_v1_1_state(
         d_v = int(values.shape[-1])
         if pad:
             values_padded = torch.cat(
-                [
-                    values,
-                    torch.zeros(h_kv, pad, d_v, device=device, dtype=values.dtype),
-                ],
+                [values, torch.zeros(h_kv, pad, d_v, device=device, dtype=values.dtype)],
                 dim=1,
             )
         else:
@@ -279,3 +289,165 @@ def add_v10_layouts(state: dict) -> None:
                 ~valid[:, h_idx, :, :, None], 0.0
             )
         state["cluster_values_f16"] = cluster_values.contiguous()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Shared query helpers (inlined from commons/_TA_common.py)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_Q_PACK_CACHE: dict = {}
+
+
+def _q_subspace_pack_indices(
+    dim_slices: list[tuple[int, int]],
+    max_w: int,
+    d: int,
+    device: torch.device,
+) -> torch.Tensor:
+    key = (id(dim_slices), tuple(dim_slices), max_w, d, device)
+    cached = _Q_PACK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    s_count = len(dim_slices)
+    idx = torch.full((s_count, max_w), d, dtype=torch.long, device=device)
+    for s_idx, (start, end) in enumerate(dim_slices):
+        w = end - start
+        idx[s_idx, :w] = torch.arange(start, end, device=device)
+    _Q_PACK_CACHE[key] = idx
+    return idx
+
+
+def compute_centroid_scores(
+    q: torch.Tensor,
+    centers_padded_f16: torch.Tensor,
+    dim_slices: list[tuple[int, int]],
+    q_head_to_kv: torch.Tensor | None,
+) -> torch.Tensor:
+    s_count, h_kv, k, max_w = centers_padded_f16.shape
+    h_q, d = q.shape
+    device = q.device
+
+    pad_idx = _q_subspace_pack_indices(dim_slices, max_w, d, device)
+    q_padded = torch.cat(
+        [q.float(), torch.zeros(h_q, 1, device=device, dtype=torch.float32)], dim=1
+    )
+    q_packed = q_padded.index_select(1, pad_idx.view(-1)).view(h_q, s_count, max_w)
+
+    if q_head_to_kv is None:
+        centers_eff = centers_padded_f16.float()
+        out = torch.einsum("shkw,hsw->hsk", centers_eff, q_packed)
+    else:
+        centers_eff = centers_padded_f16.index_select(1, q_head_to_kv).float()
+        out = torch.einsum("shkw,hsw->hsk", centers_eff, q_packed)
+    return out.contiguous()
+
+
+def stop_depth_per_head(
+    sorted_scores: torch.Tensor, threshold: torch.Tensor
+) -> torch.Tensor:
+    h_q, _s, k = sorted_scores.shape
+    row_sums = sorted_scores.sum(dim=1)
+    below = row_sums < threshold.unsqueeze(-1)
+    has = below.any(dim=-1)
+    first = below.float().argmax(dim=-1)
+    depth = torch.where(has, first + 1, torch.full_like(first, k))
+    return depth
+
+
+def build_selected_clusters(
+    order: torch.Tensor, depth: torch.Tensor
+) -> torch.Tensor:
+    h_q, s_count, k = order.shape
+    device = order.device
+    rank_pos = torch.arange(k, device=device).view(1, 1, k)
+    in_top = rank_pos < depth.view(h_q, 1, 1)
+    in_top_b = in_top.expand(h_q, s_count, k).contiguous()
+    selected = torch.zeros(h_q, s_count, k, dtype=torch.bool, device=device)
+    selected.scatter_(2, order, in_top_b)
+    return selected
+
+
+def per_key_candidate_mask(
+    selected: torch.Tensor,
+    assigns_padded: torch.Tensor,
+    q_head_to_kv: torch.Tensor | None,
+) -> torch.Tensor:
+    s_count, h_kv, n_pad = assigns_padded.shape
+    device = selected.device
+    h_q = int(selected.shape[0])
+
+    if q_head_to_kv is None:
+        assigns_eff = assigns_padded
+    else:
+        assigns_eff = assigns_padded.index_select(1, q_head_to_kv).contiguous()
+
+    cand = torch.zeros(h_q, n_pad, dtype=torch.bool, device=device)
+    for s_idx in range(s_count):
+        parents = assigns_eff[s_idx].to(torch.int64)
+        sel_s = selected[:, s_idx, :]
+        passed = sel_s.gather(1, parents)
+        cand |= passed
+    return cand
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v11 builder (inlined from v11/TA_build_v_11_0.py)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_v11(
+    keys: torch.Tensor,
+    bf: int,
+    n_subspaces: int,
+    refine_iter: int = 5,
+    values: torch.Tensor | None = None,
+) -> dict:
+    if bf != 4 or n_subspaces != 4:
+        raise ValueError(
+            f"TA_build_v11.0 is specialized for bf=4 and n_subspaces=4; "
+            f"got bf={bf}, n_subspaces={n_subspaces}"
+        )
+    state = build_v1_1_state(
+        keys=keys,
+        bf=bf,
+        n_subspaces=n_subspaces,
+        refine_iter=refine_iter,
+        values=values,
+    )
+    add_v10_layouts(state)
+    state["version"] = "v11.0"
+    return state
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v13 builder — top-level public API (inlined from v13/TA_build_v_13_0.py)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _add_v13_layouts(state: dict) -> None:
+    children = state["children_padded_i32"].contiguous()
+    state["parent_children_i32"] = children.view(
+        int(children.shape[0]),
+        int(children.shape[1]),
+        int(children.shape[2]) * int(children.shape[3]),
+    ).contiguous()
+
+
+def build(
+    keys: torch.Tensor,
+    bf: int,
+    n_subspaces: int,
+    refine_iter: int = 5,
+    values: torch.Tensor | None = None,
+) -> dict:
+    state = _build_v11(
+        keys=keys,
+        bf=bf,
+        n_subspaces=n_subspaces,
+        refine_iter=refine_iter,
+        values=values,
+    )
+    _add_v13_layouts(state)
+    state["version"] = KERNEL_VERSION
+    return state
+
+
+KERNEL = build

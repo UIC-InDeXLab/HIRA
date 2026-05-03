@@ -18,11 +18,8 @@ if str(REPO_ROOT) not in sys.path:
 from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.sparse_attn._sdpa_cuda_atomic_fp16 import (
     sdpa_cuda_atomic_fp16,
 )
-from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.sparse_attn._sdpa_cuda_sparse_v1_6_fp16 import (
-    sdpa_cuda_sparse_v1_6_fp16,
-)
-from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.sparse_attn._sdpa_cuda_sparse_v1_20_fp16 import (
-    sdpa_cuda_sparse_v1_20_fp16,
+from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.sparse_attn._sdpa_cuda_sparse_v2_4_fp16 import (
+    sdpa_cuda_sparse_v2_4_fp16,
 )
 from hira.benchmark_area.quick_pruning.pruning_bench_utils import CaptureState, _q_to_kv_map
 
@@ -36,6 +33,23 @@ def time_call(fn, iters: int, warmup: int) -> float:
         fn()
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) * 1000.0 / iters
+
+
+def mask_to_compact(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert dense int8 mask [Hq, N] to (live_idx [Hq, N] int32, live_count [Hq] int32).
+
+    Done outside the timing loop — compact-input kernels are not meant to do
+    this work themselves.
+    """
+    h_q, n_ctx = mask.shape
+    live_count = mask.sum(dim=1).to(torch.int32)
+    live_idx = torch.zeros(h_q, n_ctx, dtype=torch.int32, device=mask.device)
+    for h in range(h_q):
+        idx = mask[h].nonzero(as_tuple=False).squeeze(-1).to(torch.int32)
+        c = idx.numel()
+        if c > 0:
+            live_idx[h, :c] = idx
+    return live_idx, live_count
 
 
 def topk_dot_mask(
@@ -92,10 +106,11 @@ def main() -> None:
         queries_f32.append(q.contiguous())
         queries.append(q.half().contiguous())
 
+    # input_kind: "mask" → fn(q, keys, values, mask, q_head_to_kv, scale, **kwargs)
+    #             "compact" → fn(q, keys, values, live_idx, live_count, q_head_to_kv, scale, **kwargs)
     baselines = [
-        ("cuda_atomic", sdpa_cuda_atomic_fp16, {}),
-        ("cuda_sparse_v1_6", sdpa_cuda_sparse_v1_6_fp16, {}),
-        ("cuda_sparse_v1_20", sdpa_cuda_sparse_v1_20_fp16, {}),
+        ("cuda_atomic",   sdpa_cuda_atomic_fp16,   "mask",    {}),
+        ("cuda_sparse_v2_4", sdpa_cuda_sparse_v2_4_fp16, "compact", {}),
     ]
 
     fractions = [float(f) for f in args.fractions]
@@ -104,16 +119,24 @@ def main() -> None:
     fractions = sorted(set(fractions), reverse=True)
 
     print(f"Hq={h_q} Hkv={h_kv} N={n_ctx} D={d} queries={len(queries)}")
-    results_by_baseline: dict[str, dict[float, float]] = {name: {} for name, _, _ in baselines}
+    results_by_baseline: dict[str, dict[float, float]] = {name: {} for name, _, _, _ in baselines}
     for frac in fractions:
         masks = [topk_dot_mask(q, keys, q_head_to_kv, frac) for q in queries_f32]
+        compacts = [mask_to_compact(m) for m in masks]
         torch.cuda.synchronize()
         actual = sum(float(m.float().mean().item()) for m in masks) / len(masks)
         print(f"\nfraction={frac:g} actual={actual:.4f}")
-        for name, fn, kwargs in baselines:
-            def run() -> None:
-                for q, mask in zip(queries, masks):
-                    fn(q, keys, values, mask, q_head_to_kv, scale, **kwargs)
+        for name, fn, input_kind, kwargs in baselines:
+            if input_kind == "mask":
+                def run() -> None:
+                    for q, mask in zip(queries, masks):
+                        fn(q, keys, values, mask, q_head_to_kv, scale, **kwargs)
+            elif input_kind == "compact":
+                def run() -> None:
+                    for q, (li, lc) in zip(queries, compacts):
+                        fn(q, keys, values, li, lc, q_head_to_kv, scale, **kwargs)
+            else:
+                raise ValueError(f"unknown input_kind={input_kind}")
 
             try:
                 ms = time_call(run, args.iters, args.warmup) / len(queries)
@@ -127,7 +150,7 @@ def main() -> None:
     print("-" * 72)
     header = ["baseline"] + [f"f={f:g}" for f in fractions]
     print("  " + "  ".join(f"{h:<14s}" for h in header))
-    for name, _, _ in baselines:
+    for name, _, _, _ in baselines:
         base = results_by_baseline[name].get(1.0)
         row = [f"{name:<14s}"]
         for frac in fractions:

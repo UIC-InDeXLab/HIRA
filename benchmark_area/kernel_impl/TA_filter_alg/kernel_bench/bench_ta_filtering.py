@@ -21,16 +21,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.filtering import (
-    ta_filter_v1_0,
-    ta_filter_v1_1,
-    ta_filter_v2_0,
-    ta_filter_v2_1,
-    ta_filter_v2_2,
+    ta_filter_v8_0,
 )
-from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.v13.TA_build_v_13_0 import (
+from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.TA_build import (
     build as build_v13_0,
-)
-from hira.benchmark_area.kernel_impl.TA_filter_alg.kernels.commons._TA_common import (
     build_selected_clusters,
     compute_centroid_scores,
     per_key_candidate_mask,
@@ -60,8 +54,23 @@ def _dense_alive_mask_for_bench(
     q_head_to_kv: torch.Tensor | None,
     n_ctx: int,
 ) -> torch.Tensor:
-    """Dense [Hq, n_ctx] bool alive mask."""
+    """Dense [Hq, n_ctx] bool alive mask, materialised from whatever the
+    kernel natively returns (dense or compact)."""
     out = fn(q, th, state, q_head_to_kv)
+    if isinstance(out, tuple):
+        # v4.0 compact: (live_idx[Hq, Npad], live_count[Hq])
+        live_idx, live_count = out[0], out[1]
+        h_q = int(live_idx.shape[0])
+        mask = torch.zeros(h_q, n_ctx, dtype=torch.bool, device=live_idx.device)
+        cnts = live_count.tolist()
+        for h in range(h_q):
+            c = int(cnts[h])
+            if c == 0:
+                continue
+            idx = live_idx[h, :c].long()
+            idx = idx[idx < n_ctx]
+            mask[h, idx] = True
+        return mask
     return out[:, :n_ctx].bool()
 
 
@@ -115,11 +124,7 @@ def main() -> None:
         pairs.append((q.half().contiguous(), th.float().contiguous()))
 
     impls = [
-        ("ta_filter_v1.0", ta_filter_v1_0),
-        ("ta_filter_v1.1", ta_filter_v1_1),
-        ("ta_filter_v2.0", ta_filter_v2_0),
-        ("ta_filter_v2.1", ta_filter_v2_1),
-        ("ta_filter_v2.2", ta_filter_v2_2),
+        ("ta_filter_v8.0", ta_filter_v8_0),
     ]
 
     # quick correctness check vs reference PyTorch stage-1 logic
